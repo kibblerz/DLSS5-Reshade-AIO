@@ -50,7 +50,11 @@ Run `addon\build.bat`. The complete runtime set is emitted under `addon\build`:
 - `nvngx_dlss.dll`
 - `DLSS5_Feed.fx`
 
-Conan should be set to fullscreen at the desired lower render resolution. The addon virtualizes the fullscreen transition so the desktop stays at native resolution, then presents the reconstructed native output in its proxy window. `DLSS5_Feed.fx` and a compatible motion-vector provider must be available and the `DLSS5_Feed` technique must be enabled.
+Conan should be set to fullscreen at the desired lower render resolution. The addon virtualizes the fullscreen transition so the desktop stays at native resolution, then presents the reconstructed native output in its proxy window.
+
+The game `OnPresent` event is the activation and evaluation boundary. The addon copies the reduced game backbuffer there and loads its own private `nvngx_dlssnr.dll`, `nvngx_dlss.dll`, and caller-identity bridge; it does not hook or reuse the game's DLSS implementation. RHI may deploy only the `.addon64` file to the game directory, so the addon also searches `%LOCALAPPDATA%\RHI\Custom\Addons` for the complete private runtime set.
+
+`DLSS5_Feed.fx` is now optional. When its correctly sized `R16G16_FLOAT` motion and `R32_FLOAT` depth resources are available, the addon captures them for the next `OnPresent`. Otherwise it creates and clears internal fallback guides so initialization and native reconstruction are not blocked. The fallback proves the standalone path and maintains full-frame output, though true game motion/depth will ultimately be needed for high-quality temporal reconstruction in motion.
 
 The persistent game log is `%LOCALAPPDATA%\RHI\Logs\standalone-dlssnr.log`. It reports runtime discovery, core/snippet initialization, both feature creation results, per-stage evaluation failures, the active input/output contract, and initial successful frames.
 

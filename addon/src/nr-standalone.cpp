@@ -21,7 +21,7 @@
 #include <nvsdk_ngx_params.h>
 #include <nvsdk_ngx_defs_dlssd.h>
 
-#define ADDON_VERSION "1.0.0-lab-proven"
+#define ADDON_VERSION "1.1.0-on-present"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -75,7 +75,8 @@ static bool g_depth_reversed = true;
 static bool g_neural_failed = false;
 static bool g_neural_ready = false;
 static bool g_mask_available = false;
-static char g_neural_status[256] = "waiting for DLSS5_Feed guides";
+static bool g_using_external_guides = false;
+static char g_neural_status[256] = "waiting for first game present";
 static std::atomic<unsigned long long> g_nr_frames{0};
 static std::atomic<unsigned long long> g_sr_frames{0};
 
@@ -94,6 +95,12 @@ static UINT64 g_neural_fence_value;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_packed_color;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_nr_stage;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_sr_stage;
+static Microsoft::WRL::ComPtr<ID3D12Resource> g_fallback_motion;
+static Microsoft::WRL::ComPtr<ID3D12Resource> g_fallback_depth;
+static Microsoft::WRL::ComPtr<ID3D12Resource> g_captured_motion;
+static Microsoft::WRL::ComPtr<ID3D12Resource> g_captured_depth;
+static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> g_guide_rtv_heap;
+static UINT g_guide_rtv_stride;
 static UINT g_resource_input_width;
 static UINT g_resource_input_height;
 static UINT g_resource_output_width;
@@ -268,13 +275,63 @@ static HMODULE LoadInstalledNgxCore()
     return module;
 }
 
+static void BuildRuntimePath(wchar_t (&path)[MAX_PATH], const wchar_t *directory, const wchar_t *name)
+{
+    const size_t length = wcslen(directory);
+    const bool has_separator = length != 0 && (directory[length - 1] == L'\\' || directory[length - 1] == L'/');
+    swprintf_s(path, L"%ls%ls%ls", directory, has_separator ? L"" : L"\\", name);
+}
+
+static bool HasStandaloneRuntime(const wchar_t *directory)
+{
+    for (const wchar_t *name : {L"nvngx_dlssnr.dll", L"nvngx_dlss.dll", L"nvngx.dll"})
+    {
+        wchar_t path[MAX_PATH] = {};
+        BuildRuntimePath(path, directory, name);
+        const DWORD attributes = GetFileAttributesW(path);
+        if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+            return false;
+    }
+    return true;
+}
+
+static bool FindStandaloneRuntime(wchar_t (&directory)[MAX_PATH])
+{
+    if (HasStandaloneRuntime(g_addon_directory))
+    {
+        wcscpy_s(directory, g_addon_directory);
+        return true;
+    }
+
+    wchar_t local_app_data[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH) != 0)
+    {
+        wchar_t custom_addons[MAX_PATH] = {};
+        swprintf_s(custom_addons, L"%ls\\RHI\\Custom\\Addons", local_app_data);
+        if (HasStandaloneRuntime(custom_addons))
+        {
+            wcscpy_s(directory, custom_addons);
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool InitializeNgx()
 {
     if (g_ngx_params != nullptr) return true;
+    wchar_t runtime_directory[MAX_PATH] = {};
+    if (!FindStandaloneRuntime(runtime_directory))
+    {
+        Log("standalone runtime set not found beside addon or in %%LOCALAPPDATA%%\\RHI\\Custom\\Addons");
+        Fail("private runtime dependency set missing", ERROR_FILE_NOT_FOUND);
+        return false;
+    }
     wchar_t nr_path[MAX_PATH] = {}, dlss_path[MAX_PATH] = {}, bridge_path[MAX_PATH] = {};
-    swprintf_s(nr_path, L"%snvngx_dlssnr.dll", g_addon_directory);
-    swprintf_s(dlss_path, L"%snvngx_dlss.dll", g_addon_directory);
-    swprintf_s(bridge_path, L"%snvngx.dll", g_addon_directory);
+    BuildRuntimePath(nr_path, runtime_directory, L"nvngx_dlssnr.dll");
+    BuildRuntimePath(dlss_path, runtime_directory, L"nvngx_dlss.dll");
+    BuildRuntimePath(bridge_path, runtime_directory, L"nvngx.dll");
+    Log("standalone private runtime directory: %ls", runtime_directory);
     for (const wchar_t *path : {nr_path, dlss_path, bridge_path})
     {
         WIN32_FILE_ATTRIBUTE_DATA data = {};
@@ -475,6 +532,28 @@ static bool CreateTexture(UINT width, UINT height, DXGI_FORMAT format, bool uav,
     return true;
 }
 
+static bool CreateGuideTexture(UINT width, UINT height, DXGI_FORMAT format, const float clear_color[4],
+    UINT descriptor_index, Microsoft::WRL::ComPtr<ID3D12Resource> &resource)
+{
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width; desc.Height = height; desc.DepthOrArraySize = 1; desc.MipLevels = 1;
+    desc.Format = format; desc.SampleDesc.Count = 1; desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE clear = {};
+    clear.Format = format;
+    memcpy(clear.Color, clear_color, sizeof(clear.Color));
+    const HRESULT hr = g_neural_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &clear, IID_PPV_ARGS(&resource));
+    if (FAILED(hr)) { Fail("fallback guide allocation", static_cast<unsigned int>(hr)); return false; }
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_guide_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += static_cast<SIZE_T>(descriptor_index) * g_guide_rtv_stride;
+    g_neural_device->CreateRenderTargetView(resource.Get(), nullptr, rtv);
+    return true;
+}
+
 static void PublishOutput(ID3D12Resource *resource)
 {
     resource->AddRef();
@@ -485,7 +564,7 @@ static void PublishOutput(ID3D12Resource *resource)
 
 static bool EnsureStandaloneResources(ID3D12Resource *backbuffer)
 {
-    if (g_neural_failed || !backbuffer || !g_command_queue || !g_rs_queue) return false;
+    if (g_neural_failed || !backbuffer || !g_command_queue) return false;
     const D3D12_RESOURCE_DESC backbuffer_desc = backbuffer->GetDesc();
     const UINT iw = static_cast<UINT>(backbuffer_desc.Width), ih = backbuffer_desc.Height;
     const UINT ow = g_output_width.load(), oh = g_output_height.load();
@@ -494,6 +573,11 @@ static bool EnsureStandaloneResources(ID3D12Resource *backbuffer)
     if (iw > ow || ih > oh)
     {
         SetStatus("render resolution exceeds native output");
+        return false;
+    }
+    if (iw == ow && ih == oh)
+    {
+        SetStatus("waiting for a reduced fullscreen render resolution");
         return false;
     }
     if (g_neural_ready)
@@ -510,7 +594,12 @@ static bool EnsureStandaloneResources(ID3D12Resource *backbuffer)
         g_neural_allocator.Get(), nullptr, IID_PPV_ARGS(&g_neural_list));
     if (SUCCEEDED(hr)) hr = g_neural_list->Close();
     if (SUCCEEDED(hr)) hr = g_neural_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_neural_fence));
+    D3D12_DESCRIPTOR_HEAP_DESC guide_heap_desc = {};
+    guide_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    guide_heap_desc.NumDescriptors = 2;
+    if (SUCCEEDED(hr)) hr = g_neural_device->CreateDescriptorHeap(&guide_heap_desc, IID_PPV_ARGS(&g_guide_rtv_heap));
     if (FAILED(hr)) { Fail("D3D12 neural command infrastructure", static_cast<unsigned int>(hr)); return false; }
+    g_guide_rtv_stride = g_neural_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     g_neural_fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!g_neural_fence_event) { Fail("neural fence event", GetLastError()); return false; }
 
@@ -520,15 +609,19 @@ static bool EnsureStandaloneResources(ID3D12Resource *backbuffer)
     const DXGI_FORMAT result_format = g_color_profile == ColorProfile::Srgb ?
         DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
     if (!CreateTexture(ow, oh, input_format, false,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g_packed_color) ||
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g_packed_color) ||
         !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g_nr_stage) ||
         !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, g_sr_stage)) return false;
+    const float motion_clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const float depth_clear[4] = {g_depth_reversed ? 0.0f : 1.0f, 0.0f, 0.0f, 0.0f};
+    if (!CreateGuideTexture(iw, ih, DXGI_FORMAT_R16G16_FLOAT, motion_clear, 0, g_fallback_motion) ||
+        !CreateGuideTexture(iw, ih, DXGI_FORMAT_R32_FLOAT, depth_clear, 1, g_fallback_depth)) return false;
     if (!InitializeNgx() || !CreateFeatures()) return false;
     PublishOutput(g_sr_stage.Get());
     g_neural_ready = true;
-    SetStatus("active: NR + DLSS SR");
-    Log("resources ready: packed=%ux%u fmt=%u, NR/SR=%ux%u fmt=%u",
-        ow, oh, static_cast<unsigned int>(input_format), ow, oh, static_cast<unsigned int>(result_format));
+    SetStatus("active on present: NR + DLSS SR (fallback guides)");
+    Log("resources ready on present: packed=%ux%u fmt=%u, NR/SR=%ux%u fmt=%u; fallback guides=%ux%u",
+        ow, oh, static_cast<unsigned int>(input_format), ow, oh, static_cast<unsigned int>(result_format), iw, ih);
     return true;
 }
 
@@ -612,7 +705,7 @@ static void ResolveHandles(reshade::api::effect_runtime *runtime)
         g_depth_variable.handle ? "found" : "MISSING", g_mask_variable.handle ? "found" : "optional/missing",
         g_depth_reversed ? 1 : 0);
     if (!g_feed_technique.handle || !g_mv_variable.handle || !g_depth_variable.handle)
-        SetStatus("waiting for DLSS5_Feed.fx and guide textures");
+        Log("DLSS5_Feed is optional; internal fallback guides will be used by the on-present pipeline");
 }
 
 static void OnInitEffectRuntime(reshade::api::effect_runtime *runtime) { ResolveHandles(runtime); }
@@ -621,15 +714,16 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *runtime)
 {
     if (runtime != g_runtime) return;
     g_runtime = nullptr; g_feed_technique = {}; g_mv_variable = {}; g_depth_variable = {}; g_mask_variable = {};
-    SetStatus("effect runtime reloading");
+    g_captured_motion.Reset(); g_captured_depth.Reset();
+    g_using_external_guides = false;
 }
 
 static void OnRenderTechnique(reshade::api::effect_runtime *runtime, reshade::api::effect_technique technique,
-    reshade::api::command_list *command_list, reshade::api::resource_view rtv, reshade::api::resource_view)
+    reshade::api::command_list *, reshade::api::resource_view rtv, reshade::api::resource_view)
 {
     using namespace reshade::api;
     if (!g_enabled || g_neural_failed || runtime != g_runtime || !g_feed_technique.handle ||
-        technique.handle != g_feed_technique.handle || !command_list) return;
+        technique.handle != g_feed_technique.handle) return;
     resource_view mv_srv = {}, mv_srgb = {}, depth_srv = {}, depth_srgb = {}, mask_srv = {}, mask_srgb = {};
     runtime->get_texture_binding(g_mv_variable, &mv_srv, &mv_srgb);
     runtime->get_texture_binding(g_depth_variable, &depth_srv, &depth_srgb);
@@ -640,11 +734,7 @@ static void OnRenderTechnique(reshade::api::effect_runtime *runtime, reshade::ap
     auto *motion = reinterpret_cast<ID3D12Resource *>(device->get_resource_from_view(mv_srv).handle);
     auto *depth = reinterpret_cast<ID3D12Resource *>(device->get_resource_from_view(depth_srv).handle);
     auto *mask = mask_srv.handle ? reinterpret_cast<ID3D12Resource *>(device->get_resource_from_view(mask_srv).handle) : nullptr;
-    if (!backbuffer || !motion || !depth)
-    {
-        SetStatus("waiting for color, motion-vector and depth resources");
-        return;
-    }
+    if (!backbuffer || !motion || !depth) return;
     const D3D12_RESOURCE_DESC color_desc = backbuffer->GetDesc();
     const D3D12_RESOURCE_DESC mv_desc = motion->GetDesc();
     const D3D12_RESOURCE_DESC depth_desc = depth->GetDesc();
@@ -661,82 +751,147 @@ static void OnRenderTechnique(reshade::api::effect_runtime *runtime, reshade::ap
                 mv_desc.Width, mv_desc.Height, static_cast<unsigned int>(mv_desc.Format),
                 depth_desc.Width, depth_desc.Height, static_cast<unsigned int>(depth_desc.Format));
         }
-        SetStatus("guide texture dimensions/formats do not match");
         return;
     }
     g_mask_available = mask && mask->GetDesc().Width == color_desc.Width && mask->GetDesc().Height == color_desc.Height &&
         mask->GetDesc().Format == DXGI_FORMAT_R8_UNORM;
-    g_input_width = static_cast<UINT>(color_desc.Width); g_input_height = color_desc.Height;
-    if (!EnsureStandaloneResources(backbuffer)) return;
+    const bool first_capture = !g_captured_motion || !g_captured_depth;
+    g_captured_motion = motion;
+    g_captured_depth = depth;
+    if (first_capture)
+        Log("captured optional DLSS5_Feed guide resources for subsequent on-present frames: %ux%u",
+            static_cast<unsigned int>(color_desc.Width), color_desc.Height);
+}
 
-    const resource packed = {reinterpret_cast<uint64_t>(g_packed_color.Get())};
-    const resource resources[2] = {backbuffer_resource, packed};
-    const resource_usage before[2] = {resource_usage::render_target, resource_usage::shader_resource};
-    const resource_usage copying[2] = {resource_usage::copy_source, resource_usage::copy_dest};
-    command_list->barrier(2, resources, before, copying);
-    const subresource_box source_box = {0, 0, 0, g_resource_input_width, g_resource_input_height, 1};
-    const subresource_box dest_box = source_box;
-    command_list->copy_texture_region(backbuffer_resource, 0, &source_box, packed, 0, &dest_box);
-    command_list->barrier(2, resources, copying, before);
-    g_rs_queue->flush_immediate_command_list();
+static bool CapturedGuidesMatchInput()
+{
+    if (!g_captured_motion || !g_captured_depth) return false;
+    const D3D12_RESOURCE_DESC motion = g_captured_motion->GetDesc();
+    const D3D12_RESOURCE_DESC depth = g_captured_depth->GetDesc();
+    return motion.Width == g_resource_input_width && motion.Height == g_resource_input_height &&
+        depth.Width == g_resource_input_width && depth.Height == g_resource_input_height &&
+        motion.Format == DXGI_FORMAT_R16G16_FLOAT && depth.Format == DXGI_FORMAT_R32_FLOAT;
+}
 
-    if (!BeginNeuralCommands()) return;
+static D3D12_RESOURCE_BARRIER Transition(ID3D12Resource *resource,
+    D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+{
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = resource;
+    barrier.Transition.StateBefore = before;
+    barrier.Transition.StateAfter = after;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    return barrier;
+}
+
+static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
+{
+    if (!EnsureStandaloneResources(backbuffer)) return false;
+
+    const bool use_external_guides = CapturedGuidesMatchInput();
+    if (use_external_guides != g_using_external_guides)
+    {
+        g_using_external_guides = use_external_guides;
+        g_need_history_reset = true;
+        Log("on-present guide source changed to %s", use_external_guides ? "captured DLSS5_Feed" : "internal fallback");
+    }
+    ID3D12Resource *motion = use_external_guides ? g_captured_motion.Get() : g_fallback_motion.Get();
+    ID3D12Resource *depth = use_external_guides ? g_captured_depth.Get() : g_fallback_depth.Get();
+
+    if (!BeginNeuralCommands()) return false;
+    D3D12_RESOURCE_BARRIER copy_begin[2] = {
+        Transition(backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        Transition(g_packed_color.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)
+    };
+    g_neural_list->ResourceBarrier(2, copy_begin);
+    D3D12_TEXTURE_COPY_LOCATION source = {};
+    source.pResource = backbuffer;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    source.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION destination = {};
+    destination.pResource = g_packed_color.Get();
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destination.SubresourceIndex = 0;
+    const D3D12_BOX source_box = {0, 0, 0, g_resource_input_width, g_resource_input_height, 1};
+    g_neural_list->CopyTextureRegion(&destination, 0, 0, 0, &source, &source_box);
+    D3D12_RESOURCE_BARRIER copy_end[2] = {
+        Transition(backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT),
+        Transition(g_packed_color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+    };
+    g_neural_list->ResourceBarrier(2, copy_end);
+
+    if (!use_external_guides)
+    {
+        D3D12_RESOURCE_BARRIER guides_to_rtv[2] = {
+            Transition(motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
+            Transition(depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET)
+        };
+        g_neural_list->ResourceBarrier(2, guides_to_rtv);
+        D3D12_CPU_DESCRIPTOR_HANDLE motion_rtv = g_guide_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_CPU_DESCRIPTOR_HANDLE depth_rtv = motion_rtv;
+        depth_rtv.ptr += g_guide_rtv_stride;
+        const float motion_clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        const float depth_clear[4] = {g_depth_reversed ? 0.0f : 1.0f, 0.0f, 0.0f, 0.0f};
+        g_neural_list->ClearRenderTargetView(motion_rtv, motion_clear, 0, nullptr);
+        g_neural_list->ClearRenderTargetView(depth_rtv, depth_clear, 0, nullptr);
+        D3D12_RESOURCE_BARRIER guides_to_srv[2] = {
+            Transition(motion, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            Transition(depth, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+        };
+        g_neural_list->ResourceBarrier(2, guides_to_srv);
+    }
+
     const bool reset = g_need_history_reset || g_reset_every_frame;
     g_need_history_reset = false;
     SetNrEvaluationContract(depth, motion, reset);
-    D3D12_RESOURCE_BARRIER sr_to_uav = {};
-    sr_to_uav.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    sr_to_uav.Transition.pResource = g_sr_stage.Get();
-    sr_to_uav.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    sr_to_uav.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    sr_to_uav.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    D3D12_RESOURCE_BARRIER sr_to_uav = Transition(
+        g_sr_stage.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     g_neural_list->ResourceBarrier(1, &sr_to_uav);
     DWORD exception = 0;
-    NVSDK_NGX_Result nr_result = SafeEvaluate(true, &exception);
+    const NVSDK_NGX_Result nr_result = SafeEvaluate(true, &exception);
     if (exception)
     {
         g_neural_list->Close();
-        Fail("NR evaluation exception", exception);
-        return;
+        Fail("on-present NR evaluation exception", exception);
+        return false;
     }
-    D3D12_RESOURCE_BARRIER nr_to_srv = {};
-    nr_to_srv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    nr_to_srv.Transition.pResource = g_nr_stage.Get();
-    nr_to_srv.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    nr_to_srv.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    nr_to_srv.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    D3D12_RESOURCE_BARRIER nr_to_srv = Transition(
+        g_nr_stage.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     g_neural_list->ResourceBarrier(1, &nr_to_srv);
     SetSrEvaluationContract(depth, motion, reset);
     NVSDK_NGX_Result sr_result = static_cast<NVSDK_NGX_Result>(0xBAD00004);
     if (NVSDK_NGX_SUCCEED(nr_result)) sr_result = SafeEvaluate(false, &exception);
-    D3D12_RESOURCE_BARRIER restore[2] = {nr_to_srv, sr_to_uav};
-    restore[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    restore[0].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    restore[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    restore[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
     if (exception)
     {
         g_neural_list->Close();
-        Fail("DLSS SR evaluation exception", exception);
-        return;
+        Fail("on-present DLSS SR evaluation exception", exception);
+        return false;
     }
+    D3D12_RESOURCE_BARRIER restore[2] = {
+        Transition(g_nr_stage.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        Transition(g_sr_stage.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON)
+    };
     g_neural_list->ResourceBarrier(2, restore);
-    if (!SubmitNeuralCommands(false)) return;
+    if (!SubmitNeuralCommands(false)) return false;
     if (NVSDK_NGX_FAILED(nr_result) || NVSDK_NGX_FAILED(sr_result))
     {
-        Log("evaluation failure: NR=0x%08X (%s), SR=0x%08X (%s)", static_cast<unsigned int>(nr_result), ResultName(nr_result),
+        Log("on-present evaluation failure: NR=0x%08X (%s), SR=0x%08X (%s)",
+            static_cast<unsigned int>(nr_result), ResultName(nr_result),
             static_cast<unsigned int>(sr_result), ResultName(sr_result));
-        Fail(NVSDK_NGX_FAILED(nr_result) ? "NR evaluation" : "DLSS SR evaluation",
+        Fail(NVSDK_NGX_FAILED(nr_result) ? "on-present NR evaluation" : "on-present DLSS SR evaluation",
             static_cast<unsigned int>(NVSDK_NGX_FAILED(nr_result) ? nr_result : sr_result));
-        return;
+        return false;
     }
+
     const unsigned long long frame = ++g_nr_frames;
     ++g_sr_frames;
-    SetStatus("active: NR + DLSS SR");
+    SetStatus("active on present: NR + DLSS SR (%s guides)", use_external_guides ? "captured" : "fallback");
     if (frame <= 8 || frame % 1800 == 0)
-        Log("frame %llu: NR=Success, SR=Success, reset=%d, guides=%ux%u, output=%ux%u, mask=%s",
-            frame, reset ? 1 : 0, g_resource_input_width, g_resource_input_height,
-            g_resource_output_width, g_resource_output_height, g_mask_available ? "valid" : "automatic");
+        Log("on-present frame %llu: NR=Success, SR=Success, reset=%d, guides=%s %ux%u, output=%ux%u",
+            frame, reset ? 1 : 0, use_external_guides ? "captured" : "fallback",
+            g_resource_input_width, g_resource_input_height, g_resource_output_width, g_resource_output_height);
+    return true;
 }
 
 static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
@@ -943,8 +1098,13 @@ static void OnInitCommandQueue(reshade::api::command_queue *queue)
     Log("captured D3D12 graphics queue: reshade=%p native=%p", queue, g_command_queue);
 }
 
-static void OnPresent(reshade::api::command_queue *, reshade::api::swapchain *, const reshade::api::rect *, const reshade::api::rect *, uint32_t, const reshade::api::rect *)
+static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain,
+    const reshade::api::rect *, const reshade::api::rect *, uint32_t, const reshade::api::rect *)
 {
+    if (!queue || !swapchain || !g_rs_queue || queue != g_rs_queue ||
+        reinterpret_cast<ID3D12CommandQueue *>(queue->get_native()) != g_command_queue) return;
+    const HWND present_window = static_cast<HWND>(swapchain->get_hwnd());
+    if (g_game_window && present_window && present_window != g_game_window) return;
     if (!g_enabled || g_neural_failed)
     {
         if (g_proxy_window && !g_proxy_hidden)
@@ -972,6 +1132,14 @@ static void OnPresent(reshade::api::command_queue *, reshade::api::swapchain *, 
     }
     g_home_down = home;
     g_alt_x_down = alt_x;
+    const reshade::api::resource backbuffer_resource = swapchain->get_current_back_buffer();
+    auto *backbuffer = reinterpret_cast<ID3D12Resource *>(backbuffer_resource.handle);
+    if (!backbuffer) return;
+    const D3D12_RESOURCE_DESC backbuffer_desc = backbuffer->GetDesc();
+    g_input_width = static_cast<UINT>(backbuffer_desc.Width);
+    g_input_height = backbuffer_desc.Height;
+    if (!ExecuteOnPresentPipeline(backbuffer)) return;
+
     ID3D12Resource *source = g_nr_output;
     if (g_proxy_hidden || g_sr_frames.load() == 0 || source == nullptr || !EnsureProxy(source)) return;
 
@@ -1114,9 +1282,12 @@ static void DrawOverlay(reshade::api::effect_runtime *)
 
     ImGui::Separator();
     ImGui::Text("Status: %s", g_neural_status);
+    ImGui::TextUnformatted("Activation boundary: game OnPresent (standalone private NGX runtime)");
     ImGui::Text("Pipeline: feature 18 NR frames=%llu; DLSS SR frames=%llu", g_nr_frames.load(), g_sr_frames.load());
     ImGui::Text("Contract: %ux%u -> %ux%u", g_input_width.load(), g_input_height.load(), g_output_width.load(), g_output_height.load());
-    ImGui::Text("Guides: depth/MV required; validation mask=%s", g_mask_available ? "valid" : "automatic mask");
+    ImGui::Text("Guides: %s; validation mask=%s",
+        g_using_external_guides ? "captured DLSS5_Feed" : "internal fallback",
+        g_mask_available ? "valid" : "automatic mask");
     ImGui::Text("Native proxy: %s; frames=%llu", g_proxy_swapchain ? "presenting" : (g_proxy_failed ? "failed" : "waiting"), g_frames_presented.load());
     ImGui::TextWrapped("Set the reduced render resolution in Conan's fullscreen menu. The addon keeps the desktop at native resolution and performs NR followed by DLSS Super Resolution.");
     ImGui::TextUnformatted("Press F10 to hide/show native output. Home and Alt+X hide it for overlays.");
@@ -1204,6 +1375,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         if (g_proxy_window_thread) CloseHandle(g_proxy_window_thread);
         if (g_proxy_window_ready) CloseHandle(g_proxy_window_ready);
         if (g_nr_output) g_nr_output->Release();
+        g_captured_depth.Reset(); g_captured_motion.Reset();
+        g_fallback_depth.Reset(); g_fallback_motion.Reset(); g_guide_rtv_heap.Reset();
         g_sr_stage.Reset(); g_nr_stage.Reset(); g_packed_color.Reset();
         g_neural_list.Reset(); g_neural_allocator.Reset(); g_neural_fence.Reset(); g_neural_device.Reset();
         if (g_neural_fence_event) CloseHandle(g_neural_fence_event);
