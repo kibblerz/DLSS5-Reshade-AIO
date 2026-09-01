@@ -602,6 +602,11 @@ static void ResolveHandles(reshade::api::effect_runtime *runtime)
     g_mask_variable = runtime->find_texture_variable("DLSS5_Feed.fx", "DLSS5_Mask");
     char reversed[16] = {};
     g_depth_reversed = !runtime->get_preprocessor_definition("RESHADE_DEPTH_INPUT_IS_REVERSED", reversed) || atoi(reversed) != 0;
+    if (g_enabled && g_feed_technique.handle && !runtime->get_technique_state(g_feed_technique))
+    {
+        runtime->set_technique_state(g_feed_technique, true);
+        Log("DLSS5_Feed technique enabled automatically");
+    }
     Log("DLSS5_Feed handles: technique=%s mv=%s depth=%s mask=%s depth_reversed=%d",
         g_feed_technique.handle ? "found" : "MISSING", g_mv_variable.handle ? "found" : "MISSING",
         g_depth_variable.handle ? "found" : "MISSING", g_mask_variable.handle ? "found" : "optional/missing",
@@ -1065,6 +1070,8 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     {
         reshade::set_config_value(nullptr, section, "Enabled", g_enabled ? "1" : "0");
         g_need_history_reset = true;
+        if (g_runtime && g_feed_technique.handle)
+            g_runtime->set_technique_state(g_feed_technique, g_enabled);
         if (g_proxy_window)
         {
             g_proxy_hidden = !g_enabled;
