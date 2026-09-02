@@ -23,7 +23,7 @@
 #include <nvsdk_ngx_defs_dlssd.h>
 #include <nvsdk_ngx_defs_dlssg.h>
 
-#define ADDON_VERSION "1.5.1-borderless-framegen"
+#define ADDON_VERSION "1.5.2-uncapped-framegen"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -48,8 +48,8 @@ static HANDLE g_proxy_window_thread;
 static HANDLE g_proxy_window_ready;
 static HHOOK g_proxy_mouse_hook;
 static Microsoft::WRL::ComPtr<IDXGISwapChain3> g_proxy_swapchain;
-static Microsoft::WRL::ComPtr<ID3D12CommandAllocator> g_proxy_allocator;
-static Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> g_proxy_list;
+static Microsoft::WRL::ComPtr<ID3D12CommandAllocator> g_proxy_allocators[2];
+static Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> g_proxy_lists[2];
 static Microsoft::WRL::ComPtr<ID3D12Fence> g_proxy_fence;
 static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> g_proxy_rtv_heap;
 static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> g_proxy_srv_heap;
@@ -60,6 +60,7 @@ static UINT g_proxy_srv_stride;
 static DXGI_FORMAT g_proxy_present_format;
 static HANDLE g_proxy_fence_event;
 static UINT64 g_proxy_fence_value;
+static bool g_proxy_allow_tearing;
 static bool g_proxy_failed;
 static std::atomic<bool> g_proxy_hidden{false};
 static bool g_show_neural_output = true;
@@ -71,8 +72,11 @@ static std::atomic<unsigned long long> g_overlay_mouse_events{0};
 static unsigned long long g_last_logged_mouse_event;
 static bool g_show_proxy_fps = true;
 static std::atomic<unsigned int> g_proxy_fps{0};
-static ULONGLONG g_fps_sample_start;
-static unsigned int g_fps_sample_frames;
+static std::atomic<unsigned int> g_source_fps{0};
+static ULONGLONG g_source_fps_sample_start;
+static unsigned int g_source_fps_sample_frames;
+static ULONGLONG g_output_fps_sample_start;
+static unsigned int g_output_fps_sample_frames;
 static bool g_f10_down;
 static bool g_home_down;
 static bool g_alt_x_down;
@@ -1537,16 +1541,28 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
     return DefWindowProcW(hwnd, message, wparam, lparam);
 }
 
-static void UpdateProxyFps()
+static void UpdateSourceFps()
 {
     const ULONGLONG now = GetTickCount64();
-    if (g_fps_sample_start == 0) g_fps_sample_start = now;
-    ++g_fps_sample_frames;
-    const ULONGLONG elapsed = now - g_fps_sample_start;
+    if (g_source_fps_sample_start == 0) g_source_fps_sample_start = now;
+    ++g_source_fps_sample_frames;
+    const ULONGLONG elapsed = now - g_source_fps_sample_start;
     if (elapsed < 500) return;
-    g_proxy_fps = static_cast<unsigned int>((static_cast<ULONGLONG>(g_fps_sample_frames) * 1000 + elapsed / 2) / elapsed);
-    g_fps_sample_frames = 0;
-    g_fps_sample_start = now;
+    g_source_fps = static_cast<unsigned int>((static_cast<ULONGLONG>(g_source_fps_sample_frames) * 1000 + elapsed / 2) / elapsed);
+    g_source_fps_sample_frames = 0;
+    g_source_fps_sample_start = now;
+}
+
+static void UpdateOutputFps()
+{
+    const ULONGLONG now = GetTickCount64();
+    if (g_output_fps_sample_start == 0) g_output_fps_sample_start = now;
+    ++g_output_fps_sample_frames;
+    const ULONGLONG elapsed = now - g_output_fps_sample_start;
+    if (elapsed < 500) return;
+    g_proxy_fps = static_cast<unsigned int>((static_cast<ULONGLONG>(g_output_fps_sample_frames) * 1000 + elapsed / 2) / elapsed);
+    g_output_fps_sample_frames = 0;
+    g_output_fps_sample_start = now;
 }
 
 static DWORD WINAPI ProxyWindowThread(void *)
@@ -1632,11 +1648,19 @@ static bool EnsureProxy(ID3D12Resource *source)
     Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
     const char *failed_stage = "CreateDXGIFactory1";
+    g_proxy_allow_tearing = false;
+    Microsoft::WRL::ComPtr<IDXGIFactory5> factory5;
+    BOOL allow_tearing = FALSE;
+    if (SUCCEEDED(hr) && SUCCEEDED(factory.As(&factory5)) &&
+        SUCCEEDED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+            &allow_tearing, sizeof(allow_tearing))))
+        g_proxy_allow_tearing = allow_tearing == TRUE;
     DXGI_SWAP_CHAIN_DESC1 desc = {};
     desc.Width = width; desc.Height = height; desc.Format = present_format;
     desc.SampleDesc.Count = 1; desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     desc.BufferCount = 2; desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     desc.Scaling = DXGI_SCALING_STRETCH; desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+    if (g_proxy_allow_tearing) desc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
     Microsoft::WRL::ComPtr<IDXGISwapChain1> swapchain1;
     if (SUCCEEDED(hr)) { failed_stage = "CreateSwapChainForHwnd"; hr = factory->CreateSwapChainForHwnd(g_command_queue, g_proxy_window, &desc, nullptr, nullptr, &swapchain1); }
     if (SUCCEEDED(hr)) { failed_stage = "IDXGISwapChain3"; hr = swapchain1.As(&g_proxy_swapchain); }
@@ -1652,9 +1676,18 @@ static bool EnsureProxy(ID3D12Resource *source)
     }
     Microsoft::WRL::ComPtr<ID3D12Device> device;
     if (SUCCEEDED(hr)) { failed_stage = "ID3D12CommandQueue::GetDevice"; hr = g_command_queue->GetDevice(IID_PPV_ARGS(&device)); }
-    if (SUCCEEDED(hr)) { failed_stage = "CreateCommandAllocator"; hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_proxy_allocator)); }
-    if (SUCCEEDED(hr)) { failed_stage = "CreateCommandList"; hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_proxy_allocator.Get(), nullptr, IID_PPV_ARGS(&g_proxy_list)); }
-    if (SUCCEEDED(hr)) { failed_stage = "CloseCommandList"; hr = g_proxy_list->Close(); }
+    for (UINT index = 0; index < 2 && SUCCEEDED(hr); ++index)
+    {
+        failed_stage = "CreateCommandAllocator";
+        hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_proxy_allocators[index]));
+        if (SUCCEEDED(hr))
+        {
+            failed_stage = "CreateCommandList";
+            hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                g_proxy_allocators[index].Get(), nullptr, IID_PPV_ARGS(&g_proxy_lists[index]));
+        }
+        if (SUCCEEDED(hr)) { failed_stage = "CloseCommandList"; hr = g_proxy_lists[index]->Close(); }
+    }
     if (SUCCEEDED(hr)) { failed_stage = "CreateFence"; hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_proxy_fence)); }
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; heap_desc.NumDescriptors = 2;
@@ -1744,8 +1777,9 @@ static bool EnsureProxy(ID3D12Resource *source)
         g_proxy_swapchain.Reset(); return false;
     }
     g_proxy_present_format = present_format;
-    Log("native proxy ready: %ux%u source_format=%u present_format=%u hwnd=%p", width, height,
-        static_cast<unsigned int>(source_desc.Format), static_cast<unsigned int>(present_format), g_proxy_window);
+    Log("native proxy ready: %ux%u source_format=%u present_format=%u hwnd=%p tearing=%s", width, height,
+        static_cast<unsigned int>(source_desc.Format), static_cast<unsigned int>(present_format), g_proxy_window,
+        g_proxy_allow_tearing ? "supported" : "unavailable");
     return true;
 }
 
@@ -1834,8 +1868,10 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
 
     for (UINT present_index = 0; present_index < present_count; ++present_index)
     {
-        if (FAILED(g_proxy_allocator->Reset()) ||
-            FAILED(g_proxy_list->Reset(g_proxy_allocator.Get(), nullptr))) return false;
+        ID3D12CommandAllocator *allocator = g_proxy_allocators[present_index].Get();
+        ID3D12GraphicsCommandList *list = g_proxy_lists[present_index].Get();
+        if (allocator == nullptr || list == nullptr || FAILED(allocator->Reset()) ||
+            FAILED(list->Reset(allocator, nullptr))) return false;
         Microsoft::WRL::ComPtr<ID3D12Resource> destination;
         const UINT buffer_index = g_proxy_swapchain->GetCurrentBackBufferIndex();
         if (FAILED(g_proxy_swapchain->GetBuffer(buffer_index, IID_PPV_ARGS(&destination)))) return false;
@@ -1861,35 +1897,33 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
             Transition(original_source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             Transition(backbuffer, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT)
         };
-        g_proxy_list->ResourceBarrier(4, barriers);
-        ID3D12DescriptorHeap *heaps[] = {g_proxy_srv_heap.Get()}; g_proxy_list->SetDescriptorHeaps(1, heaps);
-        g_proxy_list->SetGraphicsRootSignature(g_proxy_root_signature.Get()); g_proxy_list->SetPipelineState(g_proxy_pipeline.Get());
+        list->ResourceBarrier(4, barriers);
+        ID3D12DescriptorHeap *heaps[] = {g_proxy_srv_heap.Get()}; list->SetDescriptorHeaps(1, heaps);
+        list->SetGraphicsRootSignature(g_proxy_root_signature.Get()); list->SetPipelineState(g_proxy_pipeline.Get());
         auto gpu_srv = g_proxy_srv_heap->GetGPUDescriptorHandleForHeapStart();
         gpu_srv.ptr += static_cast<UINT64>(present_index) * 3 * g_proxy_srv_stride;
-        g_proxy_list->SetGraphicsRootDescriptorTable(0, gpu_srv);
-        g_proxy_list->SetGraphicsRoot32BitConstants(1, 8, &constants, 0);
-        g_proxy_list->RSSetViewports(1, &viewport); g_proxy_list->RSSetScissorRects(1, &scissor);
+        list->SetGraphicsRootDescriptorTable(0, gpu_srv);
+        list->SetGraphicsRoot32BitConstants(1, 8, &constants, 0);
+        list->RSSetViewports(1, &viewport); list->RSSetScissorRects(1, &scissor);
         auto rtv = g_proxy_rtv_heap->GetCPUDescriptorHandleForHeapStart(); rtv.ptr += buffer_index * g_proxy_rtv_stride;
-        g_proxy_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr); g_proxy_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        g_proxy_list->DrawInstanced(3, 1, 0, 0);
-        g_proxy_list->ResourceBarrier(4, barriers + 4);
-        if (FAILED(g_proxy_list->Close())) return false;
-        ID3D12CommandList *lists[] = {g_proxy_list.Get()};
+        list->OMSetRenderTargets(1, &rtv, FALSE, nullptr); list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list->DrawInstanced(3, 1, 0, 0);
+        list->ResourceBarrier(4, barriers + 4);
+        if (FAILED(list->Close())) return false;
+        ID3D12CommandList *lists[] = {list};
         g_command_queue->ExecuteCommandLists(1, lists);
         ++g_proxy_fence_value; g_command_queue->Signal(g_proxy_fence.Get(), g_proxy_fence_value);
-        if (FAILED(g_proxy_swapchain->Present(use_framegen ? 1u : 0u, 0))) return false;
+        const UINT present_flags = g_proxy_allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0u;
+        if (FAILED(g_proxy_swapchain->Present(0, present_flags))) return false;
         ++g_frames_presented;
-        if (present_index + 1 < present_count)
-        {
-            g_proxy_fence->SetEventOnCompletion(g_proxy_fence_value, g_proxy_fence_event);
-            if (WaitForSingleObject(g_proxy_fence_event, 1000) != WAIT_OBJECT_0) return false;
-        }
+        UpdateOutputFps();
     }
     const unsigned long long post_frame = ++g_post_reshade_frames;
     if (post_frame == 1)
         Log("post-ReShade native presentation active; effects and overlay are available to the proxy compositor");
     if (use_framegen && post_frame == 2)
-        Log("experimental DLSS-G presentation active: generated frame then real frame, synchronized at 2x cadence");
+        Log("experimental DLSS-G presentation active: generated frame then real frame, uncapped flip cadence, tearing=%s",
+            g_proxy_allow_tearing ? "enabled" : "unavailable");
     return true;
 }
 
@@ -1936,7 +1970,7 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         Log("native proxy restored after primary borderless presentation resumed");
     }
     if (!AdoptPresentQueue(queue)) return;
-    UpdateProxyFps();
+    UpdateSourceFps();
     const unsigned long long routed_mouse_events = g_overlay_mouse_events.load();
     if (routed_mouse_events != g_last_logged_mouse_event && routed_mouse_events <= 8)
     {
@@ -2175,7 +2209,8 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::Text("Current-frame guide submissions: %llu", g_current_guide_frames.load());
     ImGui::Text("Native proxy: %s; frames=%llu; post-ReShade=%llu", g_proxy_swapchain ? "presenting" : (g_proxy_failed ? "failed" : "waiting"),
         g_frames_presented.load(), g_post_reshade_frames.load());
-    ImGui::Text("Proxy FPS: %u; ReShade menu input: %s", g_proxy_fps.load(),
+    ImGui::Text("Source FPS: %u; proxy presents/sec: %u; ReShade menu input: %s",
+        g_source_fps.load(), g_proxy_fps.load(),
         g_reshade_overlay_open.load() ? "click-through" : "game forwarding");
     ImGui::Text("Routed ReShade mouse events: %llu", g_overlay_mouse_events.load());
     ImGui::Text("Presented image: %s", g_show_neural_output ? "neural native output" : "stretched original backbuffer");
@@ -2271,7 +2306,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::unregister_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
         if (g_proxy_fence_event) CloseHandle(g_proxy_fence_event);
         g_proxy_pipeline.Reset(); g_proxy_root_signature.Reset(); g_proxy_srv_heap.Reset(); g_proxy_rtv_heap.Reset();
-        g_proxy_list.Reset(); g_proxy_allocator.Reset(); g_proxy_fence.Reset(); g_proxy_swapchain.Reset();
+        for (UINT index = 0; index < 2; ++index)
+        {
+            g_proxy_lists[index].Reset();
+            g_proxy_allocators[index].Reset();
+        }
+        g_proxy_fence.Reset(); g_proxy_swapchain.Reset();
         if (g_proxy_window) PostMessageW(g_proxy_window, WM_CLOSE, 0, 0);
         if (g_proxy_window_thread) CloseHandle(g_proxy_window_thread);
         if (g_proxy_window_ready) CloseHandle(g_proxy_window_ready);
