@@ -1090,21 +1090,40 @@ static bool EnsureProxy(ID3D12Resource *source)
 static void OnInitCommandQueue(reshade::api::command_queue *queue)
 {
     if (queue == nullptr || queue->get_device()->get_api() != reshade::api::device_api::d3d12 ||
-        (queue->get_type() & reshade::api::command_queue_type::graphics) != reshade::api::command_queue_type::graphics ||
-        g_command_queue != nullptr) return;
+        (queue->get_type() & reshade::api::command_queue_type::graphics) != reshade::api::command_queue_type::graphics) return;
+    Log("observed D3D12 graphics queue: reshade=%p native=%p", queue, queue->get_native());
+}
+
+static bool AdoptPresentQueue(reshade::api::command_queue *queue)
+{
+    auto *native = reinterpret_cast<ID3D12CommandQueue *>(queue->get_native());
+    if (!native) return false;
+    if (native == g_command_queue)
+    {
+        g_rs_queue = queue;
+        return true;
+    }
+    if (g_neural_ready || g_proxy_swapchain)
+    {
+        Fail("game OnPresent queue changed after initialization");
+        return false;
+    }
+    if (g_command_queue) g_command_queue->Release();
     g_rs_queue = queue;
-    g_command_queue = reinterpret_cast<ID3D12CommandQueue *>(queue->get_native());
-    if (g_command_queue) g_command_queue->AddRef();
-    Log("captured D3D12 graphics queue: reshade=%p native=%p", queue, g_command_queue);
+    g_command_queue = native;
+    g_command_queue->AddRef();
+    Log("adopted authoritative game OnPresent queue: reshade=%p native=%p", queue, g_command_queue);
+    return true;
 }
 
 static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain,
     const reshade::api::rect *, const reshade::api::rect *, uint32_t, const reshade::api::rect *)
 {
-    if (!queue || !swapchain || !g_rs_queue || queue != g_rs_queue ||
-        reinterpret_cast<ID3D12CommandQueue *>(queue->get_native()) != g_command_queue) return;
+    if (!queue || !swapchain) return;
     const HWND present_window = static_cast<HWND>(swapchain->get_hwnd());
     if (g_game_window && present_window && present_window != g_game_window) return;
+    if (!g_game_window && present_window) g_game_window = present_window;
+    if (!AdoptPresentQueue(queue)) return;
     if (!g_enabled || g_neural_failed)
     {
         if (g_proxy_window && !g_proxy_hidden)
