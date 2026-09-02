@@ -1,25 +1,57 @@
-# Standalone DLSS-NR + Super Resolution prototype
+# DLSS5 ReShade AIO
 
-## Basic usage
+Bring Neural Rendering, DLAA/DLSS Super Resolution, and Frame Generation to supported 64-bit Windows games even when the game does not include those features. This is experimental software and currently supports D3D9, D3D11, D3D12, and Vulkan through ReShade.
 
-1. Disable the game's built-in DLSS and antialiasing entirely.
-2. Use fullscreen or fullscreen borderless mode.
-3. Choose the game resolution: native resolution activates DLAA, while a lower resolution activates DLSS Super Resolution.
-4. NR, Frame Generation, and either DLAA or DLSS Super Resolution should report as enabled once the steps above are complete.
+## Quick install
 
-Reduced-resolution DLSS Super Resolution mode can provide **massive performance improvements** compared with native-resolution rendering. Native-resolution DLAA mode instead prioritizes image quality.
+> [!IMPORTANT]
+> The release contains **two required downloads**. Install both `standalone-dlssnr.addon64` **and** `nvngx.dll`. The addon will not initialize with only the `.addon64` file.
 
-- Press **F10** to switch to the unprocessed game output.
-- The addon places an FPS counter at the top of the output because the DLSS presentation approach currently prevents other overlays from working reliably.
-- Project page: [DLSS5-Reshade-AIO](https://github.com/kibblerz/DLSS5-Reshade-AIO)
+1. Install a 64-bit ReShade build with addon support into the folder containing the game's real executable. Launchers often use a different folder, so target the executable that renders the game.
+2. Open the [latest release](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/latest) and download:
+   - `standalone-dlssnr.addon64`
+   - `nvngx.dll` (the required caller bridge)
+3. Put both files beside the game's ReShade DLL and executable. RHI users may instead put them in `%LOCALAPPDATA%\RHI\Custom\Addons`.
+4. Supply `nvngx_dlssnr.dll`, `nvngx_dlss.dll`, and optionally `nvngx_dlssg.dll` from sources whose licenses permit your use. These NVIDIA runtimes cannot be distributed in this repository. The simplest arrangement is to place them beside the addon; see [`runtime/README.md`](runtime/README.md).
+5. Start the game and open ReShade. Confirm that **Standalone DLSS-NR + SR** appears under the Add-ons tab.
 
-## Known issues
+## First-launch setup
 
-- Occasional stuttering may occur.
-- In games without a secondary ReShade runtime on the native proxy, opening ReShade temporarily shows the game's lower-resolution presentation. The native-size DLSS output returns when the menu closes.
-- Changing resolution may cause visual glitching. Restarting the game should fix it.
-- No Man's Sky, and potentially other Vulkan games, may not display the ReShade menu correctly.
-- Additional Vulkan-specific issues may still be present.
+1. Disable the game's built-in **DLSS/upscaling, Frame Generation, and antialiasing**. The addon supplies its own pipeline.
+2. Try fullscreen or borderless first. Windowed mode is also supported and can help games that refuse to create a reduced-resolution fullscreen image.
+3. Select the game resolution:
+   - **Same as the monitor:** the addon automatically uses **DLAA** at a 1:1 render scale.
+   - **Lower than the monitor:** the addon uses **DLSS Super Resolution** to reconstruct the image to the monitor's native size.
+4. If a lower game resolution still reports **DLAA**, the game is still presenting a native-size backbuffer. Switch between fullscreen, borderless, and windowed modes; restart after changing modes if necessary. Use whichever mode makes the overlay report **DLSS SR**.
+5. Neural Rendering and Frame Generation are enabled by default and can be toggled independently in ReShade. Disabling both leaves an SR/DLAA-only pipeline.
+
+Reduced-resolution DLSS SR can provide major performance improvements. Native-resolution DLAA instead prioritizes image quality.
+
+- Press **F10** to compare the processed image with the original game output.
+- The addon draws its own FPS counter because third-party overlays may not appear through its presentation proxy.
+- Logs are written to `%LOCALAPPDATA%\RHI\Logs\standalone-dlssnr.log`.
+
+## Quick troubleshooting
+
+| Symptom | First things to try |
+| --- | --- |
+| Addon is missing from ReShade | Confirm ReShade has addon support, the game is 64-bit, and `standalone-dlssnr.addon64` is beside the actual game executable/ReShade DLL. |
+| `required private runtime dependency missing` | Install `nvngx.dll` **as well as** the addon. Also place `nvngx_dlssnr.dll` and `nvngx_dlss.dll` beside them. `nvngx_dlssg.dll` is needed for Frame Generation. |
+| Lower resolution still says DLAA | Switch between fullscreen, borderless, and windowed. The game must create a genuinely smaller backbuffer before DLSS SR can activate. Restart the game after changing resolution or display mode. |
+| Image is small, smeared, or changes size | Restart the game. Set the resolution and display mode before loading gameplay. Press F10 once to confirm whether the presentation proxy is active. |
+| ReShade menu temporarily makes the image smaller | Close the ReShade menu; the native-size processed output should return. This is a known proxy-input workaround in some games. |
+| Black screen | Close the game, restore native resolution, and try another display mode. Do not repeatedly change resolution while the pipeline is active. Check the persistent log before trying again. |
+| Vulkan says it is waiting for a shared frame | Make sure ReShade's Vulkan layer is active. Install `StandaloneBoundary.fx` when no other ReShade effect is loaded; Vulkan needs an effects boundary for the frame handoff. |
+
+## Known limitations
+
+- Occasional stuttering or uneven Frame Generation pacing may occur.
+- Changing resolution while running may cause visual glitches; restarting usually fixes them.
+- Some games temporarily show their lower-resolution image while the ReShade menu is open.
+- No Man's Sky and potentially other Vulkan games may not display the ReShade menu correctly.
+- Additional game-specific and Vulkan issues are expected.
+
+## Technical details
 
 This project contains two independently useful pieces:
 
@@ -65,7 +97,7 @@ Matrix complete: 0 failing cases out of 9.
 
 Each case writes a text log, a JSON result, and a PPM output. `nr-lab.log` contains the latest detailed run. A passing result requires successful feature-18 creation/evaluation, successful DLSS SR creation/evaluation, and over 95% changed-pixel coverage with every quadrant over 90%.
 
-## Build and use the addon
+## Build from source
 
 Clone with submodules, then install the NVIDIA NGX SDK headers/import library and Khronos Vulkan headers using the instructions under `external\DLSS5-Feeder\external\ngx` and `external\DLSS5-Feeder\external\vulkan`. The closed-source NVIDIA runtime DLLs are not stored in this public repository; place locally obtained copies in `runtime\` as described in `runtime\README.md`.
 
