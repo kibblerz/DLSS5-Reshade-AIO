@@ -57,11 +57,14 @@ texture DLSS5_AIO_Depth
     Format = R32F;
 };
 
+// Responsivity uses R16F because NVIDIA's DLSSD contract accepts R16F or
+// R8_SNORM in the API range. ReShade's plain R8 format is UNORM, so it is kept
+// only for the separate DLSS disocclusion mask.
 texture DLSS5_AIO_RawMask
 {
     Width = BUFFER_WIDTH;
     Height = BUFFER_HEIGHT;
-    Format = R8;
+    Format = R16F;
 };
 sampler sDLSS5_AIO_RawMask
 {
@@ -74,6 +77,29 @@ sampler sDLSS5_AIO_RawMask
 };
 
 texture DLSS5_AIO_Mask
+{
+    Width = BUFFER_WIDTH;
+    Height = BUFFER_HEIGHT;
+    Format = R16F;
+};
+
+texture DLSS5_AIO_RawDisocclusionMask
+{
+    Width = BUFFER_WIDTH;
+    Height = BUFFER_HEIGHT;
+    Format = R8;
+};
+sampler sDLSS5_AIO_RawDisocclusionMask
+{
+    Texture = DLSS5_AIO_RawDisocclusionMask;
+    AddressU = Clamp;
+    AddressV = Clamp;
+    MipFilter = Point;
+    MinFilter = Point;
+    MagFilter = Point;
+};
+
+texture DLSS5_AIO_DisocclusionMask
 {
     Width = BUFFER_WIDTH;
     Height = BUFFER_HEIGHT;
@@ -168,7 +194,7 @@ float DLSS5_AIO_RawDepth(float2 uv)
 // x = appearance mismatch, y = depth mismatch, z = vector inconsistency.
 float4 DLSS5_AIO_ValidateMotion(float2 uv, float2 motion_uv)
 {
-    float4 failure = 0.0;
+    float4 failure = float4(0.0, 0.0, 0.0, 0.0);
     if (!DLSS5_AIO_EnableAdaptiveRejection || DLSS5_AIO_ResetAdaptiveHistory)
         return failure;
 
@@ -222,7 +248,8 @@ float4 DLSS5_AIO_ValidateMotion(float2 uv, float2 motion_uv)
 }
 
 void DLSS5_AIO_CaptureGuides(float4 position : SV_Position, float2 texcoord : TEXCOORD,
-    out float2 motion : SV_Target0, out float depth : SV_Target1, out float mask : SV_Target2)
+    out float2 motion : SV_Target0, out float depth : SV_Target1,
+    out float responsivity : SV_Target2, out float disocclusion : SV_Target3)
 {
     // VORT publishes previous_uv = current_uv + motion. DLSS uses the same
     // direction but expects pixels rather than normalized UV units.
@@ -241,11 +268,15 @@ void DLSS5_AIO_CaptureGuides(float4 position : SV_Position, float2 texcoord : TE
     const float depth_dy = abs(depth - DLSS5_AIO_RawDepth(texcoord + float2(0.0, pixel.y)));
     const float relative_depth_edge = max(depth_dx, depth_dy) / max(abs(depth), 1e-4);
     const float depth_edge = smoothstep(0.015, 0.08, relative_depth_edge);
-    const float adaptive_rejection = max(validation.x, max(validation.y, validation.z));
-    mask = saturate(max(adaptive_rejection, max(outside, max(extreme_flow, depth_edge))));
+    // Appearance change and inconsistent optical flow describe responsive
+    // shading (particles, reflections, foliage and transparency). Depth and
+    // viewport failures instead describe geometric disocclusion. Keeping these
+    // meanings separate lets NR and SR apply the intended temporal policy.
+    responsivity = saturate(max(validation.x, validation.z));
+    disocclusion = saturate(max(validation.y, max(outside, max(extreme_flow, depth_edge))));
 }
 
-float DLSS5_AIO_DilateMask(float4 position : SV_Position, float2 texcoord : TEXCOORD) : SV_Target
+float DLSS5_AIO_DilateResponsivity(float4 position : SV_Position, float2 texcoord : TEXCOORD) : SV_Target
 {
     const float2 pixel = 1.0 / float2(BUFFER_WIDTH, BUFFER_HEIGHT);
     float mask = tex2Dlod(sDLSS5_AIO_RawMask, float4(texcoord, 0.0, 0.0)).x;
@@ -253,6 +284,17 @@ float DLSS5_AIO_DilateMask(float4 position : SV_Position, float2 texcoord : TEXC
     mask = max(mask, tex2Dlod(sDLSS5_AIO_RawMask, float4(texcoord - float2(pixel.x, 0.0), 0.0, 0.0)).x);
     mask = max(mask, tex2Dlod(sDLSS5_AIO_RawMask, float4(texcoord + float2(0.0, pixel.y), 0.0, 0.0)).x);
     mask = max(mask, tex2Dlod(sDLSS5_AIO_RawMask, float4(texcoord - float2(0.0, pixel.y), 0.0, 0.0)).x);
+    return mask;
+}
+
+float DLSS5_AIO_DilateDisocclusion(float4 position : SV_Position, float2 texcoord : TEXCOORD) : SV_Target
+{
+    const float2 pixel = 1.0 / float2(BUFFER_WIDTH, BUFFER_HEIGHT);
+    float mask = tex2Dlod(sDLSS5_AIO_RawDisocclusionMask, float4(texcoord, 0.0, 0.0)).x;
+    mask = max(mask, tex2Dlod(sDLSS5_AIO_RawDisocclusionMask, float4(texcoord + float2(pixel.x, 0.0), 0.0, 0.0)).x);
+    mask = max(mask, tex2Dlod(sDLSS5_AIO_RawDisocclusionMask, float4(texcoord - float2(pixel.x, 0.0), 0.0, 0.0)).x);
+    mask = max(mask, tex2Dlod(sDLSS5_AIO_RawDisocclusionMask, float4(texcoord + float2(0.0, pixel.y), 0.0, 0.0)).x);
+    mask = max(mask, tex2Dlod(sDLSS5_AIO_RawDisocclusionMask, float4(texcoord - float2(0.0, pixel.y), 0.0, 0.0)).x);
     return mask;
 }
 
@@ -278,12 +320,19 @@ technique DLSS5_AIO_Feed
         RenderTarget0 = DLSS5_AIO_MV;
         RenderTarget1 = DLSS5_AIO_Depth;
         RenderTarget2 = DLSS5_AIO_RawMask;
+        RenderTarget3 = DLSS5_AIO_RawDisocclusionMask;
     }
-    pass DilateMask
+    pass DilateResponsivity
     {
         VertexShader = DLSS5_AIO_FullscreenVS;
-        PixelShader = DLSS5_AIO_DilateMask;
+        PixelShader = DLSS5_AIO_DilateResponsivity;
         RenderTarget = DLSS5_AIO_Mask;
+    }
+    pass DilateDisocclusion
+    {
+        VertexShader = DLSS5_AIO_FullscreenVS;
+        PixelShader = DLSS5_AIO_DilateDisocclusion;
+        RenderTarget = DLSS5_AIO_DisocclusionMask;
     }
     pass StoreHistory
     {

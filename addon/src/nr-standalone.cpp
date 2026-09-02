@@ -28,7 +28,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.18-vort-controls-prototype"
+#define ADDON_VERSION "1.7.18-nr-masks-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -136,6 +136,8 @@ static bool g_reset_every_frame = false;
 static bool g_stable_sr_history = false;
 static bool g_vort_motion_enabled = true;
 static bool g_adaptive_smear_reduction = true;
+static bool g_nr_temporal_masks_enabled = true;
+static bool g_nr_temporal_masks_active = false;
 static bool g_nr_enabled = true;
 static bool g_framegen_enabled = true;
 static bool g_framegen_failed = false;
@@ -145,6 +147,7 @@ static bool g_depth_reversed = true;
 static bool g_neural_failed = false;
 static bool g_neural_ready = false;
 static bool g_mask_available = false;
+static bool g_disocclusion_mask_available = false;
 static bool g_using_external_guides = false;
 static char g_neural_status[256] = "waiting for first game present";
 static std::atomic<unsigned long long> g_nr_frames{0};
@@ -157,6 +160,7 @@ static reshade::api::effect_technique g_motion_technique;
 static reshade::api::effect_texture_variable g_mv_variable;
 static reshade::api::effect_texture_variable g_depth_variable;
 static reshade::api::effect_texture_variable g_mask_variable;
+static reshade::api::effect_texture_variable g_disocclusion_mask_variable;
 static reshade::api::effect_uniform_variable g_adaptive_rejection_variable;
 static reshade::api::effect_uniform_variable g_adaptive_history_reset_variable;
 struct BackbufferView
@@ -183,6 +187,7 @@ static Microsoft::WRL::ComPtr<ID3D12Resource> g_fallback_depth;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_captured_motion;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_captured_depth;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_captured_mask;
+static Microsoft::WRL::ComPtr<ID3D12Resource> g_captured_disocclusion_mask;
 static reshade::api::device_api g_present_api = static_cast<reshade::api::device_api>(0);
 static Microsoft::WRL::ComPtr<ID3D11Device> g_legacy_device11;
 static Microsoft::WRL::ComPtr<ID3D11DeviceContext> g_legacy_context11;
@@ -1076,8 +1081,11 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
     g_using_external_guides = false;
     g_last_current_guide_tick = 0;
     g_mask_available = false;
+    g_disocclusion_mask_available = false;
+    g_nr_temporal_masks_active = false;
     g_pending_proxy_frame = false;
     g_captured_motion.Reset(); g_captured_depth.Reset(); g_captured_mask.Reset();
+    g_captured_disocclusion_mask.Reset();
     g_fallback_motion.Reset(); g_fallback_depth.Reset();
     ReleaseLegacyFrameResources();
     g_fg_stage.Reset(); g_sr_stage.Reset(); g_nr_stage.Reset(); g_packed_color.Reset();
@@ -1657,7 +1665,8 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
     return true;
 }
 
-static void SetNrEvaluationContract(ID3D12Resource *depth, ID3D12Resource *motion, bool reset)
+static void SetNrEvaluationContract(ID3D12Resource *depth, ID3D12Resource *motion,
+    ID3D12Resource *responsivity_mask, ID3D12Resource *disocclusion_mask, bool reset)
 {
     const UINT iw = g_resource_input_width, ih = g_resource_input_height;
     for (const char *name : {"Color", "DLSSNR.Color"}) g_ngx_params->Set(name, g_packed_color.Get());
@@ -1674,6 +1683,15 @@ static void SetNrEvaluationContract(ID3D12Resource *depth, ID3D12Resource *motio
     g_ngx_params->Set("DLSS.Input.Color.Subrect.Base.X", 0u); g_ngx_params->Set("DLSS.Input.Color.Subrect.Base.Y", 0u);
     g_ngx_params->Set("DLSS.Input.Depth.Subrect.Base.X", 0u); g_ngx_params->Set("DLSS.Input.Depth.Subrect.Base.Y", 0u);
     g_ngx_params->Set("DLSS.Input.MV.Subrect.Base.X", 0u); g_ngx_params->Set("DLSS.Input.MV.Subrect.Base.Y", 0u);
+    // DLSSD exposes distinct temporal inputs: responsivity tells NR that the
+    // current shading changed independently of geometry, while disocclusion
+    // rejects history for newly visible geometry. Do not collapse the two.
+    g_ngx_params->Set("DLSSD.ResponsivityMask", responsivity_mask);
+    g_ngx_params->Set("DLSSD.ResponsivityMask.Subrect.Base.X", 0u);
+    g_ngx_params->Set("DLSSD.ResponsivityMask.Subrect.Base.Y", 0u);
+    g_ngx_params->Set("DLSS.DisocclusionMask", disocclusion_mask);
+    g_ngx_params->Set("DLSS.DisocclusionMask.Subrect.Base.X", 0u);
+    g_ngx_params->Set("DLSS.DisocclusionMask.Subrect.Base.Y", 0u);
     g_ngx_params->Set("DLSS.Output.Subrect.Base.X", 0u); g_ngx_params->Set("DLSS.Output.Subrect.Base.Y", 0u);
     g_ngx_params->Set("DLSSNR.ColorSubrectBaseX", 0); g_ngx_params->Set("DLSSNR.ColorSubrectBaseY", 0);
     g_ngx_params->Set("DLSSNR.ColorSubrectWidth", static_cast<int>(iw)); g_ngx_params->Set("DLSSNR.ColorSubrectHeight", static_cast<int>(ih));
@@ -1700,7 +1718,7 @@ static void SetNrEvaluationContract(ID3D12Resource *depth, ID3D12Resource *motio
 }
 
 static void SetSrEvaluationContract(ID3D12Resource *color, ID3D12Resource *depth, ID3D12Resource *motion,
-    ID3D12Resource *history_mask, bool reset)
+    ID3D12Resource *responsivity_mask, ID3D12Resource *disocclusion_mask, bool reset)
 {
     g_ngx_params->Set("Color", color); g_ngx_params->Set("Output", g_sr_stage.Get());
     g_ngx_params->Set("Depth", depth); g_ngx_params->Set("MotionVectors", motion);
@@ -1712,9 +1730,11 @@ static void SetSrEvaluationContract(ID3D12Resource *color, ID3D12Resource *depth
     g_ngx_params->Set("DLSS.Input.Color.Subrect.Base.X", 0u); g_ngx_params->Set("DLSS.Input.Color.Subrect.Base.Y", 0u);
     g_ngx_params->Set("DLSS.Input.Depth.Subrect.Base.X", 0u); g_ngx_params->Set("DLSS.Input.Depth.Subrect.Base.Y", 0u);
     g_ngx_params->Set("DLSS.Input.MV.Subrect.Base.X", 0u); g_ngx_params->Set("DLSS.Input.MV.Subrect.Base.Y", 0u);
-    g_ngx_params->Set("DLSS.Input.Bias.Current.Color.Mask", history_mask);
-    g_ngx_params->Set("DLSS.Input.Reduce.Ghost.Mask", history_mask);
-    g_ngx_params->Set("DLSS.DisocclusionMask", history_mask);
+    // Appearance and optical-flow inconsistency should bias toward current
+    // color. Newly visible geometry belongs in the disocclusion input.
+    g_ngx_params->Set("DLSS.Input.Bias.Current.Color.Mask", responsivity_mask);
+    g_ngx_params->Set("DLSS.Input.Reduce.Ghost.Mask", responsivity_mask);
+    g_ngx_params->Set("DLSS.DisocclusionMask", disocclusion_mask);
     g_ngx_params->Set("DLSS.Input.Bias.Current.Color.Subrect.Base.X", 0u);
     g_ngx_params->Set("DLSS.Input.Bias.Current.Color.Subrect.Base.Y", 0u);
     g_ngx_params->Set("DLSS.Input.Reduce.Ghost.Subrect.Base.X", 0u);
@@ -1783,6 +1803,8 @@ static void ResolveHandles(reshade::api::effect_runtime *runtime)
     g_mv_variable = runtime->find_texture_variable("DLSS5_AIO_Feed.fx", "DLSS5_AIO_MV");
     g_depth_variable = runtime->find_texture_variable("DLSS5_AIO_Feed.fx", "DLSS5_AIO_Depth");
     g_mask_variable = runtime->find_texture_variable("DLSS5_AIO_Feed.fx", "DLSS5_AIO_Mask");
+    g_disocclusion_mask_variable = runtime->find_texture_variable(
+        "DLSS5_AIO_Feed.fx", "DLSS5_AIO_DisocclusionMask");
     g_adaptive_rejection_variable = runtime->find_uniform_variable(
         "DLSS5_AIO_Feed.fx", "DLSS5_AIO_EnableAdaptiveRejection");
     g_adaptive_history_reset_variable = runtime->find_uniform_variable(
@@ -1796,10 +1818,11 @@ static void ResolveHandles(reshade::api::effect_runtime *runtime)
         runtime->set_technique_state(g_motion_technique, false);
     if (g_feed_technique.handle && runtime->get_technique_state(g_feed_technique))
         runtime->set_technique_state(g_feed_technique, false);
-    Log("current-frame guide handles: VORT=%s feed=%s mv=%s depth=%s mask=%s adaptive=%s depth_reversed=%d",
+    Log("current-frame guide handles: VORT=%s feed=%s mv=%s depth=%s responsivity=%s disocclusion=%s adaptive=%s depth_reversed=%d",
         g_motion_technique.handle ? "found" : "MISSING",
         g_feed_technique.handle ? "found" : "MISSING", g_mv_variable.handle ? "found" : "MISSING",
         g_depth_variable.handle ? "found" : "MISSING", g_mask_variable.handle ? "found" : "optional/missing",
+        g_disocclusion_mask_variable.handle ? "found" : "optional/missing",
         g_adaptive_rejection_variable.handle && g_adaptive_history_reset_variable.handle ? "ready" : "unavailable",
         g_depth_reversed ? 1 : 0);
     if (!g_motion_technique.handle || !g_feed_technique.handle || !g_mv_variable.handle || !g_depth_variable.handle)
@@ -1910,8 +1933,13 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *runtime)
     g_backbuffer_views.clear();
     g_runtime = nullptr; g_feed_technique = {}; g_motion_technique = {};
     g_mv_variable = {}; g_depth_variable = {}; g_mask_variable = {};
+    g_disocclusion_mask_variable = {};
     g_adaptive_rejection_variable = {}; g_adaptive_history_reset_variable = {};
     g_captured_motion.Reset(); g_captured_depth.Reset(); g_captured_mask.Reset();
+    g_captured_disocclusion_mask.Reset();
+    g_mask_available = false;
+    g_disocclusion_mask_available = false;
+    g_nr_temporal_masks_active = false;
     g_using_external_guides = false;
     g_last_current_guide_tick = 0;
     g_reshade_overlay_open = false;
@@ -1928,16 +1956,21 @@ static void OnRenderTechnique(reshade::api::effect_runtime *runtime, reshade::ap
     if (!g_enabled || g_neural_failed || runtime != g_runtime || !g_feed_technique.handle ||
         technique.handle != g_feed_technique.handle ||
         runtime->get_device()->get_api() != device_api::d3d12) return;
-    resource_view mv_srv = {}, mv_srgb = {}, depth_srv = {}, depth_srgb = {}, mask_srv = {}, mask_srgb = {};
+    resource_view mv_srv = {}, mv_srgb = {}, depth_srv = {}, depth_srgb = {};
+    resource_view mask_srv = {}, mask_srgb = {}, disocclusion_srv = {}, disocclusion_srgb = {};
     runtime->get_texture_binding(g_mv_variable, &mv_srv, &mv_srgb);
     runtime->get_texture_binding(g_depth_variable, &depth_srv, &depth_srgb);
     if (g_mask_variable.handle) runtime->get_texture_binding(g_mask_variable, &mask_srv, &mask_srgb);
+    if (g_disocclusion_mask_variable.handle)
+        runtime->get_texture_binding(g_disocclusion_mask_variable, &disocclusion_srv, &disocclusion_srgb);
     auto *device = runtime->get_device();
     const resource backbuffer_resource = device->get_resource_from_view(rtv);
     auto *backbuffer = reinterpret_cast<ID3D12Resource *>(backbuffer_resource.handle);
     auto *motion = reinterpret_cast<ID3D12Resource *>(device->get_resource_from_view(mv_srv).handle);
     auto *depth = reinterpret_cast<ID3D12Resource *>(device->get_resource_from_view(depth_srv).handle);
     auto *mask = mask_srv.handle ? reinterpret_cast<ID3D12Resource *>(device->get_resource_from_view(mask_srv).handle) : nullptr;
+    auto *disocclusion = disocclusion_srv.handle ?
+        reinterpret_cast<ID3D12Resource *>(device->get_resource_from_view(disocclusion_srv).handle) : nullptr;
     if (!backbuffer || !motion || !depth) return;
     const D3D12_RESOURCE_DESC color_desc = backbuffer->GetDesc();
     const D3D12_RESOURCE_DESC mv_desc = motion->GetDesc();
@@ -1958,14 +1991,21 @@ static void OnRenderTechnique(reshade::api::effect_runtime *runtime, reshade::ap
         return;
     }
     g_mask_available = mask && mask->GetDesc().Width == color_desc.Width && mask->GetDesc().Height == color_desc.Height &&
-        mask->GetDesc().Format == DXGI_FORMAT_R8_UNORM;
+        mask->GetDesc().Format == DXGI_FORMAT_R16_FLOAT;
+    g_disocclusion_mask_available = disocclusion &&
+        disocclusion->GetDesc().Width == color_desc.Width &&
+        disocclusion->GetDesc().Height == color_desc.Height &&
+        disocclusion->GetDesc().Format == DXGI_FORMAT_R8_UNORM;
     const bool first_capture = !g_captured_motion || !g_captured_depth;
     g_captured_motion = motion;
     g_captured_depth = depth;
     g_captured_mask = g_mask_available ? mask : nullptr;
+    g_captured_disocclusion_mask = g_disocclusion_mask_available ? disocclusion : nullptr;
     if (first_capture)
-        Log("captured DLSS5_AIO_Feed resources for same-frame on-present evaluation: %ux%u; DLSS history rejection mask=%s",
-            static_cast<unsigned int>(color_desc.Width), color_desc.Height, g_mask_available ? "active" : "missing");
+        Log("captured DLSS5_AIO_Feed resources for same-frame on-present evaluation: %ux%u; responsivity=%s (R16F), disocclusion=%s (R8)",
+            static_cast<unsigned int>(color_desc.Width), color_desc.Height,
+            g_mask_available ? "active" : "missing",
+            g_disocclusion_mask_available ? "active" : "missing");
 }
 
 static reshade::api::resource_view GetBackbufferRtv(ID3D12Resource *backbuffer)
@@ -2153,6 +2193,21 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
 
     const bool reset = g_need_history_reset || g_reset_every_frame;
     g_need_history_reset = false;
+    ID3D12Resource *responsivity_mask = use_external_guides && g_mask_available ?
+        g_captured_mask.Get() : nullptr;
+    ID3D12Resource *disocclusion_mask = use_external_guides && g_disocclusion_mask_available ?
+        g_captured_disocclusion_mask.Get() : nullptr;
+    const bool feed_nr_temporal_masks = g_nr_temporal_masks_enabled &&
+        responsivity_mask != nullptr && disocclusion_mask != nullptr;
+    const bool nr_temporal_masks_active = evaluate_nr && feed_nr_temporal_masks;
+    if (nr_temporal_masks_active != g_nr_temporal_masks_active)
+    {
+        g_nr_temporal_masks_active = nr_temporal_masks_active;
+        Log("NR temporal mask binding changed to %s (responsivity=%s disocclusion=%s)",
+            nr_temporal_masks_active ? "ACTIVE" : "inactive",
+            responsivity_mask ? "ready" : "missing",
+            disocclusion_mask ? "ready" : "missing");
+    }
     D3D12_RESOURCE_BARRIER sr_to_uav = Transition(
         g_sr_stage.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     g_neural_list->ResourceBarrier(1, &sr_to_uav);
@@ -2160,7 +2215,9 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     NVSDK_NGX_Result nr_result = NVSDK_NGX_Result_Success;
     if (evaluate_nr)
     {
-        SetNrEvaluationContract(depth, motion, reset);
+        SetNrEvaluationContract(depth, motion,
+            feed_nr_temporal_masks ? responsivity_mask : nullptr,
+            feed_nr_temporal_masks ? disocclusion_mask : nullptr, reset);
         nr_result = SafeEvaluate(true, &exception);
         if (exception)
         {
@@ -2180,9 +2237,11 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     // Keep motion-guided NR, but do not let generic optical-flow errors persist
     // through DLSS SR's temporal accumulator in the stable mode.
     ID3D12Resource *sr_motion = g_stable_sr_history ? g_fallback_motion.Get() : motion;
-    ID3D12Resource *history_mask = !g_stable_sr_history && use_external_guides && g_mask_available ? g_captured_mask.Get() : nullptr;
+    ID3D12Resource *sr_responsivity_mask = !g_stable_sr_history ? responsivity_mask : nullptr;
+    ID3D12Resource *sr_disocclusion_mask = !g_stable_sr_history ? disocclusion_mask : nullptr;
     const bool sr_reset = g_stable_sr_history || reset;
-    SetSrEvaluationContract(sr_color, depth, sr_motion, history_mask, sr_reset);
+    SetSrEvaluationContract(sr_color, depth, sr_motion,
+        sr_responsivity_mask, sr_disocclusion_mask, sr_reset);
     NVSDK_NGX_Result sr_result = static_cast<NVSDK_NGX_Result>(0xBAD00004);
     if (NVSDK_NGX_SUCCEED(nr_result)) sr_result = SafeEvaluate(false, &exception);
     if (exception)
@@ -2273,11 +2332,13 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         SetStatus("active on present: NR disabled + %s + FG %s (%s guides)",
             SrModeName(), fg_status, guide_status);
     if (frame <= 8 || frame % 1800 == 0)
-        Log("on-present frame %llu: NR=%s, %s=Success, model=%d, NR-reset=%d, NR-guides=%s, SR-history=%s, DLSS history mask=%s, input=%ux%u, output=%ux%u",
+        Log("on-present frame %llu: NR=%s, %s=Success, model=%d, NR-reset=%d, NR-guides=%s, NR-masks=%s, SR-history=%s, SR-responsivity=%s, SR-disocclusion=%s, input=%ux%u, output=%ux%u",
             frame, evaluate_nr ? "Success" : "DISABLED", SrModeName(), g_active_nr_model,
             reset ? 1 : 0, use_external_guides ? "same-frame-motion" : "fallback",
+            nr_temporal_masks_active ? "BOUND" : "none",
             g_stable_sr_history ? "per-frame-reset/zero-motion" : "temporal/VORT",
-            history_mask ? "BOUND" : "none",
+            sr_responsivity_mask ? "BOUND" : "none",
+            sr_disocclusion_mask ? "BOUND" : "none",
             g_resource_input_width, g_resource_input_height, g_resource_output_width, g_resource_output_height);
     return true;
 }
@@ -3462,10 +3523,23 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         Log("adaptive VORT smear reduction changed to %s",
             g_adaptive_smear_reduction ? "enabled" : "disabled");
     }
-    ImGui::TextDisabled(g_using_external_guides && g_adaptive_rejection_variable.handle &&
+    ImGui::TextDisabled(g_using_external_guides && g_adaptive_smear_reduction &&
+        g_adaptive_rejection_variable.handle &&
         g_adaptive_history_reset_variable.handle ?
         "Active: validates VORT using previous color, depth and motion, then dilates rejection edges." :
         "Inactive: requires the current DLSS5_AIO_Feed shader and same-frame VORT Motion guides.");
+    if (ImGui::Checkbox("Feed temporal masks to Neural Rendering", &g_nr_temporal_masks_enabled))
+    {
+        reshade::set_config_value(nullptr, section, "NrTemporalMasks",
+            g_nr_temporal_masks_enabled ? "1" : "0");
+        g_need_history_reset = true;
+        Log("NR responsivity/disocclusion masks changed to %s; temporal history reset",
+            g_nr_temporal_masks_enabled ? "enabled" : "disabled (A/B control)");
+    }
+    ImGui::TextDisabled(g_nr_temporal_masks_active ?
+        "Active: separate R16F responsivity and R8 disocclusion masks are bound to NR." :
+        "Inactive: requires VORT, the current feed shader, and both valid temporal masks.");
+    ImGui::TextDisabled("A/B affects NR only; SR continues using its matching temporal masks when available.");
     if (ImGui::Checkbox("Experimental DLSS Frame Generation (2x)", &g_framegen_enabled))
     {
         reshade::set_config_value(nullptr, section, "FrameGeneration", g_framegen_enabled ? "1" : "0");
@@ -3496,11 +3570,12 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g_framegen_failed ? "failed/off" : (g_framegen_enabled ? "2x" : "off"),
         g_active_nr_model);
     ImGui::Text("Contract: %ux%u -> %ux%u", g_input_width.load(), g_input_height.load(), g_output_width.load(), g_output_height.load());
-    ImGui::Text("NR guides: %s; DLSS SR history: %s; validation mask=%s; adaptive VORT=%s",
+    ImGui::Text("NR guides: %s; DLSS SR history: %s; masks: response=%s disocclusion=%s; adaptive VORT=%s",
         g_using_external_guides ? "same-frame VORT optical flow" :
             (!g_vort_motion_enabled ? "internal zero-motion (VORT disabled)" : "internal zero-motion fallback"),
         g_stable_sr_history ? "per-frame reset / zero motion" : "experimental temporal VORT",
-        g_mask_available ? "valid" : "automatic mask",
+        g_mask_available ? "valid" : "missing",
+        g_disocclusion_mask_available ? "valid" : "missing",
         g_using_external_guides && g_adaptive_smear_reduction && g_adaptive_rejection_variable.handle &&
             g_adaptive_history_reset_variable.handle ? "active" : "inactive");
     ImGui::Text("Current-frame guide submissions: %llu", g_current_guide_frames.load());
@@ -3612,15 +3687,17 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("StableSrHistory", "0", value, sizeof(value)); g_stable_sr_history = strcmp(value, "0") != 0;
         read_setting("VortMotionGuides", "1", value, sizeof(value)); g_vort_motion_enabled = strcmp(value, "0") != 0;
         read_setting("AdaptiveVortSmearReduction", "1", value, sizeof(value)); g_adaptive_smear_reduction = strcmp(value, "0") != 0;
+        read_setting("NrTemporalMasks", "1", value, sizeof(value)); g_nr_temporal_masks_enabled = strcmp(value, "0") != 0;
         read_setting("NeuralRendering", "1", value, sizeof(value)); g_nr_enabled = strcmp(value, "0") != 0;
         read_setting("FrameGeneration", "1", value, sizeof(value)); g_framegen_enabled = strcmp(value, "0") != 0;
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
         read_setting("EarlyProxyInitialization", "0", value, sizeof(value)); g_early_proxy_initialization = strcmp(value, "0") != 0;
-        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d NR=%s VORT=%s adaptive_vort=%s early_proxy=%s",
+        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d NR=%s VORT=%s adaptive_vort=%s nr_masks=%s early_proxy=%s",
             ADDON_VERSION, ProfileName(g_color_profile), g_nr_model, g_nr_enabled ? "enabled" : "disabled",
             g_vort_motion_enabled ? "enabled" : "disabled",
             g_adaptive_smear_reduction ? "enabled" : "disabled",
+            g_nr_temporal_masks_enabled ? "enabled" : "disabled",
             g_early_proxy_initialization ? "enabled" : "disabled");
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
@@ -3667,6 +3744,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         if (g_proxy_window_ready) CloseHandle(g_proxy_window_ready);
         if (g_nr_output) g_nr_output->Release();
         g_captured_depth.Reset(); g_captured_motion.Reset(); g_captured_mask.Reset();
+        g_captured_disocclusion_mask.Reset();
         g_fallback_depth.Reset(); g_fallback_motion.Reset(); g_guide_rtv_heap.Reset();
         ReleaseLegacyFrameResources();
         if (g_vulkan.ok && g_vulkan_semaphore != VK_NULL_HANDLE)
