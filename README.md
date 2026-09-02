@@ -3,7 +3,7 @@
 This project contains two independently useful pieces:
 
 - `lab/`: a deterministic D3D12 test program that reverse-engineers and validates the private DLSS-NR feature-18 contract without launching a game.
-- `addon/`: a standalone ReShade addon for D3D9, D3D11, and D3D12 games. It does not hook or depend on the ShortFuse addon.
+- `addon/`: a standalone ReShade addon for D3D9, D3D11, D3D12, and 64-bit Windows Vulkan games. It does not hook or depend on the ShortFuse addon.
 
 ## Proven pipeline
 
@@ -68,6 +68,10 @@ Version 1.6 adds native legacy-API transport. D3D11 games copy their backbuffer 
 Run `lab\build-legacy-smoke.bat` to validate both transports without a game. It selects the NVIDIA adapter and checks D3D11 shared texture/fence access followed by D3D9 -> D3D11 -> D3D12 sharing. On drivers that reject D3D12-created BGRA textures in D3D11, both the smoke test and addon automatically use the proven reverse D3D11-created NT-handle path.
 
 Version 1.6.1 replaces the old global HDR10 default with per-game color-profile detection. `Auto` reads the primary swapchain color space and recognizes nonlinear sRGB/BT.709, linear BT.709/scRGB, BT.2100 PQ/HDR10, and BT.2100 HLG; older D3D9/D3D11 paths fall back to their surface format. The native proxy now uses a matching format and explicitly sets matching DXGI presentation metadata, so both neural output and F10 passthrough retain the game's color convention. Manual profile overrides remain available for games or wrappers that report incorrect metadata. The new `InputColorProfile` setting intentionally ignores the obsolete `ColorProfile` value, migrating existing installations that had been pinned to HDR10 back to Auto.
+
+Version 1.7 adds 64-bit Windows Vulkan transport while retaining the verified private-D3D12 NGX and native proxy path. The addon creates its packed input and post-ReShade surfaces on D3D12 with shared NT handles, imports them into the game's `VkDevice` using `VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT`, and synchronizes both APIs with a shared D3D12 fence imported as a Vulkan timeline semaphore. Vulkan supplies the reduced pre/post-ReShade frames; NR, DLSS SR, optional DLSS-G, color conversion metadata, F10 presentation, and the native-size proxy remain on D3D12. Adapter LUID matching prevents cross-GPU sharing on hybrid systems, and resolution/format changes retire the imported Vulkan images with the existing NGX resource lifecycle.
+
+Vulkan requires ReShade's 64-bit global implicit layer rather than a per-game `dxgi.dll`. The addon normally hooks `vkCreateDevice` early enough to enable the external-memory, external-semaphore, dedicated-allocation, and timeline-semaphore features itself. If `standalone-dlssnr.log` reports missing Vulkan interop entry points, use `addon\build\VulkanLayer\run-with-standalone-vulkan-layer.bat "path\to\game.exe"`; that per-launch fallback enables the same extensions without registering another global layer. It has no per-frame code. Native Linux/Proton and 32-bit Vulkan are not part of version 1.7.
 
 Version 1.3 renders `vort_MotionEffects` and `DLSS5_Feed` explicitly inside the game `OnPresent` callback, then flushes that current-frame guide work before NGX evaluation. `DLSS5_Feed.fx` reads VORT's pooled `MotVectTexVort`, converts its delta-UV flow to pixel units, and also captures raw game depth. Both techniques remain disabled in ReShade's ordinary effect list because the addon schedules them itself in the required order. The overlay reports `same-frame VORT optical flow` only when those passes and correctly sized `R16G16_FLOAT` motion / `R32_FLOAT` depth resources are present; otherwise it reports and uses the internal zero-motion fallback.
 

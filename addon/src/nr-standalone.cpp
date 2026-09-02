@@ -25,11 +25,14 @@
 #include <nvsdk_ngx_defs_dlssd.h>
 #include <nvsdk_ngx_defs_dlssg.h>
 
-#define ADDON_VERSION "1.6.1-color-auto"
+#include "../../../work/DLSS5-Feeder/src/feed_vk.h"
+#include "../../../work/DLSS5-Feeder/src/feed_vk_hook.h"
+
+#define ADDON_VERSION "1.7.0-vulkan-interop"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
-    "Standalone D3D9/D3D11/D3D12 DLSS Neural Rendering, Super Resolution, and Frame Generation.";
+    "Standalone D3D9/D3D11/D3D12/Vulkan DLSS Neural Rendering, Super Resolution, and Frame Generation.";
 
 static HMODULE g_self;
 static wchar_t g_addon_directory[MAX_PATH];
@@ -173,6 +176,16 @@ static UINT64 g_legacy_d3d12_done_value;
 static UINT g_legacy_width;
 static UINT g_legacy_height;
 static DXGI_FORMAT g_legacy_format = DXGI_FORMAT_UNKNOWN;
+static FeedVk g_vulkan;
+static reshade::api::device *g_vulkan_reshade_device;
+static reshade::api::fence g_vulkan_fence;
+static VkSemaphore g_vulkan_semaphore = VK_NULL_HANDLE;
+static VkImage g_vulkan_input = VK_NULL_HANDLE;
+static VkImage g_vulkan_post = VK_NULL_HANDLE;
+static VkDeviceMemory g_vulkan_input_memory = VK_NULL_HANDLE;
+static VkDeviceMemory g_vulkan_post_memory = VK_NULL_HANDLE;
+static bool g_vulkan_input_layout_initialized;
+static bool g_vulkan_post_layout_initialized;
 static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> g_guide_rtv_heap;
 static UINT g_guide_rtv_stride;
 static UINT g_resource_input_width;
@@ -975,11 +988,208 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
 
 static void ReleaseLegacyFrameResources()
 {
+    if (g_vulkan.ok)
+    {
+        if (g_vulkan_input != VK_NULL_HANDLE) g_vulkan.DestroyImage(g_vulkan.dev, g_vulkan_input, nullptr);
+        if (g_vulkan_post != VK_NULL_HANDLE) g_vulkan.DestroyImage(g_vulkan.dev, g_vulkan_post, nullptr);
+        if (g_vulkan_input_memory != VK_NULL_HANDLE) g_vulkan.FreeMemory(g_vulkan.dev, g_vulkan_input_memory, nullptr);
+        if (g_vulkan_post_memory != VK_NULL_HANDLE) g_vulkan.FreeMemory(g_vulkan.dev, g_vulkan_post_memory, nullptr);
+    }
+    g_vulkan_input = g_vulkan_post = VK_NULL_HANDLE;
+    g_vulkan_input_memory = g_vulkan_post_memory = VK_NULL_HANDLE;
+    g_vulkan_input_layout_initialized = g_vulkan_post_layout_initialized = false;
     g_legacy_input9.Reset(); g_legacy_post9.Reset();
     g_legacy_input9_11.Reset(); g_legacy_post9_11.Reset();
     g_legacy_input11.Reset(); g_legacy_post11.Reset(); g_legacy_post12.Reset();
     g_legacy_width = g_legacy_height = 0;
     g_legacy_format = DXGI_FORMAT_UNKNOWN;
+}
+
+static Microsoft::WRL::ComPtr<IDXGIAdapter1> FindAdapterByLuid(reshade::api::device *device)
+{
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+    if (!device) return adapter;
+    LUID luid = {};
+    if (!device->get_property(reshade::api::device_properties::adapter_luid, &luid))
+    {
+        Log("Vulkan interop could not query the game adapter LUID; using the default adapter");
+        return adapter;
+    }
+    Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) ||
+        FAILED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter))))
+    {
+        Log("Vulkan interop could not resolve DXGI adapter LUID %08X:%08X; using the default adapter",
+            static_cast<unsigned int>(luid.HighPart), luid.LowPart);
+        adapter.Reset();
+    }
+    return adapter;
+}
+
+static bool InitializeVulkanTransport(reshade::api::command_queue *queue)
+{
+    if (!queue || queue->get_device()->get_api() != reshade::api::device_api::vulkan) return false;
+    reshade::api::device *device = queue->get_device();
+    if (g_command_queue && g_present_api == reshade::api::device_api::vulkan &&
+        g_vulkan.ok && g_vulkan_reshade_device == device && g_vulkan_semaphore != VK_NULL_HANDLE)
+    {
+        g_rs_queue = queue;
+        return true;
+    }
+    if (g_command_queue || g_vulkan_reshade_device)
+    {
+        Log("Vulkan device changed after transport initialization; refusing to reuse stale external objects");
+        return false;
+    }
+
+    if (!FeedVkLoad(&g_vulkan, FeedVkDispatch<VkDevice>(device->get_native())))
+    {
+        Log("Vulkan transport missing external-memory/semaphore entry points; vkCreateDevice hook calls=%d",
+            g_vk_hook_devices);
+        Log("Vulkan fallback: use the bundled VK_LAYER_feed_vk if the in-process device hook did not add the required extensions");
+        return false;
+    }
+
+    const auto adapter = FindAdapterByLuid(device);
+    Microsoft::WRL::ComPtr<ID3D12Device> device12;
+    HRESULT hr = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device12));
+    D3D12_COMMAND_QUEUE_DESC queue_desc = {};
+    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (SUCCEEDED(hr)) hr = device12->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&g_command_queue));
+    HANDLE shared_fence = nullptr;
+    if (SUCCEEDED(hr)) hr = device12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&g_legacy_fence12));
+    if (SUCCEEDED(hr)) hr = device12->CreateSharedHandle(g_legacy_fence12.Get(), nullptr, GENERIC_ALL, nullptr, &shared_fence);
+    if (FAILED(hr))
+    {
+        if (shared_fence) CloseHandle(shared_fence);
+        Log("Vulkan private D3D12 session failed: 0x%08X", static_cast<unsigned int>(hr));
+        return false;
+    }
+
+    g_vulkan_semaphore = FeedVkImportFence(&g_vulkan, shared_fence);
+    CloseHandle(shared_fence);
+    if (g_vulkan_semaphore == VK_NULL_HANDLE)
+    {
+        Log("Vulkan failed to import the shared D3D12 fence as a timeline semaphore");
+        return false;
+    }
+    g_vulkan_fence = {FeedVkValue(g_vulkan_semaphore)};
+    g_vulkan_reshade_device = device;
+    g_rs_queue = queue;
+    g_present_api = reshade::api::device_api::vulkan;
+    Log("Vulkan interop session ready: VkDevice=%p D3D12 queue=%p shared timeline=%p",
+        reinterpret_cast<void *>(device->get_native()), g_command_queue,
+        reinterpret_cast<void *>(FeedVkValue(g_vulkan_semaphore)));
+    return true;
+}
+
+static DXGI_FORMAT VulkanSharedFormat(DXGI_FORMAT format)
+{
+    format = TypedInputFormat(format);
+    // Vulkan commonly exposes BGRX swapchains as the BGRA compatibility class.
+    // Use an explicit alpha-bearing D3D12 resource so the external format has a
+    // direct VkFormat mapping while preserving the same 32-bit texel layout.
+    if (format == DXGI_FORMAT_B8G8R8X8_UNORM) return DXGI_FORMAT_B8G8R8A8_UNORM;
+    return format;
+}
+
+static bool CreateSharedPairVk(UINT width, UINT height, DXGI_FORMAT format,
+    Microsoft::WRL::ComPtr<ID3D12Resource> &resource12, VkImage &image, VkDeviceMemory &memory)
+{
+    if (!g_neural_device || !g_vulkan.ok) return false;
+    format = VulkanSharedFormat(format);
+    const VkFormat vk_format = FeedVkFormat(format);
+    if (vk_format == VK_FORMAT_UNDEFINED)
+    {
+        Log("Vulkan interop has no shared format mapping for %u", static_cast<unsigned int>(format));
+        return false;
+    }
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width; desc.Height = height; desc.DepthOrArraySize = 1; desc.MipLevels = 1;
+    desc.Format = format; desc.SampleDesc.Count = 1; desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+    HRESULT hr = g_neural_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc,
+        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&resource12));
+    HANDLE shared = nullptr;
+    if (SUCCEEDED(hr)) hr = g_neural_device->CreateSharedHandle(resource12.Get(), nullptr, GENERIC_ALL, nullptr, &shared);
+    const bool imported = SUCCEEDED(hr) && FeedVkImportImage(&g_vulkan, shared, width, height,
+        vk_format, false, &image, &memory);
+    if (shared) CloseHandle(shared);
+    if (!imported)
+    {
+        Log("Vulkan shared image import failed: %ux%u dxgi=%u vk=%u hr=0x%08X",
+            width, height, static_cast<unsigned int>(format), static_cast<unsigned int>(vk_format),
+            static_cast<unsigned int>(hr));
+        resource12.Reset();
+        return false;
+    }
+    return true;
+}
+
+static bool BuildVulkanFrameResources(UINT width, UINT height, DXGI_FORMAT format)
+{
+    ReleaseLegacyFrameResources();
+    g_packed_color.Reset();
+    g_legacy_post12.Reset();
+    const DXGI_FORMAT shared_format = VulkanSharedFormat(format);
+    if (!CreateSharedPairVk(width, height, shared_format, g_packed_color,
+            g_vulkan_input, g_vulkan_input_memory) ||
+        !CreateSharedPairVk(width, height, shared_format, g_legacy_post12,
+            g_vulkan_post, g_vulkan_post_memory))
+    {
+        ReleaseLegacyFrameResources();
+        g_packed_color.Reset(); g_legacy_post12.Reset();
+        return false;
+    }
+    g_legacy_width = width; g_legacy_height = height; g_legacy_format = shared_format;
+    Log("Vulkan shared frame resources ready: %ux%u game fmt=%u shared fmt=%u",
+        width, height, static_cast<unsigned int>(format), static_cast<unsigned int>(shared_format));
+    return true;
+}
+
+static bool CopyVulkanFrameToD3D12(reshade::api::command_queue *queue,
+    reshade::api::resource source, reshade::api::resource_usage source_usage, bool post_effects)
+{
+    if (!queue || !g_vulkan.ok || source.handle == 0 || !g_command_queue || !g_legacy_fence12)
+        return false;
+    VkImage destination = post_effects ? g_vulkan_post : g_vulkan_input;
+    bool &layout_initialized = post_effects ? g_vulkan_post_layout_initialized : g_vulkan_input_layout_initialized;
+    if (destination == VK_NULL_HANDLE) return false;
+
+    if (g_legacy_d3d12_done_value != 0 && !queue->wait(g_vulkan_fence, g_legacy_d3d12_done_value))
+    {
+        Log("Vulkan queue failed to wait for D3D12 shared image release value %llu", g_legacy_d3d12_done_value);
+        return false;
+    }
+    reshade::api::command_list *list = queue->get_immediate_command_list();
+    if (!list) return false;
+    VkCommandBuffer command_buffer = FeedVkDispatch<VkCommandBuffer>(list->get_native());
+    VkImage source_image = FeedVkHandle<VkImage>(source.handle);
+    if (!layout_initialized)
+    {
+        FeedVkBarrier(&g_vulkan, command_buffer, destination,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+        layout_initialized = true;
+    }
+    const reshade::api::resource resources[1] = {source};
+    const reshade::api::resource_usage copy_source[1] = {reshade::api::resource_usage::copy_source};
+    list->barrier(1, resources, &source_usage, copy_source);
+    FeedVkCopyImage(&g_vulkan, command_buffer, source_image,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination, VK_IMAGE_LAYOUT_GENERAL,
+        g_legacy_width, g_legacy_height);
+    list->barrier(1, resources, copy_source, &source_usage);
+    queue->flush_immediate_command_list();
+
+    const UINT64 value = ++g_legacy_fence_value;
+    if (!queue->signal(g_vulkan_fence, value) || FAILED(g_command_queue->Wait(g_legacy_fence12.Get(), value)))
+    {
+        Log("Vulkan -> D3D12 timeline handoff failed at value %llu", value);
+        return false;
+    }
+    return true;
 }
 
 static bool CreateSharedPair11(UINT width, UINT height, DXGI_FORMAT format,
@@ -1301,10 +1511,14 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
     const DXGI_FORMAT result_format = g_active_color_profile == ColorProfile::Srgb ?
         DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
     const bool legacy = g_present_api == reshade::api::device_api::d3d11 ||
-        g_present_api == reshade::api::device_api::d3d9;
-    if ((legacy ? !BuildLegacyFrameResources(iw, ih, input_format) :
-            !CreateTexture(iw, ih, input_format, false,
-                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g_packed_color)) ||
+        g_present_api == reshade::api::device_api::d3d9 ||
+        g_present_api == reshade::api::device_api::vulkan;
+    const bool input_ready = g_present_api == reshade::api::device_api::vulkan ?
+        BuildVulkanFrameResources(iw, ih, input_format) :
+        (legacy ? BuildLegacyFrameResources(iw, ih, input_format) :
+            CreateTexture(iw, ih, input_format, false,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g_packed_color));
+    if (!input_ready ||
         !CreateTexture(iw, ih, result_format, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g_nr_stage) ||
         !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, g_sr_stage) ||
         !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, g_fg_stage)) return false;
@@ -2249,7 +2463,8 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
     const bool use_framegen = g_framegen_enabled && !g_framegen_failed &&
         g_show_neural_output && g_fg_stage && g_fg_frames.load() >= 2;
     const bool legacy = g_present_api == reshade::api::device_api::d3d11 ||
-        g_present_api == reshade::api::device_api::d3d9;
+        g_present_api == reshade::api::device_api::d3d9 ||
+        g_present_api == reshade::api::device_api::vulkan;
     const D3D12_RESOURCE_STATES original_base_state = legacy ?
         D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     const D3D12_RESOURCE_STATES post_base_state = legacy ?
@@ -2392,6 +2607,9 @@ static void OnReshadePresent(reshade::api::effect_runtime *runtime)
     else if ((api == reshade::api::device_api::d3d11 || api == reshade::api::device_api::d3d9) &&
         CopyLegacyFrameToD3D12(reinterpret_cast<void *>(resource.handle), true))
         PresentProxyAfterReshade(g_legacy_post12.Get());
+    else if (api == reshade::api::device_api::vulkan &&
+        CopyVulkanFrameToD3D12(queue, resource, reshade::api::resource_usage::present, true))
+        PresentProxyAfterReshade(g_legacy_post12.Get());
 }
 
 static bool OnReshadeOpenOverlay(reshade::api::effect_runtime *runtime, bool open, reshade::api::input_source)
@@ -2444,9 +2662,18 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
             return;
         }
     }
+    else if (api == reshade::api::device_api::vulkan)
+    {
+        g_rs_queue = queue;
+        if (!InitializeVulkanTransport(queue))
+        {
+            SetStatus("failed to initialize Vulkan -> D3D12 interop; see log");
+            return;
+        }
+    }
     else
     {
-        SetStatus("unsupported graphics API (D3D9/D3D11/D3D12 required)");
+        SetStatus("unsupported graphics API (D3D9/D3D11/D3D12/Vulkan required)");
         return;
     }
     UpdateSourceFps();
@@ -2509,7 +2736,7 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         g_input_height = backbuffer_desc.Height;
         if (!ExecuteOnPresentPipeline(backbuffer)) return;
     }
-    else
+    else if (api == reshade::api::device_api::d3d11 || api == reshade::api::device_api::d3d9)
     {
         const auto desc = swapchain->get_device()->get_resource_desc(backbuffer_resource);
         const UINT width = static_cast<UINT>(desc.texture.width);
@@ -2522,6 +2749,21 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         {
             if (!g_neural_failed) SetStatus("waiting for a valid %s shared frame",
                 api == reshade::api::device_api::d3d11 ? "D3D11" : "D3D9");
+            return;
+        }
+    }
+    else
+    {
+        const auto desc = swapchain->get_device()->get_resource_desc(backbuffer_resource);
+        const UINT width = static_cast<UINT>(desc.texture.width);
+        const UINT height = desc.texture.height;
+        const DXGI_FORMAT format = VulkanSharedFormat(static_cast<DXGI_FORMAT>(desc.texture.format));
+        g_input_width = width; g_input_height = height;
+        if (!EnsureStandaloneResources(width, height, format) ||
+            !CopyVulkanFrameToD3D12(queue, backbuffer_resource, reshade::api::resource_usage::present, false) ||
+            !ExecuteOnPresentPipeline(nullptr))
+        {
+            if (!g_neural_failed) SetStatus("waiting for a valid Vulkan shared frame");
             return;
         }
     }
@@ -2602,6 +2844,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::TextUnformatted("Standalone DLSS-NR + Super Resolution");
     const char *api_name = g_present_api == reshade::api::device_api::d3d9 ? "D3D9 -> D3D11 -> D3D12" :
         g_present_api == reshade::api::device_api::d3d11 ? "D3D11 -> D3D12" :
+        g_present_api == reshade::api::device_api::vulkan ? "Vulkan -> D3D12 shared timeline" :
         g_present_api == reshade::api::device_api::d3d12 ? "D3D12 native" : "waiting";
     ImGui::Text("Graphics transport: %s", api_name);
     if (ImGui::Checkbox("Enable addon", &g_enabled))
@@ -2746,6 +2989,29 @@ static void OnDestroyDevice(reshade::api::device *device)
         g_neural_failed = true;
         SetStatus("legacy graphics device destroyed");
     }
+    else if (device->get_api() == reshade::api::device_api::vulkan && device == g_vulkan_reshade_device)
+    {
+        Log("game Vulkan device is being destroyed; releasing imported shared objects");
+        if (g_rs_queue) g_rs_queue->wait_idle();
+        ReleaseLegacyFrameResources();
+        if (g_vulkan.ok && g_vulkan_semaphore != VK_NULL_HANDLE)
+            g_vulkan.DestroySemaphore(g_vulkan.dev, g_vulkan_semaphore, nullptr);
+        g_vulkan_semaphore = VK_NULL_HANDLE;
+        g_vulkan_fence = {};
+        if (g_vulkan.lib) FreeLibrary(g_vulkan.lib);
+        g_vulkan = {};
+        g_vulkan_reshade_device = nullptr;
+        g_neural_ready = false;
+        g_neural_failed = true;
+        SetStatus("Vulkan device destroyed");
+    }
+}
+
+static bool OnCreateDevice(reshade::api::device_api api, uint32_t &)
+{
+    if (api == reshade::api::device_api::vulkan)
+        FeedVkHookInstall();
+    return false;
 }
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
@@ -2795,6 +3061,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
         Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d", ADDON_VERSION, ProfileName(g_color_profile), g_nr_model);
+        reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
@@ -2810,6 +3077,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
+        reshade::unregister_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::unregister_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
         reshade::unregister_overlay(nullptr, DrawOverlay);
         reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(OnReshadeOpenOverlay);
@@ -2837,6 +3105,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         g_captured_depth.Reset(); g_captured_motion.Reset(); g_captured_mask.Reset();
         g_fallback_depth.Reset(); g_fallback_motion.Reset(); g_guide_rtv_heap.Reset();
         ReleaseLegacyFrameResources();
+        if (g_vulkan.ok && g_vulkan_semaphore != VK_NULL_HANDLE)
+            g_vulkan.DestroySemaphore(g_vulkan.dev, g_vulkan_semaphore, nullptr);
+        g_vulkan_semaphore = VK_NULL_HANDLE;
+        if (g_vulkan.lib) FreeLibrary(g_vulkan.lib);
+        g_vulkan = {};
+        FeedVkHookRemove();
         g_legacy_query9.Reset(); g_legacy_device9.Reset();
         g_legacy_fence11.Reset(); g_legacy_fence12.Reset(); g_legacy_context4.Reset();
         g_legacy_context11.Reset(); g_legacy_device11.Reset();
