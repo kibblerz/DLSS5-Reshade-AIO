@@ -22,7 +22,7 @@
 #include <nvsdk_ngx_params.h>
 #include <nvsdk_ngx_defs_dlssd.h>
 
-#define ADDON_VERSION "1.3.5-masked-dlss-history"
+#define ADDON_VERSION "1.3.6-live-resolution-reconfigure"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -640,6 +640,78 @@ static void PublishOutput(ID3D12Resource *resource)
     if (old) old->Release();
 }
 
+static void ClearPublishedOutput()
+{
+    ID3D12Resource *old = static_cast<ID3D12Resource *>(
+        InterlockedExchangePointer(reinterpret_cast<void *volatile *>(&g_nr_output), nullptr));
+    if (old) old->Release();
+}
+
+static bool RetireResolutionDependentResources(UINT next_width, UINT next_height, DXGI_FORMAT next_format)
+{
+    Log("resolution reconfiguration begin: %ux%u fmt=%u -> %ux%u fmt=%u",
+        g_resource_input_width, g_resource_input_height, static_cast<unsigned int>(g_resource_input_format),
+        next_width, next_height, static_cast<unsigned int>(next_format));
+
+    // The proxy submits after the neural fence, on the same queue, but owns a
+    // later fence value. Do not withdraw its SRV resource until that sampling
+    // work has completed.
+    if (g_proxy_fence && g_proxy_fence_value != 0 && g_proxy_fence->GetCompletedValue() < g_proxy_fence_value)
+    {
+        if (FAILED(g_proxy_fence->SetEventOnCompletion(g_proxy_fence_value, g_proxy_fence_event)) ||
+            WaitForSingleObject(g_proxy_fence_event, 30000) != WAIT_OBJECT_0)
+        {
+            Fail("proxy GPU fence during resolution change", static_cast<unsigned int>(GetLastError()));
+            return false;
+        }
+    }
+    if (!WaitForNeuralGpu()) return false;
+
+    DWORD exception = 0;
+    if (g_sr_feature)
+    {
+        const NVSDK_NGX_Result result = SafeRelease(g_sr_release, g_sr_feature, &exception);
+        if (exception || NVSDK_NGX_FAILED(result))
+        {
+            Fail(exception ? "DLSS SR release during resolution change" : "DLSS SR release during resolution change",
+                exception ? exception : static_cast<unsigned int>(result));
+            return false;
+        }
+        g_sr_feature = nullptr;
+    }
+    if (g_nr_feature)
+    {
+        const NVSDK_NGX_Result result = SafeRelease(g_nr_release, g_nr_feature, &exception);
+        if (exception || NVSDK_NGX_FAILED(result))
+        {
+            Fail(exception ? "NR release during resolution change" : "NR release during resolution change",
+                exception ? exception : static_cast<unsigned int>(result));
+            return false;
+        }
+        g_nr_feature = nullptr;
+    }
+
+    ClearPublishedOutput();
+    g_neural_ready = false;
+    g_need_history_reset = true;
+    g_using_external_guides = false;
+    g_mask_available = false;
+    g_pending_proxy_frame = false;
+    g_captured_motion.Reset(); g_captured_depth.Reset(); g_captured_mask.Reset();
+    g_fallback_motion.Reset(); g_fallback_depth.Reset();
+    g_sr_stage.Reset(); g_nr_stage.Reset(); g_packed_color.Reset();
+
+    if (g_runtime)
+    {
+        auto *device = g_runtime->get_device();
+        for (const BackbufferView &entry : g_backbuffer_views)
+            if (entry.rtv.handle) device->destroy_resource_view(entry.rtv);
+        g_backbuffer_views.clear();
+    }
+    Log("resolution reconfiguration retired old NGX handles and size-dependent resources");
+    return true;
+}
+
 static bool EnsureStandaloneResources(ID3D12Resource *backbuffer)
 {
     if (g_neural_failed || !backbuffer || !g_command_queue) return false;
@@ -648,38 +720,42 @@ static bool EnsureStandaloneResources(ID3D12Resource *backbuffer)
     const UINT ow = g_output_width.load(), oh = g_output_height.load();
     const DXGI_FORMAT input_format = TypedInputFormat(backbuffer_desc.Format);
     if (iw == 0 || ih == 0 || ow == 0 || oh == 0) return false;
+    if (g_neural_ready && (iw != g_resource_input_width || ih != g_resource_input_height ||
+        ow != g_resource_output_width || oh != g_resource_output_height || input_format != g_resource_input_format))
+    {
+        if (!RetireResolutionDependentResources(iw, ih, input_format)) return false;
+    }
     if (iw > ow || ih > oh)
     {
+        if (g_proxy_window) { g_proxy_hidden = true; ShowWindow(g_proxy_window, SW_HIDE); }
         SetStatus("render resolution exceeds native output");
         return false;
     }
     if (iw == ow && ih == oh)
     {
+        if (g_proxy_window) { g_proxy_hidden = true; ShowWindow(g_proxy_window, SW_HIDE); }
         SetStatus("waiting for a reduced fullscreen render resolution");
         return false;
     }
-    if (g_neural_ready)
-    {
-        if (iw == g_resource_input_width && ih == g_resource_input_height && ow == g_resource_output_width &&
-            oh == g_resource_output_height && input_format == g_resource_input_format) return true;
-        Fail("resolution/format changed; restart required");
-        return false;
-    }
+    if (g_neural_ready) return true;
 
-    HRESULT hr = g_command_queue->GetDevice(IID_PPV_ARGS(&g_neural_device));
-    if (SUCCEEDED(hr)) hr = g_neural_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_neural_allocator));
-    if (SUCCEEDED(hr)) hr = g_neural_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-        g_neural_allocator.Get(), nullptr, IID_PPV_ARGS(&g_neural_list));
-    if (SUCCEEDED(hr)) hr = g_neural_list->Close();
-    if (SUCCEEDED(hr)) hr = g_neural_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_neural_fence));
-    D3D12_DESCRIPTOR_HEAP_DESC guide_heap_desc = {};
-    guide_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    guide_heap_desc.NumDescriptors = 2;
-    if (SUCCEEDED(hr)) hr = g_neural_device->CreateDescriptorHeap(&guide_heap_desc, IID_PPV_ARGS(&g_guide_rtv_heap));
-    if (FAILED(hr)) { Fail("D3D12 neural command infrastructure", static_cast<unsigned int>(hr)); return false; }
-    g_guide_rtv_stride = g_neural_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    g_neural_fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!g_neural_fence_event) { Fail("neural fence event", GetLastError()); return false; }
+    if (!g_neural_device)
+    {
+        HRESULT hr = g_command_queue->GetDevice(IID_PPV_ARGS(&g_neural_device));
+        if (SUCCEEDED(hr)) hr = g_neural_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_neural_allocator));
+        if (SUCCEEDED(hr)) hr = g_neural_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            g_neural_allocator.Get(), nullptr, IID_PPV_ARGS(&g_neural_list));
+        if (SUCCEEDED(hr)) hr = g_neural_list->Close();
+        if (SUCCEEDED(hr)) hr = g_neural_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_neural_fence));
+        D3D12_DESCRIPTOR_HEAP_DESC guide_heap_desc = {};
+        guide_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        guide_heap_desc.NumDescriptors = 2;
+        if (SUCCEEDED(hr)) hr = g_neural_device->CreateDescriptorHeap(&guide_heap_desc, IID_PPV_ARGS(&g_guide_rtv_heap));
+        if (FAILED(hr)) { Fail("D3D12 neural command infrastructure", static_cast<unsigned int>(hr)); return false; }
+        g_guide_rtv_stride = g_neural_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        g_neural_fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!g_neural_fence_event) { Fail("neural fence event", GetLastError()); return false; }
+    }
 
     g_resource_input_width = iw; g_resource_input_height = ih;
     g_resource_output_width = ow; g_resource_output_height = oh;
@@ -697,9 +773,15 @@ static bool EnsureStandaloneResources(ID3D12Resource *backbuffer)
     if (!InitializeNgx() || !CreateFeatures()) return false;
     PublishOutput(g_sr_stage.Get());
     g_neural_ready = true;
+    if (g_proxy_window)
+    {
+        g_proxy_hidden = false;
+        ShowWindow(g_proxy_window, SW_SHOWNOACTIVATE);
+    }
     SetStatus("active on present: NR + DLSS SR (fallback guides)");
     Log("resources ready on present: packed=%ux%u fmt=%u, NR/SR=%ux%u fmt=%u; fallback guides=%ux%u",
         ow, oh, static_cast<unsigned int>(input_format), ow, oh, static_cast<unsigned int>(result_format), iw, ih);
+    Log("resolution configuration active without restart: input=%ux%u output=%ux%u", iw, ih, ow, oh);
     return true;
 }
 
