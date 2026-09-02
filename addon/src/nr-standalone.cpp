@@ -28,7 +28,7 @@
 #include "../../../work/DLSS5-Feeder/src/feed_vk.h"
 #include "../../../work/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.2-vulkan-present-sync"
+#define ADDON_VERSION "1.7.4-vulkan-window-contract"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -88,10 +88,6 @@ static bool g_alt_x_down;
 static std::atomic<unsigned long long> g_last_primary_present_tick{0};
 static std::atomic<bool> g_proxy_watchdog_hidden{false};
 static std::atomic<unsigned long long> g_ignored_secondary_surfaces{0};
-static bool g_vulkan_force_render_resolution = false;
-static unsigned int g_vulkan_render_width = 1920;
-static unsigned int g_vulkan_render_height = 1080;
-static std::atomic<unsigned long long> g_vulkan_overridden_swapchains{0};
 
 enum class ColorProfile : int
 {
@@ -193,6 +189,7 @@ static bool g_vulkan_post_layout_initialized;
 static bool g_vulkan_release_wait_queued;
 static bool g_vulkan_input_copy_recorded;
 static bool g_vulkan_post_copy_recorded;
+static bool g_vulkan_waiting_for_effects;
 static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> g_guide_rtv_heap;
 static UINT g_guide_rtv_stride;
 static UINT g_resource_input_width;
@@ -1158,7 +1155,8 @@ static bool BuildVulkanFrameResources(UINT width, UINT height, DXGI_FORMAT forma
 }
 
 static bool RecordVulkanFrameCopy(reshade::api::command_queue *queue,
-    reshade::api::resource source, reshade::api::resource_usage source_usage, bool post_effects)
+    reshade::api::resource source, reshade::api::resource_usage source_usage, bool post_effects,
+    reshade::api::command_list *provided_list = nullptr)
 {
     if (!queue || !g_vulkan.ok || source.handle == 0 || !g_command_queue || !g_legacy_fence12)
         return false;
@@ -1173,7 +1171,7 @@ static bool RecordVulkanFrameCopy(reshade::api::command_queue *queue,
         return false;
     }
     g_vulkan_release_wait_queued = true;
-    reshade::api::command_list *list = queue->get_immediate_command_list();
+    reshade::api::command_list *list = provided_list ? provided_list : queue->get_immediate_command_list();
     if (!list) return false;
     VkCommandBuffer command_buffer = FeedVkDispatch<VkCommandBuffer>(list->get_native());
     VkImage source_image = FeedVkHandle<VkImage>(source.handle);
@@ -2108,6 +2106,27 @@ static WPARAM MouseMessageKeyState(UINT message, DWORD mouse_data)
     return keys;
 }
 
+static bool MapProxyScreenPointToGame(POINT screen_point, POINT &game_client, POINT &game_screen)
+{
+    if (!g_proxy_window || !g_game_window) return false;
+    RECT proxy_client = {}, target_client = {};
+    if (!GetClientRect(g_proxy_window, &proxy_client) || !GetClientRect(g_game_window, &target_client))
+        return false;
+    const LONG proxy_width = proxy_client.right - proxy_client.left;
+    const LONG proxy_height = proxy_client.bottom - proxy_client.top;
+    const LONG target_width = target_client.right - target_client.left;
+    const LONG target_height = target_client.bottom - target_client.top;
+    if (proxy_width <= 0 || proxy_height <= 0 || target_width <= 0 || target_height <= 0)
+        return false;
+
+    POINT proxy_point = screen_point;
+    if (!ScreenToClient(g_proxy_window, &proxy_point)) return false;
+    game_client.x = std::clamp<LONG>(MulDiv(proxy_point.x, target_width, proxy_width), 0, target_width - 1);
+    game_client.y = std::clamp<LONG>(MulDiv(proxy_point.y, target_height, proxy_height), 0, target_height - 1);
+    game_screen = game_client;
+    return ClientToScreen(g_game_window, &game_screen) != FALSE;
+}
+
 static LRESULT CALLBACK ProxyLowLevelMouseProc(int code, WPARAM wparam, LPARAM lparam)
 {
     if (code < 0 || !g_reshade_overlay_open.load() || g_game_window == nullptr)
@@ -2127,9 +2146,15 @@ static LRESULT CALLBACK ProxyLowLevelMouseProc(int code, WPARAM wparam, LPARAM l
         return CallNextHookEx(g_proxy_mouse_hook, code, wparam, lparam);
 
     const auto *mouse = reinterpret_cast<const MSLLHOOKSTRUCT *>(lparam);
-    POINT point = mouse->pt;
+    POINT client_point = {}, screen_point = {};
     const bool screen_coordinates = message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL;
-    if (!screen_coordinates) ScreenToClient(g_game_window, &point);
+    if (!MapProxyScreenPointToGame(mouse->pt, client_point, screen_point))
+    {
+        client_point = mouse->pt;
+        ScreenToClient(g_game_window, &client_point);
+        screen_point = mouse->pt;
+    }
+    const POINT point = screen_coordinates ? screen_point : client_point;
     const LPARAM position = MAKELPARAM(static_cast<short>(point.x), static_cast<short>(point.y));
     if (PostMessageW(g_game_window, message, MouseMessageKeyState(message, mouse->mouseData), position))
     {
@@ -2170,10 +2195,15 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
     {
         if (message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN || message == WM_MBUTTONDOWN)
             SetForegroundWindow(g_game_window);
-        POINT point = {static_cast<short>(LOWORD(lparam)), static_cast<short>(HIWORD(lparam))};
-        ClientToScreen(hwnd, &point);
-        ScreenToClient(g_game_window, &point);
-        const LPARAM mapped = MAKELPARAM(static_cast<short>(point.x), static_cast<short>(point.y));
+        POINT screen_point = {static_cast<short>(LOWORD(lparam)), static_cast<short>(HIWORD(lparam))};
+        ClientToScreen(hwnd, &screen_point);
+        POINT client_point = {}, mapped_screen = {};
+        if (!MapProxyScreenPointToGame(screen_point, client_point, mapped_screen))
+        {
+            ScreenToClient(g_game_window, &screen_point);
+            client_point = screen_point;
+        }
+        const LPARAM mapped = MAKELPARAM(static_cast<short>(client_point.x), static_cast<short>(client_point.y));
         PostMessageW(g_game_window, message, wparam, mapped);
         return 0;
     }
@@ -2615,10 +2645,6 @@ static void OnReshadePresent(reshade::api::effect_runtime *runtime)
 
     reshade::api::command_queue *queue = runtime->get_command_queue();
     const reshade::api::device_api api = runtime->get_device()->get_api();
-    // Vulkan's present hook owns the immediate-list submission and attaches
-    // the application's render-complete semaphore. Record both copies now and
-    // let ReShade submit them at that synchronization boundary. A manual flush
-    // here races NMS's present semaphore and can device-loss the queue.
     if (api != reshade::api::device_api::vulkan && queue)
         queue->flush_immediate_command_list();
     if (api == reshade::api::device_api::d3d12)
@@ -2627,22 +2653,30 @@ static void OnReshadePresent(reshade::api::effect_runtime *runtime)
         CopyLegacyFrameToD3D12(reinterpret_cast<void *>(resource.handle), true))
         PresentProxyAfterReshade(g_legacy_post12.Get());
     else if (api == reshade::api::device_api::vulkan)
-        RecordVulkanFrameCopy(queue, resource, reshade::api::resource_usage::present, true);
+        PresentProxyAfterReshade(g_packed_color.Get());
 }
 
-static void OnFinishPresent(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain)
+static void OnReshadeFinishEffects(reshade::api::effect_runtime *runtime,
+    reshade::api::command_list *commands, reshade::api::resource_view rtv,
+    reshade::api::resource_view)
 {
-    if (!queue || !swapchain || queue->get_device()->get_api() != reshade::api::device_api::vulkan ||
-        !g_vulkan_input_copy_recorded)
+    if (!runtime || runtime != g_runtime || !commands || !g_vulkan_waiting_for_effects ||
+        runtime->get_device()->get_api() != reshade::api::device_api::vulkan)
         return;
-    const HWND present_window = static_cast<HWND>(swapchain->get_hwnd());
-    if (g_game_window && present_window && present_window != g_game_window) return;
+    reshade::api::command_queue *queue = runtime->get_command_queue();
+    const reshade::api::resource source = runtime->get_device()->get_resource_from_view(rtv);
+    if (!queue || !source.handle) return;
 
-    // At finish_present, ReShade has submitted the recorded copies with the
-    // application's present waits and vkQueuePresentKHR has returned. Signal
-    // the imported D3D12 timeline only now, then run NGX and the native proxy.
+    // Match the proven Vulkan feeder boundary exactly: ReShade has already
+    // transitioned the swapchain image from present to render_target before
+    // invoking reshade_finish_effects. Copy from that known state, restore it,
+    // and flush the same command list before handing the shared image to D3D12.
+    if (!RecordVulkanFrameCopy(queue, source, reshade::api::resource_usage::render_target,
+        false, commands))
+        return;
+    queue->flush_immediate_command_list();
     const bool completed = CompleteVulkanFrameCopies(queue);
-    const bool has_post_copy = g_vulkan_post_copy_recorded;
+    g_vulkan_waiting_for_effects = false;
     g_vulkan_release_wait_queued = false;
     g_vulkan_input_copy_recorded = false;
     g_vulkan_post_copy_recorded = false;
@@ -2654,12 +2688,12 @@ static void OnFinishPresent(reshade::api::command_queue *queue, reshade::api::sw
             g_proxy_hidden = true;
             ShowWindow(g_proxy_window, SW_HIDE);
         }
-        SetStatus("Vulkan present-synchronized handoff failed; see log");
+        SetStatus("Vulkan effects-boundary handoff failed; see log");
         return;
     }
     if (!ExecuteOnPresentPipeline(nullptr)) return;
-    if (!g_enabled || g_neural_failed || g_proxy_hidden || !g_nr_output || !EnsureProxy(g_nr_output)) return;
-    PresentProxyAfterReshade(has_post_copy ? g_legacy_post12.Get() : g_packed_color.Get());
+    if (!g_enabled || g_neural_failed || !g_nr_output || !EnsureProxy(g_nr_output)) return;
+    g_pending_proxy_frame = true;
 }
 
 static bool OnReshadeOpenOverlay(reshade::api::effect_runtime *runtime, bool open, reshade::api::input_source)
@@ -2737,6 +2771,7 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     g_vulkan_release_wait_queued = false;
     g_vulkan_input_copy_recorded = false;
     g_vulkan_post_copy_recorded = false;
+    g_vulkan_waiting_for_effects = false;
     if (!g_enabled || g_neural_failed)
     {
         if (g_proxy_window && !g_proxy_hidden)
@@ -2813,16 +2848,8 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         const DXGI_FORMAT format = VulkanSharedFormat(static_cast<DXGI_FORMAT>(desc.texture.format));
         g_input_width = width; g_input_height = height;
         if (!EnsureStandaloneResources(width, height, format)) return;
-        if (!RecordVulkanFrameCopy(queue, backbuffer_resource, reshade::api::resource_usage::present, false))
-        {
-            if (!g_neural_failed) SetStatus("waiting for a valid Vulkan shared frame");
-            return;
-        }
-        // Arm the post-ReShade copy, but do not create/show the proxy until the
-        // first synchronized Vulkan handoff and NGX evaluation have succeeded.
-        // This is the Vulkan fail-open path: startup remains the game's normal
-        // presentation instead of exposing an uninitialized black proxy.
-        g_pending_proxy_frame = true;
+        g_vulkan_waiting_for_effects = true;
+        SetStatus("Vulkan resources ready; waiting for ReShade effects boundary");
         return;
     }
     if (g_nr_output != nullptr && EnsureProxy(g_nr_output)) g_pending_proxy_frame = true;
@@ -2896,35 +2923,6 @@ static bool OnSetFullscreenState(reshade::api::swapchain *swapchain, bool fullsc
     return true;
 }
 
-static bool OnCreateSwapchain(reshade::api::device_api api, reshade::api::swapchain_desc &desc, void *window)
-{
-    if (api != reshade::api::device_api::vulkan || !g_enabled || !g_vulkan_force_render_resolution)
-        return false;
-
-    const UINT requested_width = g_vulkan_render_width;
-    const UINT requested_height = g_vulkan_render_height;
-    const UINT original_width = static_cast<UINT>(desc.back_buffer.texture.width);
-    const UINT original_height = desc.back_buffer.texture.height;
-    HWND hwnd = static_cast<HWND>(window);
-
-    // Only reduce plausible primary presentation surfaces. This prevents a
-    // small Vulkan helper swapchain from being enlarged to the configured game
-    // resolution before OnInitSwapchain has identified the primary HWND.
-    if (hwnd == nullptr || requested_width < 640 || requested_height < 360 ||
-        original_width < requested_width || original_height < requested_height ||
-        (original_width == requested_width && original_height == requested_height))
-        return false;
-
-    desc.back_buffer.texture.width = requested_width;
-    desc.back_buffer.texture.height = requested_height;
-    const unsigned long long count = ++g_vulkan_overridden_swapchains;
-    Log("Vulkan swapchain render extent override #%llu: %ux%u -> %ux%u hwnd=%p; window/output extent remains native",
-        count, original_width, original_height, requested_width, requested_height, hwnd);
-    SetStatus("Vulkan render extent overridden to %ux%u; waiting for first shared frame",
-        requested_width, requested_height);
-    return true;
-}
-
 static void DrawOverlay(reshade::api::effect_runtime *)
 {
     constexpr const char *section = "Standalone.DLSSNR";
@@ -2951,29 +2949,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::SameLine();
     ImGui::TextDisabled("supports reduced-resolution fullscreen and borderless swapchains");
 
-    if (ImGui::Checkbox("Force reduced Vulkan swapchain extent", &g_vulkan_force_render_resolution))
-    {
-        reshade::set_config_value(nullptr, section, "VulkanForceRenderResolution",
-            g_vulkan_force_render_resolution ? "1" : "0");
-        SetStatus("Vulkan render extent setting changed; restart or recreate the game swapchain");
-    }
-    int vulkan_width = static_cast<int>(g_vulkan_render_width);
-    int vulkan_height = static_cast<int>(g_vulkan_render_height);
-    bool vulkan_size_changed = ImGui::InputInt("Vulkan render width", &vulkan_width, 8, 64);
-    vulkan_size_changed |= ImGui::InputInt("Vulkan render height", &vulkan_height, 8, 64);
-    if (vulkan_size_changed)
-    {
-        g_vulkan_render_width = static_cast<unsigned int>(std::clamp(vulkan_width, 640, 16384));
-        g_vulkan_render_height = static_cast<unsigned int>(std::clamp(vulkan_height, 360, 16384));
-        char value[16];
-        sprintf_s(value, "%u", g_vulkan_render_width);
-        reshade::set_config_value(nullptr, section, "VulkanRenderWidth", static_cast<const char *>(value));
-        sprintf_s(value, "%u", g_vulkan_render_height);
-        reshade::set_config_value(nullptr, section, "VulkanRenderHeight", static_cast<const char *>(value));
-        SetStatus("Vulkan render extent changed to %ux%u; restart or recreate the game swapchain",
-            g_vulkan_render_width, g_vulkan_render_height);
-    }
-    ImGui::TextDisabled("Vulkan only: use this when borderless mode ignores the game's reduced resolution. Restart required.");
+    ImGui::TextDisabled("Vulkan: select a real reduced windowed resolution in-game; the native proxy supplies borderless output.");
 
     int profile = static_cast<int>(g_color_profile);
     if (ImGui::Combo("Input color profile", &profile,
@@ -3075,7 +3051,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g_reshade_overlay_open.load() ? "click-through" : "game forwarding");
     ImGui::Text("Routed ReShade mouse events: %llu", g_overlay_mouse_events.load());
     ImGui::Text("Presented image: %s", g_show_neural_output ? "neural native output" : "stretched original backbuffer");
-    ImGui::TextWrapped("Set a reduced game resolution in fullscreen or borderless mode. If a Vulkan game still creates a native-size swapchain, enable the Vulkan extent override above. The addon keeps the presentation proxy at the monitor's native resolution and performs NR followed by DLSS Super Resolution.");
+    ImGui::TextWrapped("Set a reduced game resolution in fullscreen or borderless mode. Vulkan games must create a genuinely reduced windowed swapchain; the addon then supplies native-size borderless presentation. It performs NR followed by DLSS Super Resolution.");
     ImGui::TextUnformatted("Press F10 for neural/stretched-original A/B. Home is composited into the proxy; Alt+X hides it for NVIDIA.");
     ImGui::Text("Log: %s", g_log_path);
 }
@@ -3171,12 +3147,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("FrameGeneration", "1", value, sizeof(value)); g_framegen_enabled = strcmp(value, "0") != 0;
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
-        read_setting("VulkanForceRenderResolution", "0", value, sizeof(value)); g_vulkan_force_render_resolution = strcmp(value, "0") != 0;
-        read_setting("VulkanRenderWidth", "1920", value, sizeof(value)); g_vulkan_render_width = std::clamp(static_cast<unsigned int>(strtoul(value, nullptr, 10)), 640u, 16384u);
-        read_setting("VulkanRenderHeight", "1080", value, sizeof(value)); g_vulkan_render_height = std::clamp(static_cast<unsigned int>(strtoul(value, nullptr, 10)), 360u, 16384u);
         Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d", ADDON_VERSION, ProfileName(g_color_profile), g_nr_model);
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
-        reshade::register_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
@@ -3186,7 +3158,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
         reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
         reshade::register_event<reshade::addon_event::present>(OnPresent);
-        reshade::register_event<reshade::addon_event::finish_present>(OnFinishPresent);
+        reshade::register_event<reshade::addon_event::reshade_finish_effects>(OnReshadeFinishEffects);
         reshade::register_event<reshade::addon_event::reshade_present>(OnReshadePresent);
         reshade::register_event<reshade::addon_event::reshade_open_overlay>(OnReshadeOpenOverlay);
         reshade::register_overlay(nullptr, DrawOverlay);
@@ -3194,12 +3166,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     else if (reason == DLL_PROCESS_DETACH)
     {
         reshade::unregister_event<reshade::addon_event::create_device>(OnCreateDevice);
-        reshade::unregister_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
         reshade::unregister_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
         reshade::unregister_overlay(nullptr, DrawOverlay);
         reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(OnReshadeOpenOverlay);
         reshade::unregister_event<reshade::addon_event::reshade_present>(OnReshadePresent);
-        reshade::unregister_event<reshade::addon_event::finish_present>(OnFinishPresent);
+        reshade::unregister_event<reshade::addon_event::reshade_finish_effects>(OnReshadeFinishEffects);
         reshade::unregister_event<reshade::addon_event::present>(OnPresent);
         reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
         reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
