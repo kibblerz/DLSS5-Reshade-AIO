@@ -28,7 +28,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.9-sr-quality-compat"
+#define ADDON_VERSION "1.7.10-proxy-init-guard"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -67,6 +67,8 @@ static HANDLE g_proxy_fence_event;
 static UINT64 g_proxy_fence_value;
 static bool g_proxy_allow_tearing;
 static bool g_proxy_failed;
+static std::atomic<bool> g_proxy_initializing{false};
+static std::atomic<unsigned int> g_proxy_initialization_deferrals{0};
 static std::atomic<bool> g_proxy_hidden{false};
 static bool g_show_neural_output = true;
 static bool g_pending_proxy_frame;
@@ -2382,7 +2384,31 @@ static DWORD WINAPI ProxyWindowThread(void *)
 
 static bool EnsureProxy(ID3D12Resource *source)
 {
-    if (g_proxy_swapchain || g_proxy_failed || source == nullptr || g_command_queue == nullptr || g_game_window == nullptr)
+    if (source == nullptr || g_command_queue == nullptr || g_game_window == nullptr)
+        return false;
+
+    // Creating a proxy swapchain can re-enter ReShade's Present callbacks on
+    // some injectors. Do not let that nested callback (or a concurrent game
+    // Present) start a second UI thread/window while the first swapchain is
+    // still inside CreateSwapChainForHwnd.
+    bool expected = false;
+    if (!g_proxy_initializing.compare_exchange_strong(expected, true,
+        std::memory_order_acquire, std::memory_order_relaxed))
+    {
+        const unsigned int deferred = ++g_proxy_initialization_deferrals;
+        if (deferred <= 4)
+            Log("native proxy initialization already in progress; deferring nested Present (%u)", deferred);
+        return false;
+    }
+    struct ProxyInitializationGuard
+    {
+        ~ProxyInitializationGuard()
+        {
+            g_proxy_initializing.store(false, std::memory_order_release);
+        }
+    } initialization_guard;
+
+    if (g_proxy_swapchain || g_proxy_failed)
         return g_proxy_swapchain != nullptr;
 
     const D3D12_RESOURCE_DESC source_desc = source->GetDesc();
