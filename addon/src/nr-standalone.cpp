@@ -28,7 +28,7 @@
 #include "../../../work/DLSS5-Feeder/src/feed_vk.h"
 #include "../../../work/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.0-vulkan-interop"
+#define ADDON_VERSION "1.7.1-vulkan-render-extent"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -88,6 +88,10 @@ static bool g_alt_x_down;
 static std::atomic<unsigned long long> g_last_primary_present_tick{0};
 static std::atomic<bool> g_proxy_watchdog_hidden{false};
 static std::atomic<unsigned long long> g_ignored_secondary_surfaces{0};
+static bool g_vulkan_force_render_resolution = false;
+static unsigned int g_vulkan_render_width = 1920;
+static unsigned int g_vulkan_render_height = 1080;
+static std::atomic<unsigned long long> g_vulkan_overridden_swapchains{0};
 
 enum class ColorProfile : int
 {
@@ -2743,8 +2747,8 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         const UINT height = desc.texture.height;
         const DXGI_FORMAT format = static_cast<DXGI_FORMAT>(desc.texture.format);
         g_input_width = width; g_input_height = height;
-        if (!EnsureStandaloneResources(width, height, format) ||
-            !CopyLegacyFrameToD3D12(reinterpret_cast<void *>(backbuffer_resource.handle), false) ||
+        if (!EnsureStandaloneResources(width, height, format)) return;
+        if (!CopyLegacyFrameToD3D12(reinterpret_cast<void *>(backbuffer_resource.handle), false) ||
             !ExecuteOnPresentPipeline(nullptr))
         {
             if (!g_neural_failed) SetStatus("waiting for a valid %s shared frame",
@@ -2759,8 +2763,8 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         const UINT height = desc.texture.height;
         const DXGI_FORMAT format = VulkanSharedFormat(static_cast<DXGI_FORMAT>(desc.texture.format));
         g_input_width = width; g_input_height = height;
-        if (!EnsureStandaloneResources(width, height, format) ||
-            !CopyVulkanFrameToD3D12(queue, backbuffer_resource, reshade::api::resource_usage::present, false) ||
+        if (!EnsureStandaloneResources(width, height, format)) return;
+        if (!CopyVulkanFrameToD3D12(queue, backbuffer_resource, reshade::api::resource_usage::present, false) ||
             !ExecuteOnPresentPipeline(nullptr))
         {
             if (!g_neural_failed) SetStatus("waiting for a valid Vulkan shared frame");
@@ -2838,6 +2842,35 @@ static bool OnSetFullscreenState(reshade::api::swapchain *swapchain, bool fullsc
     return true;
 }
 
+static bool OnCreateSwapchain(reshade::api::device_api api, reshade::api::swapchain_desc &desc, void *window)
+{
+    if (api != reshade::api::device_api::vulkan || !g_enabled || !g_vulkan_force_render_resolution)
+        return false;
+
+    const UINT requested_width = g_vulkan_render_width;
+    const UINT requested_height = g_vulkan_render_height;
+    const UINT original_width = static_cast<UINT>(desc.back_buffer.texture.width);
+    const UINT original_height = desc.back_buffer.texture.height;
+    HWND hwnd = static_cast<HWND>(window);
+
+    // Only reduce plausible primary presentation surfaces. This prevents a
+    // small Vulkan helper swapchain from being enlarged to the configured game
+    // resolution before OnInitSwapchain has identified the primary HWND.
+    if (hwnd == nullptr || requested_width < 640 || requested_height < 360 ||
+        original_width < requested_width || original_height < requested_height ||
+        (original_width == requested_width && original_height == requested_height))
+        return false;
+
+    desc.back_buffer.texture.width = requested_width;
+    desc.back_buffer.texture.height = requested_height;
+    const unsigned long long count = ++g_vulkan_overridden_swapchains;
+    Log("Vulkan swapchain render extent override #%llu: %ux%u -> %ux%u hwnd=%p; window/output extent remains native",
+        count, original_width, original_height, requested_width, requested_height, hwnd);
+    SetStatus("Vulkan render extent overridden to %ux%u; waiting for first shared frame",
+        requested_width, requested_height);
+    return true;
+}
+
 static void DrawOverlay(reshade::api::effect_runtime *)
 {
     constexpr const char *section = "Standalone.DLSSNR";
@@ -2863,6 +2896,30 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     }
     ImGui::SameLine();
     ImGui::TextDisabled("supports reduced-resolution fullscreen and borderless swapchains");
+
+    if (ImGui::Checkbox("Force reduced Vulkan swapchain extent", &g_vulkan_force_render_resolution))
+    {
+        reshade::set_config_value(nullptr, section, "VulkanForceRenderResolution",
+            g_vulkan_force_render_resolution ? "1" : "0");
+        SetStatus("Vulkan render extent setting changed; restart or recreate the game swapchain");
+    }
+    int vulkan_width = static_cast<int>(g_vulkan_render_width);
+    int vulkan_height = static_cast<int>(g_vulkan_render_height);
+    bool vulkan_size_changed = ImGui::InputInt("Vulkan render width", &vulkan_width, 8, 64);
+    vulkan_size_changed |= ImGui::InputInt("Vulkan render height", &vulkan_height, 8, 64);
+    if (vulkan_size_changed)
+    {
+        g_vulkan_render_width = static_cast<unsigned int>(std::clamp(vulkan_width, 640, 16384));
+        g_vulkan_render_height = static_cast<unsigned int>(std::clamp(vulkan_height, 360, 16384));
+        char value[16];
+        sprintf_s(value, "%u", g_vulkan_render_width);
+        reshade::set_config_value(nullptr, section, "VulkanRenderWidth", static_cast<const char *>(value));
+        sprintf_s(value, "%u", g_vulkan_render_height);
+        reshade::set_config_value(nullptr, section, "VulkanRenderHeight", static_cast<const char *>(value));
+        SetStatus("Vulkan render extent changed to %ux%u; restart or recreate the game swapchain",
+            g_vulkan_render_width, g_vulkan_render_height);
+    }
+    ImGui::TextDisabled("Vulkan only: use this when borderless mode ignores the game's reduced resolution. Restart required.");
 
     int profile = static_cast<int>(g_color_profile);
     if (ImGui::Combo("Input color profile", &profile,
@@ -2964,7 +3021,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g_reshade_overlay_open.load() ? "click-through" : "game forwarding");
     ImGui::Text("Routed ReShade mouse events: %llu", g_overlay_mouse_events.load());
     ImGui::Text("Presented image: %s", g_show_neural_output ? "neural native output" : "stretched original backbuffer");
-    ImGui::TextWrapped("Set a reduced game resolution in fullscreen or borderless mode. The addon keeps the presentation proxy at the monitor's native resolution and performs NR followed by DLSS Super Resolution.");
+    ImGui::TextWrapped("Set a reduced game resolution in fullscreen or borderless mode. If a Vulkan game still creates a native-size swapchain, enable the Vulkan extent override above. The addon keeps the presentation proxy at the monitor's native resolution and performs NR followed by DLSS Super Resolution.");
     ImGui::TextUnformatted("Press F10 for neural/stretched-original A/B. Home is composited into the proxy; Alt+X hides it for NVIDIA.");
     ImGui::Text("Log: %s", g_log_path);
 }
@@ -3060,8 +3117,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("FrameGeneration", "1", value, sizeof(value)); g_framegen_enabled = strcmp(value, "0") != 0;
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
+        read_setting("VulkanForceRenderResolution", "0", value, sizeof(value)); g_vulkan_force_render_resolution = strcmp(value, "0") != 0;
+        read_setting("VulkanRenderWidth", "1920", value, sizeof(value)); g_vulkan_render_width = std::clamp(static_cast<unsigned int>(strtoul(value, nullptr, 10)), 640u, 16384u);
+        read_setting("VulkanRenderHeight", "1080", value, sizeof(value)); g_vulkan_render_height = std::clamp(static_cast<unsigned int>(strtoul(value, nullptr, 10)), 360u, 16384u);
         Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d", ADDON_VERSION, ProfileName(g_color_profile), g_nr_model);
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
+        reshade::register_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
@@ -3078,6 +3139,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     else if (reason == DLL_PROCESS_DETACH)
     {
         reshade::unregister_event<reshade::addon_event::create_device>(OnCreateDevice);
+        reshade::unregister_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
         reshade::unregister_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
         reshade::unregister_overlay(nullptr, DrawOverlay);
         reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(OnReshadeOpenOverlay);
