@@ -1,0 +1,19 @@
+# Generated build and validation output
+addon/build/
+addon/*.exp
+addon/*.lib
+lab/build/
+lab/*.exe
+lab/*.dll
+lab/*.obj
+lab/*.exp
+lab/*.lib
+lab/*.log
+lab/*.ppm
+lab/*.json
+lab/matrix-results.txt
+lab/log-*.txt
+
+# Closed-source NVIDIA runtimes are supplied locally, never committed.
+runtime/*.dll
+runtime/*.bin

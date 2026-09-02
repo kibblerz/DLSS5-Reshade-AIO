@@ -42,7 +42,9 @@ Each case writes a text log, a JSON result, and a PPM output. `nr-lab.log` conta
 
 ## Build and use the addon
 
-Run `addon\build.bat`. The complete runtime set is emitted under `addon\build`:
+Clone with submodules, then install the NVIDIA NGX SDK headers/import library and Khronos Vulkan headers using the instructions under `external\DLSS5-Feeder\external\ngx` and `external\DLSS5-Feeder\external\vulkan`. The closed-source NVIDIA runtime DLLs are not stored in this public repository; place locally obtained copies in `runtime\` as described in `runtime\README.md`.
+
+Run `addon\build.bat`. The available runtime set is emitted under `addon\build`:
 
 - `standalone-dlssnr.addon64`
 - `nvngx.dll` (the caller-identity bridge required by the NR snippet)

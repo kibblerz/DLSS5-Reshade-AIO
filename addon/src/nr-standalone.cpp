@@ -25,8 +25,8 @@
 #include <nvsdk_ngx_defs_dlssd.h>
 #include <nvsdk_ngx_defs_dlssg.h>
 
-#include "../../../work/DLSS5-Feeder/src/feed_vk.h"
-#include "../../../work/DLSS5-Feeder/src/feed_vk_hook.h"
+#include "../../external/DLSS5-Feeder/src/feed_vk.h"
+#include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
 #define ADDON_VERSION "1.7.5-vulkan-input"
 

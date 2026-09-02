@@ -1,0 +1,3 @@
+[submodule "external/DLSS5-Feeder"]
+	path = external/DLSS5-Feeder
+	url = https://github.com/jlrouzies-fr/DLSS5-Feeder

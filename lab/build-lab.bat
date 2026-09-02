@@ -1,23 +1,18 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-call "..\..\work\DLSS5-Feeder\tools\vcvars.bat" x64 || exit /b 1
+set "FEEDER_ROOT=%~dp0..\external\DLSS5-Feeder"
+call "%FEEDER_ROOT%\tools\vcvars.bat" x64 || exit /b 1
 cl /nologo /std:c++17 /O2 /EHsc /W4 /MD /LD ^
   nvngx-bridge.cpp /Fe:nvngx.dll ^
   /link d3d12.lib
 if errorlevel 1 exit /b 1
 cl /nologo /std:c++17 /O2 /EHsc /W4 /MD ^
-  /I"..\..\work\DLSS5-Feeder\external\ngx" ^
+  /I"%FEEDER_ROOT%\external\ngx" ^
   nr-lab.cpp /Fe:nr-lab.exe ^
-  /link "..\..\work\DLSS5-Feeder\external\ngx\libs\nvsdk_ngx_d.lib" ^
+  /link "%FEEDER_ROOT%\external\ngx\libs\nvsdk_ngx_d.lib" ^
   d3d12.lib dxgi.lib dxguid.lib user32.lib advapi32.lib ole32.lib
 if errorlevel 1 exit /b 1
-copy /y "..\..\nvngx_dlss.dll" "." >nul || exit /b 1
-copy /y "..\..\renodx\external\DLSS\lib\Windows_x86_64\rel\nvngx_dlssg.dll" "." >nul || exit /b 1
-if exist "nvngx_dlssnr.sf.dll" (
-  copy /y "nvngx_dlssnr.sf.dll" "nvngx_dlssnr.dll" >nul || exit /b 1
-) else (
-  copy /y "..\..\nvngx_dlssnr.dll" "." >nul || exit /b 1
-)
+for %%F in (nvngx_dlssnr.dll nvngx_dlss.dll nvngx_dlssg.dll) do copy /y "..\runtime\%%F" "." >nul || exit /b 1
 echo nr-lab built.
 endlocal
