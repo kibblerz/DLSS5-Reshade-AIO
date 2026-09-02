@@ -28,7 +28,7 @@
 #include "../../../work/DLSS5-Feeder/src/feed_vk.h"
 #include "../../../work/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.5-vulkan-input"
+#define ADDON_VERSION "1.7.6-vulkan-overlay"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -73,6 +73,10 @@ static bool g_pending_proxy_frame;
 static bool g_composite_reshade_output = true;
 static std::atomic<unsigned long long> g_post_reshade_frames{0};
 static std::atomic<bool> g_reshade_overlay_open{false};
+static std::atomic<reshade::api::effect_runtime *> g_proxy_runtime{nullptr};
+static std::atomic<bool> g_proxy_overlay_open{false};
+static bool g_proxy_overlay_syncing;
+static std::atomic<bool> g_proxy_cursor_clip_active{false};
 static std::atomic<unsigned long long> g_overlay_mouse_events{0};
 static unsigned long long g_last_logged_mouse_event;
 static bool g_show_proxy_fps = true;
@@ -1706,6 +1710,14 @@ static void OnInitEffectRuntime(reshade::api::effect_runtime *runtime)
     const HWND runtime_window = static_cast<HWND>(runtime->get_hwnd());
     const auto runtime_backbuffer = runtime->get_current_back_buffer();
     const auto runtime_desc = runtime->get_device()->get_resource_desc(runtime_backbuffer);
+    if (g_proxy_window != nullptr && runtime_window == g_proxy_window)
+    {
+        g_proxy_runtime = runtime;
+        g_proxy_overlay_open = false;
+        Log("adopted native proxy ReShade runtime for overlay mirroring: runtime=%p hwnd=%p surface=%llux%u",
+            runtime, runtime_window, runtime_desc.texture.width, runtime_desc.texture.height);
+        return;
+    }
     if (runtime_window == nullptr || runtime_desc.texture.width < 640 || runtime_desc.texture.height < 360)
     {
         Log("ignored helper ReShade runtime: hwnd=%p surface=%llux%u", runtime_window,
@@ -1729,6 +1741,12 @@ static void OnInitEffectRuntime(reshade::api::effect_runtime *runtime)
 static void OnReloadedEffects(reshade::api::effect_runtime *runtime) { if (!g_runtime || runtime == g_runtime) ResolveHandles(runtime); }
 static void OnDestroyEffectRuntime(reshade::api::effect_runtime *runtime)
 {
+    if (runtime == g_proxy_runtime.load())
+    {
+        g_proxy_runtime = nullptr;
+        g_proxy_overlay_open = false;
+        return;
+    }
     if (runtime != g_runtime) return;
     auto *device = runtime->get_device();
     for (const BackbufferView &entry : g_backbuffer_views)
@@ -2127,9 +2145,35 @@ static bool MapProxyScreenPointToGame(POINT screen_point, POINT &game_client, PO
     return ClientToScreen(g_game_window, &game_screen) != FALSE;
 }
 
+static void UpdateProxyCursorClip(bool active)
+{
+    if (active && g_proxy_window != nullptr && IsWindow(g_proxy_window))
+    {
+        RECT client = {};
+        POINT top_left = {}, bottom_right = {};
+        if (GetClientRect(g_proxy_window, &client))
+        {
+            top_left = {client.left, client.top};
+            bottom_right = {client.right, client.bottom};
+            if (ClientToScreen(g_proxy_window, &top_left) && ClientToScreen(g_proxy_window, &bottom_right))
+            {
+                const RECT clip = {top_left.x, top_left.y, bottom_right.x, bottom_right.y};
+                ClipCursor(&clip);
+                g_proxy_cursor_clip_active = true;
+                return;
+            }
+        }
+    }
+    if (g_proxy_cursor_clip_active.exchange(false))
+        ClipCursor(nullptr);
+}
+
 static LRESULT CALLBACK ProxyLowLevelMouseProc(int code, WPARAM wparam, LPARAM lparam)
 {
-    if (code < 0 || !g_reshade_overlay_open.load() || g_game_window == nullptr)
+    // A mirrored overlay on the native proxy consumes its own input. Keep the
+    // old button bridge only as a fallback if that secondary runtime is absent.
+    if (code < 0 || !g_reshade_overlay_open.load() || g_game_window == nullptr ||
+        g_proxy_runtime.load() != nullptr)
         return CallNextHookEx(g_proxy_mouse_hook, code, wparam, lparam);
 
     const UINT message = static_cast<UINT>(wparam);
@@ -2166,7 +2210,8 @@ static LRESULT CALLBACK ProxyLowLevelMouseProc(int code, WPARAM wparam, LPARAM l
 
 static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
 {
-    if (message == WM_NCHITTEST) return g_reshade_overlay_open.load() ? HTTRANSPARENT : HTCLIENT;
+    if (message == WM_NCHITTEST)
+        return g_reshade_overlay_open.load() && g_proxy_runtime.load() == nullptr ? HTTRANSPARENT : HTCLIENT;
     if (message == WM_ERASEBKGND) return 1;
     if (message == WM_CLOSE) { DestroyWindow(hwnd); return 0; }
     if (message == WM_DESTROY) { KillTimer(hwnd, 1); PostQuitMessage(0); return 0; }
@@ -2181,6 +2226,7 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
             last_present != 0 && now - last_present < 5000;
         if ((!primary_alive || !game_foreground) && !g_proxy_hidden && IsWindowVisible(hwnd))
         {
+            UpdateProxyCursorClip(false);
             ShowWindow(hwnd, SW_HIDE);
             g_proxy_watchdog_hidden = true;
         }
@@ -2198,7 +2244,8 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
     // cursor "gravity"). Leave movement to the game's native raw-input path and
     // bridge only events whose hit target is otherwise consumed by the proxy.
     if (message == WM_MOUSEMOVE && g_game_window != nullptr)
-        return 0;
+        return g_reshade_overlay_open.load() && g_proxy_runtime.load() != nullptr ?
+            DefWindowProcW(hwnd, message, wparam, lparam) : 0;
 
     const bool routed_mouse_message = message == WM_LBUTTONDOWN || message == WM_LBUTTONUP ||
         message == WM_RBUTTONDOWN || message == WM_RBUTTONUP ||
@@ -2207,6 +2254,8 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
         message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL;
     if (routed_mouse_message && g_game_window != nullptr)
     {
+        if (g_reshade_overlay_open.load() && g_proxy_runtime.load() != nullptr)
+            return DefWindowProcW(hwnd, message, wparam, lparam);
         if (message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN ||
             message == WM_MBUTTONDOWN || message == WM_XBUTTONDOWN)
             SetForegroundWindow(g_game_window);
@@ -2656,7 +2705,19 @@ static bool EnsureStandaloneResources(ID3D12Resource *backbuffer)
 
 static void OnReshadePresent(reshade::api::effect_runtime *runtime)
 {
-    if (runtime == nullptr || runtime != g_runtime || !g_pending_proxy_frame) return;
+    if (runtime == nullptr) return;
+    if (runtime == g_proxy_runtime.load())
+    {
+        const bool desired = g_reshade_overlay_open.load();
+        if (g_proxy_overlay_open.load() != desired && !g_proxy_overlay_syncing)
+        {
+            g_proxy_overlay_syncing = true;
+            runtime->open_overlay(desired, reshade::api::input_source::none);
+            g_proxy_overlay_syncing = false;
+        }
+        return;
+    }
+    if (runtime != g_runtime || !g_pending_proxy_frame) return;
     g_pending_proxy_frame = false;
     if (!g_enabled || g_neural_failed || g_proxy_hidden) return;
     const reshade::api::resource resource = runtime->get_current_back_buffer();
@@ -2717,10 +2778,20 @@ static void OnReshadeFinishEffects(reshade::api::effect_runtime *runtime,
 
 static bool OnReshadeOpenOverlay(reshade::api::effect_runtime *runtime, bool open, reshade::api::input_source)
 {
+    if (runtime == g_proxy_runtime.load())
+    {
+        // The proxy overlay follows the primary runtime. Cancel an independent
+        // proxy hotkey toggle so the two runtimes cannot become inverted.
+        if (!g_proxy_overlay_syncing && open != g_reshade_overlay_open.load())
+            return true;
+        g_proxy_overlay_open = open;
+        Log("native proxy ReShade overlay mirror %s", open ? "opened" : "closed");
+        return false;
+    }
     if (runtime != g_runtime) return false;
     g_reshade_overlay_open = open;
-    Log("ReShade overlay %s; native proxy hit testing is now %s",
-        open ? "opened" : "closed", open ? "click-through" : "interactive forwarding");
+    Log("primary ReShade overlay %s; native proxy mirror requested",
+        open ? "opened" : "closed");
     return false;
 }
 
@@ -2734,6 +2805,8 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     g_last_primary_present_tick = GetTickCount64();
     const HWND foreground = GetForegroundWindow();
     const bool primary_foreground = foreground == g_game_window || GetAncestor(foreground, GA_ROOT) == g_game_window;
+    UpdateProxyCursorClip(primary_foreground && g_proxy_window != nullptr &&
+        !g_proxy_hidden && IsWindowVisible(g_proxy_window));
     if (g_proxy_watchdog_hidden.load() && primary_foreground && g_proxy_window != nullptr && !g_proxy_hidden)
     {
         g_proxy_watchdog_hidden = false;
@@ -2796,6 +2869,7 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         if (g_proxy_window && !g_proxy_hidden)
         {
             g_proxy_hidden = true;
+            UpdateProxyCursorClip(false);
             ShowWindow(g_proxy_window, SW_HIDE);
         }
         return;
@@ -2828,6 +2902,7 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     if (alt_x && !g_alt_x_down && g_proxy_window != nullptr && !g_proxy_hidden)
     {
         g_proxy_hidden = true;
+        UpdateProxyCursorClip(false);
         ShowWindow(g_proxy_window, SW_HIDE);
         Log("native proxy hidden automatically for NVIDIA overlay");
     }
@@ -3067,7 +3142,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g_frames_presented.load(), g_post_reshade_frames.load());
     ImGui::Text("Source FPS: %u; proxy presents/sec: %u; ReShade menu input: %s",
         g_source_fps.load(), g_proxy_fps.load(),
-        g_reshade_overlay_open.load() ? "click-through" : "game forwarding");
+        g_reshade_overlay_open.load() ? (g_proxy_runtime.load() ? "native proxy overlay" : "fallback bridge") : "game forwarding");
     ImGui::Text("Routed ReShade mouse events: %llu", g_overlay_mouse_events.load());
     ImGui::Text("Presented image: %s", g_show_neural_output ? "neural native output" : "stretched original backbuffer");
     ImGui::TextWrapped("Set a reduced game resolution in fullscreen or borderless mode. Vulkan games must create a genuinely reduced windowed swapchain; the addon then supplies native-size borderless presentation. It performs NR followed by DLSS Super Resolution.");
@@ -3206,6 +3281,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             g_proxy_allocators[index].Reset();
         }
         g_proxy_fence.Reset(); g_proxy_swapchain.Reset();
+        UpdateProxyCursorClip(false);
         if (g_proxy_window) PostMessageW(g_proxy_window, WM_CLOSE, 0, 0);
         if (g_proxy_window_thread) CloseHandle(g_proxy_window_thread);
         if (g_proxy_window_ready) CloseHandle(g_proxy_window_ready);
