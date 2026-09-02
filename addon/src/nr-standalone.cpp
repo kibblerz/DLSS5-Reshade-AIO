@@ -28,7 +28,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.17-early-proxy"
+#define ADDON_VERSION "1.7.18-model-style-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -688,6 +688,14 @@ static int FeatureFlags()
         (g_active_color_profile == ColorProfile::Srgb ? 0 : NVSDK_NGX_DLSS_Feature_Flags_IsHDR);
 }
 
+static unsigned int NrStyle()
+{
+    // The private 310.8 NR package exposes three effective networks through
+    // DLSSNR.Style values 0..2. Hint.Render.Preset is retained below for
+    // compatibility, but does not select those networks in the contract lab.
+    return static_cast<unsigned int>(std::clamp(g_nr_model - 1, 0, 2));
+}
+
 static void SetNrCreationContract()
 {
     const UINT iw = g_resource_input_width, ih = g_resource_input_height;
@@ -715,6 +723,7 @@ static void SetNrCreationContract()
     g_ngx_params->Set("DLSSNR.Upscaling", 1u);
     g_ngx_params->Set("DLSSNR.ScalingRatio", 1.0f); g_ngx_params->Set("DLSSNR.Scale", 1.0f);
     g_ngx_params->Set("DLSSNR.Hint.Render.Preset", g_nr_model);
+    g_ngx_params->Set("DLSSNR.Style", NrStyle());
     g_ngx_params->Set("DLSSNR.Intensity", g_nr_intensity);
     g_ngx_params->Set("DLSSNR.LocalToneStrength", g_nr_local_tone);
     g_ngx_params->Set("DLSSNR.LocalStructureStrength", g_nr_local_structure);
@@ -857,12 +866,12 @@ static bool CreateFeatures()
             if (NVSDK_NGX_FAILED(result) || !g_fg_feature) g_framegen_failed = true;
         }
     }
-    Log("standalone contract ready: NR=%s at %ux%u, %s -> %ux%u, DLSS-G=%s, model=%d, profile=%s",
+    Log("standalone contract ready: NR=%s at %ux%u, %s -> %ux%u, DLSS-G=%s, model=%d style=%u, profile=%s",
         g_nr_feature ? "feature 18 active" : "disabled",
         g_resource_input_width, g_resource_input_height, SrModeName(),
         g_resource_output_width, g_resource_output_height,
         (!g_framegen_failed && g_fg_feature) ? "ready" : "fallback-off",
-        g_nr_model, ProfileName(g_active_color_profile));
+        g_nr_model, NrStyle(), ProfileName(g_active_color_profile));
     g_active_nr_model = g_nr_feature ? g_nr_model : 0;
     return true;
 }
@@ -1684,6 +1693,7 @@ static void SetNrEvaluationContract(ID3D12Resource *depth, ID3D12Resource *motio
     g_ngx_params->Set("DLSSNR.Upscaling", 1u);
     g_ngx_params->Set("DLSSNR.ScalingRatio", g_nr_scaling_ratio); g_ngx_params->Set("DLSSNR.Scale", g_nr_scaling_ratio);
     g_ngx_params->Set("DLSSNR.Hint.Render.Preset", g_nr_model);
+    g_ngx_params->Set("DLSSNR.Style", NrStyle());
     g_ngx_params->Set("DLSSNR.Intensity", g_nr_intensity);
     g_ngx_params->Set("DLSSNR.LocalToneStrength", g_nr_local_tone);
     g_ngx_params->Set("DLSSNR.LocalStructureStrength", g_nr_local_structure);
@@ -3383,7 +3393,8 @@ static void DrawOverlay(reshade::api::effect_runtime *)
             SetStatus("switching live feature from model %d to model %d", g_active_nr_model, g_nr_model);
         }
     }
-    ImGui::TextDisabled("Active feature model: %d%s", g_active_nr_model,
+    ImGui::TextDisabled("Active feature model: %d (NR style %u)%s", g_active_nr_model,
+        g_active_nr_model > 0 ? static_cast<unsigned int>(g_active_nr_model - 1) : 0u,
         g_feature_recreate_requested.load() ? " (switch queued for next Present)" : "");
 
     auto save_float = [section](const char *key, float value)
@@ -3553,8 +3564,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
         read_setting("EarlyProxyInitialization", "0", value, sizeof(value)); g_early_proxy_initialization = strcmp(value, "0") != 0;
-        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d NR=%s early_proxy=%s",
-            ADDON_VERSION, ProfileName(g_color_profile), g_nr_model, g_nr_enabled ? "enabled" : "disabled",
+        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d style=%u NR=%s early_proxy=%s",
+            ADDON_VERSION, ProfileName(g_color_profile), g_nr_model, NrStyle(), g_nr_enabled ? "enabled" : "disabled",
             g_early_proxy_initialization ? "enabled" : "disabled");
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
