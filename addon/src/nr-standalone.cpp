@@ -22,7 +22,7 @@
 #include <nvsdk_ngx_params.h>
 #include <nvsdk_ngx_defs_dlssd.h>
 
-#define ADDON_VERSION "1.3.4-overlay-click-bridge"
+#define ADDON_VERSION "1.3.5-masked-dlss-history"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -124,6 +124,7 @@ static Microsoft::WRL::ComPtr<ID3D12Resource> g_fallback_motion;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_fallback_depth;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_captured_motion;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_captured_depth;
+static Microsoft::WRL::ComPtr<ID3D12Resource> g_captured_mask;
 static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> g_guide_rtv_heap;
 static UINT g_guide_rtv_stride;
 static UINT g_resource_input_width;
@@ -746,7 +747,8 @@ static void SetNrEvaluationContract(ID3D12Resource *depth, ID3D12Resource *motio
     g_ngx_params->Set("DLSSNR.UICorrection", 0u);
 }
 
-static void SetSrEvaluationContract(ID3D12Resource *color, ID3D12Resource *depth, ID3D12Resource *motion, bool reset)
+static void SetSrEvaluationContract(ID3D12Resource *color, ID3D12Resource *depth, ID3D12Resource *motion,
+    ID3D12Resource *history_mask, bool reset)
 {
     g_ngx_params->Set("Color", color); g_ngx_params->Set("Output", g_sr_stage.Get());
     g_ngx_params->Set("Depth", depth); g_ngx_params->Set("MotionVectors", motion);
@@ -758,6 +760,15 @@ static void SetSrEvaluationContract(ID3D12Resource *color, ID3D12Resource *depth
     g_ngx_params->Set("DLSS.Input.Color.Subrect.Base.X", 0u); g_ngx_params->Set("DLSS.Input.Color.Subrect.Base.Y", 0u);
     g_ngx_params->Set("DLSS.Input.Depth.Subrect.Base.X", 0u); g_ngx_params->Set("DLSS.Input.Depth.Subrect.Base.Y", 0u);
     g_ngx_params->Set("DLSS.Input.MV.Subrect.Base.X", 0u); g_ngx_params->Set("DLSS.Input.MV.Subrect.Base.Y", 0u);
+    g_ngx_params->Set("DLSS.Input.Bias.Current.Color.Mask", history_mask);
+    g_ngx_params->Set("DLSS.Input.Reduce.Ghost.Mask", history_mask);
+    g_ngx_params->Set("DLSS.DisocclusionMask", history_mask);
+    g_ngx_params->Set("DLSS.Input.Bias.Current.Color.Subrect.Base.X", 0u);
+    g_ngx_params->Set("DLSS.Input.Bias.Current.Color.Subrect.Base.Y", 0u);
+    g_ngx_params->Set("DLSS.Input.Reduce.Ghost.Subrect.Base.X", 0u);
+    g_ngx_params->Set("DLSS.Input.Reduce.Ghost.Subrect.Base.Y", 0u);
+    g_ngx_params->Set("DLSS.DisocclusionMask.Subrect.Base.X", 0u);
+    g_ngx_params->Set("DLSS.DisocclusionMask.Subrect.Base.Y", 0u);
     g_ngx_params->Set("DLSS.Output.Subrect.Base.X", 0u); g_ngx_params->Set("DLSS.Output.Subrect.Base.Y", 0u);
     g_ngx_params->Set("DLSS.Pre.Exposure", 1.0f); g_ngx_params->Set("DLSS.Exposure.Scale", 1.0f);
     g_ngx_params->Set("DLSS.Indicator.Invert.X.Axis", 0); g_ngx_params->Set("DLSS.Indicator.Invert.Y.Axis", 0);
@@ -800,7 +811,7 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *runtime)
     g_backbuffer_views.clear();
     g_runtime = nullptr; g_feed_technique = {}; g_motion_technique = {};
     g_mv_variable = {}; g_depth_variable = {}; g_mask_variable = {};
-    g_captured_motion.Reset(); g_captured_depth.Reset();
+    g_captured_motion.Reset(); g_captured_depth.Reset(); g_captured_mask.Reset();
     g_using_external_guides = false;
     g_reshade_overlay_open = false;
 }
@@ -845,9 +856,10 @@ static void OnRenderTechnique(reshade::api::effect_runtime *runtime, reshade::ap
     const bool first_capture = !g_captured_motion || !g_captured_depth;
     g_captured_motion = motion;
     g_captured_depth = depth;
+    g_captured_mask = g_mask_available ? mask : nullptr;
     if (first_capture)
-        Log("captured DLSS5_Feed resources for same-frame on-present evaluation: %ux%u",
-            static_cast<unsigned int>(color_desc.Width), color_desc.Height);
+        Log("captured DLSS5_Feed resources for same-frame on-present evaluation: %ux%u; DLSS history rejection mask=%s",
+            static_cast<unsigned int>(color_desc.Width), color_desc.Height, g_mask_available ? "active" : "missing");
 }
 
 static reshade::api::resource_view GetBackbufferRtv(ID3D12Resource *backbuffer)
@@ -1015,7 +1027,8 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         g_neural_list->ResourceBarrier(1, &nr_to_srv);
         sr_color = g_nr_stage.Get();
     }
-    SetSrEvaluationContract(sr_color, depth, motion, reset);
+    ID3D12Resource *history_mask = use_external_guides && g_mask_available ? g_captured_mask.Get() : nullptr;
+    SetSrEvaluationContract(sr_color, depth, motion, history_mask, reset);
     NVSDK_NGX_Result sr_result = static_cast<NVSDK_NGX_Result>(0xBAD00004);
     if (NVSDK_NGX_SUCCEED(nr_result)) sr_result = SafeEvaluate(false, &exception);
     if (exception)
@@ -1055,9 +1068,10 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         "active on present: NR model %d + DLSS SR (%s guides)",
         g_active_nr_model, use_external_guides ? "same-frame motion" : "fallback");
     if (frame <= 8 || frame % 1800 == 0)
-        Log("on-present frame %llu: NR=%s, SR=Success, model=%d, reset=%d, guides=%s %ux%u, output=%ux%u",
+        Log("on-present frame %llu: NR=%s, SR=Success, model=%d, reset=%d, guides=%s, DLSS history mask=%s, input=%ux%u, output=%ux%u",
             frame, g_bypass_nr_for_ab ? "BYPASSED" : "Success", g_active_nr_model,
             reset ? 1 : 0, use_external_guides ? "same-frame-motion" : "fallback",
+            history_mask ? "BOUND" : "none",
             g_resource_input_width, g_resource_input_height, g_resource_output_width, g_resource_output_height);
     return true;
 }
@@ -1804,7 +1818,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         if (g_proxy_window_thread) CloseHandle(g_proxy_window_thread);
         if (g_proxy_window_ready) CloseHandle(g_proxy_window_ready);
         if (g_nr_output) g_nr_output->Release();
-        g_captured_depth.Reset(); g_captured_motion.Reset();
+        g_captured_depth.Reset(); g_captured_motion.Reset(); g_captured_mask.Reset();
         g_fallback_depth.Reset(); g_fallback_motion.Reset(); g_guide_rtv_heap.Reset();
         g_sr_stage.Reset(); g_nr_stage.Reset(); g_packed_color.Reset();
         g_neural_list.Reset(); g_neural_allocator.Reset(); g_neural_fence.Reset(); g_neural_device.Reset();

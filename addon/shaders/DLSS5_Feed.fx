@@ -66,10 +66,23 @@ void DLSS5_CaptureGuides(float4 position : SV_Position, float2 texcoord : TEXCOO
 {
     // VORT publishes previous_uv = current_uv + motion. DLSS uses the same
     // direction but expects pixels rather than normalized UV units.
-    motion = tex2Dlod(sMotVectTexVort, float4(texcoord, 0.0, 0.0)).xy *
-        float2(BUFFER_WIDTH, BUFFER_HEIGHT);
+    float2 motion_uv = tex2Dlod(sMotVectTexVort, float4(texcoord, 0.0, 0.0)).xy;
+    motion = motion_uv * float2(BUFFER_WIDTH, BUFFER_HEIGHT);
     depth = tex2Dlod(sDLSS5_GameDepth, float4(texcoord, 0.0, 0.0)).x;
-    mask = 0.0;
+
+    // VORT is screen-space optical flow, so it cannot provide reliable history
+    // at newly exposed pixels, outside-screen reprojections, or hard depth
+    // boundaries. Mark those pixels for current-frame bias in DLSS instead of
+    // allowing a bad warp to persist as a trail.
+    float2 previous_uv = texcoord + motion_uv;
+    float outside = any(previous_uv < 0.0) || any(previous_uv > 1.0) ? 1.0 : 0.0;
+    float extreme_flow = smoothstep(48.0, 160.0, length(motion));
+    float2 pixel = 1.0 / float2(BUFFER_WIDTH, BUFFER_HEIGHT);
+    float depth_dx = abs(depth - tex2Dlod(sDLSS5_GameDepth, float4(texcoord + float2(pixel.x, 0.0), 0.0, 0.0)).x);
+    float depth_dy = abs(depth - tex2Dlod(sDLSS5_GameDepth, float4(texcoord + float2(0.0, pixel.y), 0.0, 0.0)).x);
+    float relative_depth_edge = max(depth_dx, depth_dy) / max(abs(depth), 1e-4);
+    float depth_edge = smoothstep(0.015, 0.08, relative_depth_edge);
+    mask = saturate(max(outside, max(extreme_flow, depth_edge)));
 }
 
 technique DLSS5_Feed
