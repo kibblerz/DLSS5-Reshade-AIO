@@ -44,6 +44,7 @@ Reduced-resolution DLSS SR can provide major performance improvements. Native-re
 | Image is small, smeared, or changes size | Restart the game. Set the resolution and display mode before loading gameplay. Press F10 once to confirm whether the presentation proxy is active. |
 | ReShade menu temporarily makes the image smaller | Close the ReShade menu; the native-size processed output should return. This is a known proxy-input workaround in some games. |
 | Black screen | Close the game, restore native resolution, and try another display mode. Do not repeatedly change resolution while the pipeline is active. Check the persistent log before trying again. |
+| D3D12/D3D11On12 game hangs while starting | Enable **Early proxy initialization (D3D11On12 compatibility)** in the addon settings, then restart the game. It is disabled by default and must not be toggled without restarting. |
 | Vulkan says it is waiting for a shared frame | Make sure ReShade's Vulkan layer is active. Install `StandaloneBoundary.fx` when no other ReShade effect is loaded; Vulkan needs an effects boundary for the frame handoff. |
 
 ## Known limitations
@@ -150,6 +151,8 @@ Version 1.7.14 adds a persisted `Enable Neural Rendering` checkbox, enabled by d
 Version 1.7.15 adds automatic DLAA selection for native-resolution games. When the game render dimensions exactly match the native output, the addon creates the NGX Super Sampling feature with `NVSDK_NGX_PerfQuality_Value_DLAA` and a 1:1 input/output contract. Lower resolutions continue selecting the existing DLSS Super Resolution quality modes. NR and optional Frame Generation remain available in either path, and the overlay/log now identify the active reconstruction mode explicitly.
 
 Version 1.7.16 renames this addon's companion shader, technique, and guide resources to the `DLSS5_AIO_*` namespace. `DLSS5_AIO_Feed.fx` can coexist with the upstream DLSS5-Feeder project's `DLSS5_Feed.fx` without overwriting or binding it. The namespaced shader is included as a release asset beginning with this version and is part of the required asset checklist for future releases.
+
+Version 1.7.17 adds an opt-in **Early proxy initialization (D3D11On12 compatibility)** mode for games that hang when the native proxy swapchain is first created from inside Present. When enabled before launch, D3D12 creates the proxy synchronously during primary effect-runtime initialization and keeps it hidden until its first completed output frame. It does not create a background initialization worker or add a global Present guard. The first primary Present validates the captured queue; a mismatch quarantines the hidden proxy and continues initializing the neural pipeline on the authoritative queue instead of submitting unsafe work. The setting defaults to disabled, applies only after restarting, and leaves the established D3D9, D3D11, Vulkan, and default D3D12 paths unchanged.
 
 Version 1.4 uses `GetCapabilityParameters`, restores the snippet's provider callbacks after each parameter reset, and invokes NVIDIA's scaling-ratio callback during NR creation. Packed color and NR output are now allocated at the game's reduced render resolution; only the DLSS SR output is native-sized. This is the tested low-cost topology and removes the previous native-sized NR intermediates.
 
