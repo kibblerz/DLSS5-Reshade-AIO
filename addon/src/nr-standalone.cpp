@@ -28,7 +28,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.13-native-input"
+#define ADDON_VERSION "1.7.14-nr-toggle"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -128,7 +128,7 @@ static float g_nr_local_structure = 1.0f;
 static float g_nr_skin_structure = -1.0f;
 static bool g_reset_every_frame = false;
 static bool g_stable_sr_history = false;
-static bool g_bypass_nr_for_ab = false;
+static bool g_nr_enabled = true;
 static bool g_framegen_enabled = true;
 static bool g_framegen_failed = false;
 static std::atomic<bool> g_feature_recreate_requested{false};
@@ -765,14 +765,23 @@ static NVSDK_NGX_Result SafeEvaluateFg(DWORD *exception);
 
 static bool CreateFeatures()
 {
-    SetNrCreationContract();
-    if (!BeginNeuralCommands()) return false;
     DWORD exception = 0;
-    NVSDK_NGX_Result result = SafeCreate(true, &exception);
-    if (exception) { g_neural_list->Close(); Fail("NR feature creation exception", exception); return false; }
-    if (!SubmitNeuralCommands(true)) return false;
-    Log("CreateFeature(feature=18) = 0x%08X (%s), handle=%p", static_cast<unsigned int>(result), ResultName(result), g_nr_feature);
-    if (NVSDK_NGX_FAILED(result) || !g_nr_feature) { Fail("NR feature creation", static_cast<unsigned int>(result)); return false; }
+    NVSDK_NGX_Result result = NVSDK_NGX_Result_Success;
+    if (g_nr_enabled)
+    {
+        SetNrCreationContract();
+        if (!BeginNeuralCommands()) return false;
+        result = SafeCreate(true, &exception);
+        if (exception) { g_neural_list->Close(); Fail("NR feature creation exception", exception); return false; }
+        if (!SubmitNeuralCommands(true)) return false;
+        Log("CreateFeature(feature=18) = 0x%08X (%s), handle=%p", static_cast<unsigned int>(result), ResultName(result), g_nr_feature);
+        if (NVSDK_NGX_FAILED(result) || !g_nr_feature) { Fail("NR feature creation", static_cast<unsigned int>(result)); return false; }
+    }
+    else
+    {
+        g_nr_feature = nullptr;
+        Log("CreateFeature(feature=18) skipped: Neural Rendering is disabled; SR + FG-only mode");
+    }
 
     const float ratio = static_cast<float>(g_resource_input_width) / static_cast<float>(g_resource_output_width);
     // UltraQuality is an extended NGX enum that is rejected by otherwise
@@ -828,17 +837,18 @@ static bool CreateFeatures()
             if (NVSDK_NGX_FAILED(result) || !g_fg_feature) g_framegen_failed = true;
         }
     }
-    Log("standalone contract ready: NR feature 18 %ux%u active rect, DLSS SR -> %ux%u, DLSS-G=%s, model=%d, profile=%s",
+    Log("standalone contract ready: NR=%s at %ux%u, DLSS SR -> %ux%u, DLSS-G=%s, model=%d, profile=%s",
+        g_nr_feature ? "feature 18 active" : "disabled",
         g_resource_input_width, g_resource_input_height, g_resource_output_width, g_resource_output_height,
         (!g_framegen_failed && g_fg_feature) ? "ready" : "fallback-off",
         g_nr_model, ProfileName(g_active_color_profile));
-    g_active_nr_model = g_nr_model;
+    g_active_nr_model = g_nr_feature ? g_nr_model : 0;
     return true;
 }
 
 static bool RecreateFeatures()
 {
-    if (!g_neural_ready || !g_nr_feature || !g_sr_feature) return false;
+    if (!g_neural_ready || !g_sr_feature) return false;
     if (!WaitForNeuralGpu()) return false;
     DWORD exception = 0;
     if (g_fg_feature)
@@ -859,19 +869,24 @@ static bool RecreateFeatures()
         return false;
     }
     g_sr_feature = nullptr;
-    NVSDK_NGX_Result nr_result = SafeRelease(g_nr_release, g_nr_feature, &exception);
-    if (exception || NVSDK_NGX_FAILED(nr_result))
+    if (g_nr_feature)
     {
-        Fail(exception ? "NR release exception" : "NR release",
-            exception ? exception : static_cast<unsigned int>(nr_result));
-        return false;
+        NVSDK_NGX_Result nr_result = SafeRelease(g_nr_release, g_nr_feature, &exception);
+        if (exception || NVSDK_NGX_FAILED(nr_result))
+        {
+            Fail(exception ? "NR release exception" : "NR release",
+                exception ? exception : static_cast<unsigned int>(nr_result));
+            return false;
+        }
+        g_nr_feature = nullptr;
     }
-    g_nr_feature = nullptr;
-    Log("released live features for model change: old=%d requested=%d", g_active_nr_model, g_nr_model);
+    Log("released live features for pipeline change: NR=%s old_model=%d requested_model=%d",
+        g_nr_enabled ? "enabled" : "disabled", g_active_nr_model, g_nr_model);
     g_fg_frames = 0;
     g_need_history_reset = true;
     if (!CreateFeatures()) return false;
-    Log("live model switch complete: active model=%d", g_active_nr_model);
+    Log("live pipeline switch complete: NR=%s active_model=%d",
+        g_nr_feature ? "enabled" : "disabled", g_active_nr_model);
     return true;
 }
 
@@ -1610,7 +1625,8 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
         g_proxy_hidden = false;
         ShowWindow(g_proxy_window, g_proxy_overlay_bypass ? SW_HIDE : SW_SHOWNOACTIVATE);
     }
-    SetStatus("active on present: NR + DLSS SR (fallback guides)");
+    SetStatus("active on present: %s + DLSS SR (fallback guides)",
+        g_nr_enabled ? "NR" : "NR disabled");
     Log("resources ready on present: compact packed/NR=%ux%u, SR=%ux%u, input fmt=%u result fmt=%u; fallback guides=%ux%u",
         iw, ih, ow, oh, static_cast<unsigned int>(input_format), static_cast<unsigned int>(result_format), iw, ih);
     Log("resolution configuration active without restart: input=%ux%u output=%ux%u", iw, ih, ow, oh);
@@ -1961,6 +1977,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     const bool legacy_input = backbuffer == nullptr;
     if ((!legacy_input && !EnsureStandaloneResources(backbuffer)) || (legacy_input && !g_neural_ready)) return false;
     if (g_feature_recreate_requested.exchange(false) && !RecreateFeatures()) return false;
+    const bool evaluate_nr = g_nr_enabled && g_nr_feature != nullptr;
 
     const bool use_external_guides = !legacy_input && RenderCurrentFrameGuides(backbuffer);
     if (use_external_guides != g_using_external_guides)
@@ -2046,7 +2063,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     g_neural_list->ResourceBarrier(1, &sr_to_uav);
     DWORD exception = 0;
     NVSDK_NGX_Result nr_result = NVSDK_NGX_Result_Success;
-    if (!g_bypass_nr_for_ab)
+    if (evaluate_nr)
     {
         SetNrEvaluationContract(depth, motion, reset);
         nr_result = SafeEvaluate(true, &exception);
@@ -2059,7 +2076,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     }
     D3D12_RESOURCE_BARRIER nr_to_srv = {};
     ID3D12Resource *sr_color = g_packed_color.Get();
-    if (!g_bypass_nr_for_ab)
+    if (evaluate_nr)
     {
         nr_to_srv = Transition(g_nr_stage.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         g_neural_list->ResourceBarrier(1, &nr_to_srv);
@@ -2105,7 +2122,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
 
     D3D12_RESOURCE_BARRIER restore[4] = {};
     UINT restore_count = 0;
-    if (!g_bypass_nr_for_ab)
+    if (evaluate_nr)
         restore[restore_count++] = Transition(g_nr_stage.Get(),
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (evaluate_fg)
@@ -2150,15 +2167,19 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         }
     }
 
-    const unsigned long long frame = g_bypass_nr_for_ab ? g_sr_frames.load() + 1 : ++g_nr_frames;
-    ++g_sr_frames;
-    SetStatus(g_bypass_nr_for_ab ? "diagnostic: NR BYPASSED; DLSS SR only" :
-        "active on present: NR model %d + DLSS SR + FG %s (%s guides)",
-        g_active_nr_model, (!g_framegen_failed && g_fg_frames.load() > 1) ? "2x" : "warming/fallback",
-        use_external_guides ? "same-frame motion" : "fallback");
+    const unsigned long long frame = ++g_sr_frames;
+    if (evaluate_nr) ++g_nr_frames;
+    const char *fg_status = (!g_framegen_failed && g_fg_frames.load() > 1) ? "2x" : "warming/fallback";
+    const char *guide_status = use_external_guides ? "same-frame motion" : "fallback";
+    if (evaluate_nr)
+        SetStatus("active on present: NR model %d + DLSS SR + FG %s (%s guides)",
+            g_active_nr_model, fg_status, guide_status);
+    else
+        SetStatus("active on present: NR disabled + DLSS SR + FG %s (%s guides)",
+            fg_status, guide_status);
     if (frame <= 8 || frame % 1800 == 0)
         Log("on-present frame %llu: NR=%s, SR=Success, model=%d, NR-reset=%d, NR-guides=%s, SR-history=%s, DLSS history mask=%s, input=%ux%u, output=%ux%u",
-            frame, g_bypass_nr_for_ab ? "BYPASSED" : "Success", g_active_nr_model,
+            frame, evaluate_nr ? "Success" : "DISABLED", g_active_nr_model,
             reset ? 1 : 0, use_external_guides ? "same-frame-motion" : "fallback",
             g_stable_sr_history ? "per-frame-reset/zero-motion" : "temporal/VORT",
             history_mask ? "BOUND" : "none",
@@ -3022,7 +3043,7 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
             g_show_neural_output = !g_show_neural_output;
             g_need_history_reset = true;
             Log("F10 presentation A/B changed to %s",
-                g_show_neural_output ? "neural native output" : "linearly stretched original backbuffer");
+                g_show_neural_output ? "processed native output" : "linearly stretched original backbuffer");
         }
     }
     g_f10_down = f10;
@@ -3189,6 +3210,22 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::TextDisabled("Active: %s | detected: %s (format %u)", ProfileName(g_active_color_profile),
         ColorSpaceName(g_detected_color_space), static_cast<unsigned int>(g_detected_swapchain_format));
     ImGui::TextDisabled("Auto follows the primary swapchain; use a manual profile only when a game reports it incorrectly.");
+    if (ImGui::Checkbox("Enable Neural Rendering", &g_nr_enabled))
+    {
+        reshade::set_config_value(nullptr, section, "NeuralRendering", g_nr_enabled ? "1" : "0");
+        g_need_history_reset = true;
+        g_fg_frames = 0;
+        if (g_neural_ready && g_nr_enabled &&
+            (g_nr_feature == nullptr || g_active_nr_model != g_nr_model))
+        {
+            g_feature_recreate_requested = true;
+            SetStatus("enabling Neural Rendering feature on next Present");
+        }
+        Log("Neural Rendering changed to %s; pipeline=%s",
+            g_nr_enabled ? "enabled" : "disabled",
+            g_nr_enabled ? "NR + DLSS SR + FG" : "DLSS SR + FG only");
+    }
+    ImGui::TextDisabled("Off skips NR evaluation; DLSS Super Resolution and optional Frame Generation remain active.");
     ImGui::TextUnformatted("DLSS-NR model:");
     bool model_changed = false;
     if (ImGui::RadioButton("Model 1", g_nr_model == 1)) { g_nr_model = 1; model_changed = true; }
@@ -3200,7 +3237,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     {
         char value[16]; sprintf_s(value, "%d", g_nr_model);
         reshade::set_config_value(nullptr, section, "Model", static_cast<const char *>(value));
-        if (g_neural_ready)
+        if (g_neural_ready && g_nr_enabled)
         {
             g_feature_recreate_requested = true;
             SetStatus("switching live feature from model %d to model %d", g_active_nr_model, g_nr_model);
@@ -3239,17 +3276,11 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     }
     ImGui::TextDisabled(g_framegen_failed ? "DLSS-G unavailable/failed; real-frame fallback is active." :
         "Presents one generated frame followed by one real frame; F10 original bypasses FG.");
-    if (ImGui::Checkbox("Diagnostic A/B: bypass feature 18 (DLSS SR only)", &g_bypass_nr_for_ab))
-    {
-        g_need_history_reset = true;
-        Log("user A/B diagnostic changed: NR feature 18 is now %s", g_bypass_nr_for_ab ? "BYPASSED" : "ENABLED");
-    }
-    ImGui::TextDisabled("Toggle this while viewing a detailed static scene to isolate NR's contribution from upscaling.");
-    if (ImGui::Checkbox("Present neural output (F10)", &g_show_neural_output))
+    if (ImGui::Checkbox("Present processed output (F10)", &g_show_neural_output))
     {
         g_need_history_reset = true;
         Log("overlay presentation A/B changed to %s",
-            g_show_neural_output ? "neural native output" : "linearly stretched original backbuffer");
+            g_show_neural_output ? "processed native output" : "linearly stretched original backbuffer");
     }
     if (ImGui::Checkbox("Composite ReShade menu while open", &g_composite_reshade_output))
         reshade::set_config_value(nullptr, section, "CompositeReshade", g_composite_reshade_output ? "1" : "0");
@@ -3260,10 +3291,11 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::Separator();
     ImGui::Text("Status: %s", g_neural_status);
     ImGui::TextUnformatted("Activation boundary: game OnPresent (standalone private NGX runtime)");
-    ImGui::Text("Pipeline: NR=%llu; SR=%llu; generated=%llu; FG=%s; active model=%d%s",
+    ImGui::Text("Pipeline: NR=%s (%llu evals); SR=%llu; generated=%llu; FG=%s; active model=%d",
+        g_nr_enabled ? (g_nr_feature ? "enabled" : "starting") : "disabled",
         g_nr_frames.load(), g_sr_frames.load(), g_fg_frames.load(),
         g_framegen_failed ? "failed/off" : (g_framegen_enabled ? "2x" : "off"),
-        g_active_nr_model, g_bypass_nr_for_ab ? " (NR BYPASSED)" : "");
+        g_active_nr_model);
     ImGui::Text("Contract: %ux%u -> %ux%u", g_input_width.load(), g_input_height.load(), g_output_width.load(), g_output_height.load());
     ImGui::Text("NR guides: %s; DLSS SR history: %s; validation mask=%s",
         g_using_external_guides ? "same-frame VORT optical flow" : "internal zero-motion fallback",
@@ -3276,7 +3308,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g_source_fps.load(), g_proxy_fps.load(),
         g_reshade_overlay_open.load() ? (g_proxy_runtime.load() ? "native proxy overlay" : "direct game window") : "game forwarding");
     ImGui::Text("Forwarded proxy gameplay mouse events: %llu", g_overlay_mouse_events.load());
-    ImGui::Text("Presented image: %s", g_show_neural_output ? "neural native output" : "stretched original backbuffer");
+    ImGui::Text("Presented image: %s", g_show_neural_output ? "processed native output" : "stretched original backbuffer");
     ImGui::TextWrapped("Set a reduced game resolution in fullscreen or borderless mode. Vulkan games must create a genuinely reduced windowed swapchain; the addon then supplies native-size borderless presentation. It performs NR followed by DLSS Super Resolution.");
     ImGui::TextUnformatted("Press F10 for neural/stretched-original A/B. Home is composited into the proxy; Alt+X hides it for NVIDIA.");
     ImGui::Text("Log: %s", g_log_path);
@@ -3370,10 +3402,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("SkinStructure", "-1.0", value, sizeof(value)); g_nr_skin_structure = std::clamp(static_cast<float>(atof(value)), -1.0f, 1.0f);
         read_setting("ResetEveryFrame", "0", value, sizeof(value)); g_reset_every_frame = strcmp(value, "0") != 0;
         read_setting("StableSrHistory", "0", value, sizeof(value)); g_stable_sr_history = strcmp(value, "0") != 0;
+        read_setting("NeuralRendering", "1", value, sizeof(value)); g_nr_enabled = strcmp(value, "0") != 0;
         read_setting("FrameGeneration", "1", value, sizeof(value)); g_framegen_enabled = strcmp(value, "0") != 0;
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
-        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d", ADDON_VERSION, ProfileName(g_color_profile), g_nr_model);
+        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d NR=%s",
+            ADDON_VERSION, ProfileName(g_color_profile), g_nr_model, g_nr_enabled ? "enabled" : "disabled");
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
