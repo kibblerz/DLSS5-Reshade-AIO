@@ -28,7 +28,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.17-early-proxy"
+#define ADDON_VERSION "1.7.18-vort-reprojection-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -134,6 +134,7 @@ static float g_nr_local_structure = 1.0f;
 static float g_nr_skin_structure = -1.0f;
 static bool g_reset_every_frame = false;
 static bool g_stable_sr_history = false;
+static bool g_adaptive_smear_reduction = true;
 static bool g_nr_enabled = true;
 static bool g_framegen_enabled = true;
 static bool g_framegen_failed = false;
@@ -155,6 +156,8 @@ static reshade::api::effect_technique g_motion_technique;
 static reshade::api::effect_texture_variable g_mv_variable;
 static reshade::api::effect_texture_variable g_depth_variable;
 static reshade::api::effect_texture_variable g_mask_variable;
+static reshade::api::effect_uniform_variable g_adaptive_rejection_variable;
+static reshade::api::effect_uniform_variable g_adaptive_history_reset_variable;
 struct BackbufferView
 {
     ID3D12Resource *resource;
@@ -162,6 +165,7 @@ struct BackbufferView
 };
 static std::vector<BackbufferView> g_backbuffer_views;
 static std::atomic<unsigned long long> g_current_guide_frames{0};
+static ULONGLONG g_last_current_guide_tick;
 
 static Microsoft::WRL::ComPtr<ID3D12Device> g_neural_device;
 static Microsoft::WRL::ComPtr<ID3D12CommandAllocator> g_neural_allocator;
@@ -1069,6 +1073,7 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
     g_fg_frames = 0;
     g_need_history_reset = true;
     g_using_external_guides = false;
+    g_last_current_guide_tick = 0;
     g_mask_available = false;
     g_pending_proxy_frame = false;
     g_captured_motion.Reset(); g_captured_depth.Reset(); g_captured_mask.Reset();
@@ -1777,6 +1782,10 @@ static void ResolveHandles(reshade::api::effect_runtime *runtime)
     g_mv_variable = runtime->find_texture_variable("DLSS5_AIO_Feed.fx", "DLSS5_AIO_MV");
     g_depth_variable = runtime->find_texture_variable("DLSS5_AIO_Feed.fx", "DLSS5_AIO_Depth");
     g_mask_variable = runtime->find_texture_variable("DLSS5_AIO_Feed.fx", "DLSS5_AIO_Mask");
+    g_adaptive_rejection_variable = runtime->find_uniform_variable(
+        "DLSS5_AIO_Feed.fx", "DLSS5_AIO_EnableAdaptiveRejection");
+    g_adaptive_history_reset_variable = runtime->find_uniform_variable(
+        "DLSS5_AIO_Feed.fx", "DLSS5_AIO_ResetAdaptiveHistory");
     char reversed[16] = {};
     g_depth_reversed = !runtime->get_preprocessor_definition("RESHADE_DEPTH_INPUT_IS_REVERSED", reversed) || atoi(reversed) != 0;
     // These are rendered explicitly from OnPresent, in this order, so their
@@ -1786,10 +1795,11 @@ static void ResolveHandles(reshade::api::effect_runtime *runtime)
         runtime->set_technique_state(g_motion_technique, false);
     if (g_feed_technique.handle && runtime->get_technique_state(g_feed_technique))
         runtime->set_technique_state(g_feed_technique, false);
-    Log("current-frame guide handles: VORT=%s feed=%s mv=%s depth=%s mask=%s depth_reversed=%d",
+    Log("current-frame guide handles: VORT=%s feed=%s mv=%s depth=%s mask=%s adaptive=%s depth_reversed=%d",
         g_motion_technique.handle ? "found" : "MISSING",
         g_feed_technique.handle ? "found" : "MISSING", g_mv_variable.handle ? "found" : "MISSING",
         g_depth_variable.handle ? "found" : "MISSING", g_mask_variable.handle ? "found" : "optional/missing",
+        g_adaptive_rejection_variable.handle && g_adaptive_history_reset_variable.handle ? "ready" : "unavailable",
         g_depth_reversed ? 1 : 0);
     if (!g_motion_technique.handle || !g_feed_technique.handle || !g_mv_variable.handle || !g_depth_variable.handle)
         Log("same-frame optical-flow path unavailable; internal zero-motion fallback will be used");
@@ -1899,8 +1909,10 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *runtime)
     g_backbuffer_views.clear();
     g_runtime = nullptr; g_feed_technique = {}; g_motion_technique = {};
     g_mv_variable = {}; g_depth_variable = {}; g_mask_variable = {};
+    g_adaptive_rejection_variable = {}; g_adaptive_history_reset_variable = {};
     g_captured_motion.Reset(); g_captured_depth.Reset(); g_captured_mask.Reset();
     g_using_external_guides = false;
+    g_last_current_guide_tick = 0;
     g_reshade_overlay_open = false;
     if (g_proxy_overlay_bypass.exchange(false) && g_proxy_window != nullptr &&
         g_enabled && !g_neural_failed && !g_proxy_hidden &&
@@ -1985,6 +1997,22 @@ static bool RenderCurrentFrameGuides(ID3D12Resource *backbuffer)
     const reshade::api::resource_view rtv = GetBackbufferRtv(backbuffer);
     if (!commands || !rtv.handle) return false;
 
+    // The adaptive validator is meaningful only when this same-frame VORT path
+    // is actually being submitted. Skip its previous-frame comparisons after a
+    // reset, guide-source transition, or long presentation gap, while still
+    // letting the final history pass seed the next frame.
+    const ULONGLONG now = GetTickCount64();
+    const bool long_gap = g_last_current_guide_tick != 0 && now - g_last_current_guide_tick > 250;
+    const bool reset_adaptive_history = g_need_history_reset || !g_using_external_guides || long_gap;
+    const bool adaptive_shader_ready = g_adaptive_rejection_variable.handle &&
+        g_adaptive_history_reset_variable.handle;
+    if (adaptive_shader_ready)
+    {
+        const bool enable_adaptive = g_adaptive_smear_reduction;
+        g_runtime->set_uniform_value_bool(g_adaptive_rejection_variable, &enable_adaptive, 1);
+        g_runtime->set_uniform_value_bool(g_adaptive_history_reset_variable, &reset_adaptive_history, 1);
+    }
+
     // Present callbacks happen before ReShade's normal effect pass. Render the
     // optical-flow provider and packer now, then submit them before NGX work.
     const reshade::api::resource resource = {reinterpret_cast<uint64_t>(backbuffer)};
@@ -2009,8 +2037,10 @@ static bool RenderCurrentFrameGuides(ID3D12Resource *backbuffer)
     }
 
     const unsigned long long frame = ++g_current_guide_frames;
+    g_last_current_guide_tick = now;
     if (frame <= 4 || frame % 1800 == 0)
-        Log("same-frame VORT optical flow + DLSS5_AIO_Feed submitted before NGX: frame=%llu", frame);
+        Log("same-frame VORT optical flow + DLSS5_AIO_Feed submitted before NGX: frame=%llu adaptive=%s reset=%d",
+            frame, adaptive_shader_ready && g_adaptive_smear_reduction ? "active" : "off", reset_adaptive_history ? 1 : 0);
     return CapturedGuidesMatchInput();
 }
 
@@ -3407,6 +3437,18 @@ static void DrawOverlay(reshade::api::effect_runtime *)
             g_stable_sr_history ? "per-frame reset with zero motion" : "experimental temporal VORT motion");
     }
     ImGui::TextDisabled("Off by default; enable only as a per-frame SR-history diagnostic.");
+    if (ImGui::Checkbox("Adaptive VORT smear reduction", &g_adaptive_smear_reduction))
+    {
+        reshade::set_config_value(nullptr, section, "AdaptiveVortSmearReduction",
+            g_adaptive_smear_reduction ? "1" : "0");
+        g_need_history_reset = true;
+        Log("adaptive VORT smear reduction changed to %s",
+            g_adaptive_smear_reduction ? "enabled" : "disabled");
+    }
+    ImGui::TextDisabled(g_using_external_guides && g_adaptive_rejection_variable.handle &&
+        g_adaptive_history_reset_variable.handle ?
+        "Active: validates VORT using previous color, depth and motion, then dilates rejection edges." :
+        "Inactive: requires the current DLSS5_AIO_Feed shader and same-frame VORT Motion guides.");
     if (ImGui::Checkbox("Experimental DLSS Frame Generation (2x)", &g_framegen_enabled))
     {
         reshade::set_config_value(nullptr, section, "FrameGeneration", g_framegen_enabled ? "1" : "0");
@@ -3437,10 +3479,12 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g_framegen_failed ? "failed/off" : (g_framegen_enabled ? "2x" : "off"),
         g_active_nr_model);
     ImGui::Text("Contract: %ux%u -> %ux%u", g_input_width.load(), g_input_height.load(), g_output_width.load(), g_output_height.load());
-    ImGui::Text("NR guides: %s; DLSS SR history: %s; validation mask=%s",
+    ImGui::Text("NR guides: %s; DLSS SR history: %s; validation mask=%s; adaptive VORT=%s",
         g_using_external_guides ? "same-frame VORT optical flow" : "internal zero-motion fallback",
         g_stable_sr_history ? "per-frame reset / zero motion" : "experimental temporal VORT",
-        g_mask_available ? "valid" : "automatic mask");
+        g_mask_available ? "valid" : "automatic mask",
+        g_using_external_guides && g_adaptive_smear_reduction && g_adaptive_rejection_variable.handle &&
+            g_adaptive_history_reset_variable.handle ? "active" : "inactive");
     ImGui::Text("Current-frame guide submissions: %llu", g_current_guide_frames.load());
     ImGui::Text("Native proxy: %s; frames=%llu; post-ReShade=%llu",
         g_proxy_failed ? "failed/quarantined" : (g_proxy_swapchain ? "presenting" : "waiting"),
@@ -3548,13 +3592,15 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("SkinStructure", "-1.0", value, sizeof(value)); g_nr_skin_structure = std::clamp(static_cast<float>(atof(value)), -1.0f, 1.0f);
         read_setting("ResetEveryFrame", "0", value, sizeof(value)); g_reset_every_frame = strcmp(value, "0") != 0;
         read_setting("StableSrHistory", "0", value, sizeof(value)); g_stable_sr_history = strcmp(value, "0") != 0;
+        read_setting("AdaptiveVortSmearReduction", "1", value, sizeof(value)); g_adaptive_smear_reduction = strcmp(value, "0") != 0;
         read_setting("NeuralRendering", "1", value, sizeof(value)); g_nr_enabled = strcmp(value, "0") != 0;
         read_setting("FrameGeneration", "1", value, sizeof(value)); g_framegen_enabled = strcmp(value, "0") != 0;
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
         read_setting("EarlyProxyInitialization", "0", value, sizeof(value)); g_early_proxy_initialization = strcmp(value, "0") != 0;
-        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d NR=%s early_proxy=%s",
+        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d NR=%s adaptive_vort=%s early_proxy=%s",
             ADDON_VERSION, ProfileName(g_color_profile), g_nr_model, g_nr_enabled ? "enabled" : "disabled",
+            g_adaptive_smear_reduction ? "enabled" : "disabled",
             g_early_proxy_initialization ? "enabled" : "disabled");
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
