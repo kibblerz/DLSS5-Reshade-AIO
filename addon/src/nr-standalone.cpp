@@ -22,7 +22,7 @@
 #include <nvsdk_ngx_params.h>
 #include <nvsdk_ngx_defs_dlssd.h>
 
-#define ADDON_VERSION "1.3.1-stretched-original-ab"
+#define ADDON_VERSION "1.3.2-post-reshade-overlay"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -54,12 +54,16 @@ static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> g_proxy_srv_heap;
 static Microsoft::WRL::ComPtr<ID3D12RootSignature> g_proxy_root_signature;
 static Microsoft::WRL::ComPtr<ID3D12PipelineState> g_proxy_pipeline;
 static UINT g_proxy_rtv_stride;
+static UINT g_proxy_srv_stride;
 static DXGI_FORMAT g_proxy_present_format;
 static HANDLE g_proxy_fence_event;
 static UINT64 g_proxy_fence_value;
 static bool g_proxy_failed;
 static bool g_proxy_hidden;
 static bool g_show_neural_output = true;
+static bool g_pending_proxy_frame;
+static bool g_composite_reshade_output = true;
+static std::atomic<unsigned long long> g_post_reshade_frames{0};
 static bool g_f10_down;
 static bool g_home_down;
 static bool g_alt_x_down;
@@ -1179,15 +1183,19 @@ static bool EnsureProxy(ID3D12Resource *source)
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; heap_desc.NumDescriptors = 2;
     if (SUCCEEDED(hr)) { failed_stage = "Create RTV heap"; hr = device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&g_proxy_rtv_heap)); }
-    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; heap_desc.NumDescriptors = 1; heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; heap_desc.NumDescriptors = 3; heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (SUCCEEDED(hr)) { failed_stage = "Create SRV heap"; hr = device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&g_proxy_srv_heap)); }
 
     D3D12_DESCRIPTOR_RANGE range = {};
-    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; range.NumDescriptors = 1; range.BaseShaderRegister = 0;
-    D3D12_ROOT_PARAMETER root_parameter = {};
-    root_parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    root_parameter.DescriptorTable.NumDescriptorRanges = 1; root_parameter.DescriptorTable.pDescriptorRanges = &range;
-    root_parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; range.NumDescriptors = 3; range.BaseShaderRegister = 0;
+    D3D12_ROOT_PARAMETER root_parameters[2] = {};
+    root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    root_parameters[0].DescriptorTable.NumDescriptorRanges = 1; root_parameters[0].DescriptorTable.pDescriptorRanges = &range;
+    root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    root_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    root_parameters[1].Constants.ShaderRegister = 0;
+    root_parameters[1].Constants.Num32BitValues = 4;
+    root_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_STATIC_SAMPLER_DESC sampler = {};
     // Native neural output remains a 1:1 sample. The same sampler also gives
     // the F10 diagnostic path a conventional linear stretch from render size
@@ -1195,16 +1203,21 @@ static bool EnsureProxy(ID3D12Resource *source)
     sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR; sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     sampler.ShaderRegister = 0; sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL; sampler.MaxLOD = D3D12_FLOAT32_MAX;
     D3D12_ROOT_SIGNATURE_DESC root_desc = {};
-    root_desc.NumParameters = 1; root_desc.pParameters = &root_parameter; root_desc.NumStaticSamplers = 1; root_desc.pStaticSamplers = &sampler;
+    root_desc.NumParameters = 2; root_desc.pParameters = root_parameters; root_desc.NumStaticSamplers = 1; root_desc.pStaticSamplers = &sampler;
     root_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     Microsoft::WRL::ComPtr<ID3DBlob> signature, error_blob, vertex_shader, pixel_shader;
     if (SUCCEEDED(hr)) { failed_stage = "SerializeRootSignature"; hr = D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &error_blob); }
     if (SUCCEEDED(hr)) { failed_stage = "CreateRootSignature"; hr = device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&g_proxy_root_signature)); }
     static const char *shader_source =
-        "Texture2D<float3> Source:register(t0); SamplerState Samp:register(s0);"
+        "Texture2D<float3> Neural:register(t0); Texture2D<float3> Original:register(t1); Texture2D<float3> Post:register(t2);"
+        "SamplerState Samp:register(s0); cbuffer C:register(b0){uint Mode;float2 PackedScale;float Threshold;}"
         "struct O{float4 p:SV_Position;float2 uv:TEXCOORD0;};"
         "O VS(uint id:SV_VertexID){O o; float2 p=float2((id<<1)&2,id&2); o.uv=p; o.p=float4(p*float2(2,-2)+float2(-1,1),0,1); return o;}"
-        "float4 PS(O i):SV_Target{return float4(Source.SampleLevel(Samp,i.uv,0),1);}";
+        "float4 PS(O i):SV_Target{float3 post=Post.SampleLevel(Samp,i.uv,0); if(Mode==0)return float4(post,1);"
+        "float3 neural=Neural.SampleLevel(Samp,i.uv,0); if(Mode==1)return float4(neural,1);"
+        "uint w,h; Post.GetDimensions(w,h); uint2 p=min(uint2(i.uv*float2(w,h)),uint2(w-1,h-1));"
+        "float3 postPoint=Post.Load(int3(p,0)); float3 original=Original.Load(int3(p,0)); float3 d=abs(postPoint-original);"
+        "return float4(max(d.r,max(d.g,d.b))>Threshold?post:neural,1);}";
     if (SUCCEEDED(hr)) { failed_stage = "Compile vertex shader"; hr = D3DCompile(shader_source, strlen(shader_source), nullptr, nullptr, nullptr, "VS", "vs_5_0", 0, 0, &vertex_shader, &error_blob); }
     if (SUCCEEDED(hr)) { failed_stage = "Compile pixel shader"; hr = D3DCompile(shader_source, strlen(shader_source), nullptr, nullptr, nullptr, "PS", "ps_5_0", 0, 0, &pixel_shader, &error_blob); }
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline_desc = {};
@@ -1220,6 +1233,7 @@ static bool EnsureProxy(ID3D12Resource *source)
     if (SUCCEEDED(hr))
     {
         g_proxy_rtv_stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        g_proxy_srv_stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         auto rtv = g_proxy_rtv_heap->GetCPUDescriptorHandleForHeapStart();
         for (UINT index = 0; index < 2; ++index)
         {
@@ -1228,7 +1242,7 @@ static bool EnsureProxy(ID3D12Resource *source)
             device->CreateRenderTargetView(buffer.Get(), nullptr, rtv); rtv.ptr += g_proxy_rtv_stride;
         }
         D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
-        srv.Format = source_desc.Format; srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Format = TypedInputFormat(source_desc.Format); srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; srv.Texture2D.MipLevels = 1;
         device->CreateShaderResourceView(source, &srv, g_proxy_srv_heap->GetCPUDescriptorHandleForHeapStart());
     }
@@ -1274,6 +1288,92 @@ static bool AdoptPresentQueue(reshade::api::command_queue *queue)
     return true;
 }
 
+static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
+{
+    ID3D12Resource *neural_source = g_nr_output;
+    ID3D12Resource *original_source = g_packed_color.Get();
+    if (g_proxy_hidden || g_sr_frames.load() == 0 || neural_source == nullptr ||
+        original_source == nullptr || backbuffer == nullptr || !EnsureProxy(neural_source)) return false;
+
+    if (g_proxy_fence_value != 0 && g_proxy_fence->GetCompletedValue() < g_proxy_fence_value)
+    {
+        g_proxy_fence->SetEventOnCompletion(g_proxy_fence_value, g_proxy_fence_event);
+        if (WaitForSingleObject(g_proxy_fence_event, 1000) != WAIT_OBJECT_0) return false;
+    }
+    if (FAILED(g_proxy_allocator->Reset()) || FAILED(g_proxy_list->Reset(g_proxy_allocator.Get(), nullptr))) return false;
+    Microsoft::WRL::ComPtr<ID3D12Resource> destination;
+    if (FAILED(g_proxy_swapchain->GetBuffer(g_proxy_swapchain->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&destination)))) return false;
+    Microsoft::WRL::ComPtr<ID3D12Device> device;
+    if (FAILED(g_command_queue->GetDevice(IID_PPV_ARGS(&device)))) return false;
+
+    ID3D12Resource *sources[3] = {neural_source, original_source, backbuffer};
+    auto srv_handle = g_proxy_srv_heap->GetCPUDescriptorHandleForHeapStart();
+    for (ID3D12Resource *source : sources)
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.Format = TypedInputFormat(source->GetDesc().Format); srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; srv.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(source, &srv, srv_handle);
+        srv_handle.ptr += g_proxy_srv_stride;
+    }
+
+    D3D12_RESOURCE_BARRIER barriers[8] = {
+        Transition(destination.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET),
+        Transition(neural_source, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+        Transition(original_source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+        Transition(backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+        Transition(destination.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT),
+        Transition(neural_source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+        Transition(original_source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        Transition(backbuffer, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT)
+    };
+    g_proxy_list->ResourceBarrier(4, barriers);
+    ID3D12DescriptorHeap *heaps[] = {g_proxy_srv_heap.Get()}; g_proxy_list->SetDescriptorHeaps(1, heaps);
+    g_proxy_list->SetGraphicsRootSignature(g_proxy_root_signature.Get()); g_proxy_list->SetPipelineState(g_proxy_pipeline.Get());
+    g_proxy_list->SetGraphicsRootDescriptorTable(0, g_proxy_srv_heap->GetGPUDescriptorHandleForHeapStart());
+    struct ProxyConstants { UINT mode; float packed_scale_x; float packed_scale_y; float threshold; } constants = {
+        g_show_neural_output ? (g_composite_reshade_output ? 2u : 1u) : 0u,
+        static_cast<float>(g_resource_input_width) / static_cast<float>(g_resource_output_width),
+        static_cast<float>(g_resource_input_height) / static_cast<float>(g_resource_output_height),
+        0.0f
+    };
+    g_proxy_list->SetGraphicsRoot32BitConstants(1, 4, &constants, 0);
+    D3D12_VIEWPORT viewport = {0, 0, static_cast<float>(g_output_width.load()), static_cast<float>(g_output_height.load()), 0, 1};
+    D3D12_RECT scissor = {0, 0, static_cast<LONG>(g_output_width.load()), static_cast<LONG>(g_output_height.load())};
+    g_proxy_list->RSSetViewports(1, &viewport); g_proxy_list->RSSetScissorRects(1, &scissor);
+    auto rtv = g_proxy_rtv_heap->GetCPUDescriptorHandleForHeapStart(); rtv.ptr += g_proxy_swapchain->GetCurrentBackBufferIndex() * g_proxy_rtv_stride;
+    g_proxy_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr); g_proxy_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_proxy_list->DrawInstanced(3, 1, 0, 0);
+    g_proxy_list->ResourceBarrier(4, barriers + 4);
+    if (FAILED(g_proxy_list->Close())) return false;
+    ID3D12CommandList *lists[] = {g_proxy_list.Get()};
+    g_command_queue->ExecuteCommandLists(1, lists);
+    ++g_proxy_fence_value; g_command_queue->Signal(g_proxy_fence.Get(), g_proxy_fence_value);
+    if (FAILED(g_proxy_swapchain->Present(0, 0))) return false;
+    ++g_frames_presented;
+    const unsigned long long post_frame = ++g_post_reshade_frames;
+    if (post_frame == 1)
+        Log("post-ReShade native presentation active; effects and overlay are available to the proxy compositor");
+    return true;
+}
+
+static void OnReshadePresent(reshade::api::effect_runtime *runtime)
+{
+    if (runtime == nullptr || runtime != g_runtime || !g_pending_proxy_frame) return;
+    g_pending_proxy_frame = false;
+    if (!g_enabled || g_neural_failed || g_proxy_hidden) return;
+    const reshade::api::resource resource = runtime->get_current_back_buffer();
+    auto *backbuffer = reinterpret_cast<ID3D12Resource *>(resource.handle);
+    if (!backbuffer) return;
+
+    // ReShade emits this event after recording effects and its overlay, but
+    // before the D3D12 immediate list is normally submitted. Submit it now so
+    // the native proxy samples the completed ReShade frame on the same queue.
+    reshade::api::command_queue *queue = runtime->get_command_queue();
+    if (queue) queue->flush_immediate_command_list();
+    PresentProxyAfterReshade(backbuffer);
+}
+
 static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain,
     const reshade::api::rect *, const reshade::api::rect *, uint32_t, const reshade::api::rect *)
 {
@@ -1282,6 +1382,7 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     if (g_game_window && present_window && present_window != g_game_window) return;
     if (!g_game_window && present_window) g_game_window = present_window;
     if (!AdoptPresentQueue(queue)) return;
+    g_pending_proxy_frame = false;
     if (!g_enabled || g_neural_failed)
     {
         if (g_proxy_window && !g_proxy_hidden)
@@ -1314,11 +1415,13 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     g_f10_down = f10;
     const bool home = (GetAsyncKeyState(VK_HOME) & 0x8000) != 0;
     const bool alt_x = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0 && (GetAsyncKeyState('X') & 0x8000) != 0;
-    if (((home && !g_home_down) || (alt_x && !g_alt_x_down)) && g_proxy_window != nullptr && !g_proxy_hidden)
+    if (home && !g_home_down && g_proxy_window != nullptr && !g_proxy_hidden)
+        Log("ReShade overlay requested; keeping native proxy visible for post-overlay composition");
+    if (alt_x && !g_alt_x_down && g_proxy_window != nullptr && !g_proxy_hidden)
     {
         g_proxy_hidden = true;
         ShowWindow(g_proxy_window, SW_HIDE);
-        Log("native proxy hidden automatically for %s overlay", home ? "ReShade" : "NVIDIA");
+        Log("native proxy hidden automatically for NVIDIA overlay");
     }
     g_home_down = home;
     g_alt_x_down = alt_x;
@@ -1329,56 +1432,7 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     g_input_width = static_cast<UINT>(backbuffer_desc.Width);
     g_input_height = backbuffer_desc.Height;
     if (!ExecuteOnPresentPipeline(backbuffer)) return;
-
-    ID3D12Resource *neural_source = g_nr_output;
-    if (g_proxy_hidden || g_sr_frames.load() == 0 || neural_source == nullptr || !EnsureProxy(neural_source)) return;
-    ID3D12Resource *source = g_show_neural_output ? neural_source : backbuffer;
-    const bool source_is_game_backbuffer = source == backbuffer;
-
-    if (g_proxy_fence_value != 0 && g_proxy_fence->GetCompletedValue() < g_proxy_fence_value)
-    {
-        g_proxy_fence->SetEventOnCompletion(g_proxy_fence_value, g_proxy_fence_event);
-        if (WaitForSingleObject(g_proxy_fence_event, 1000) != WAIT_OBJECT_0) return;
-    }
-    if (FAILED(g_proxy_allocator->Reset()) || FAILED(g_proxy_list->Reset(g_proxy_allocator.Get(), nullptr))) return;
-    Microsoft::WRL::ComPtr<ID3D12Resource> destination;
-    if (FAILED(g_proxy_swapchain->GetBuffer(g_proxy_swapchain->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&destination)))) return;
-    Microsoft::WRL::ComPtr<ID3D12Device> device;
-    if (FAILED(g_command_queue->GetDevice(IID_PPV_ARGS(&device)))) return;
-    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
-    srv.Format = TypedInputFormat(source->GetDesc().Format); srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; srv.Texture2D.MipLevels = 1;
-    device->CreateShaderResourceView(source, &srv, g_proxy_srv_heap->GetCPUDescriptorHandleForHeapStart());
-
-    D3D12_RESOURCE_BARRIER barriers[4] = {};
-    for (auto &barrier : barriers) barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barriers[0].Transition.pResource = destination.Get();
-    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    barriers[1].Transition.pResource = source;
-    barriers[1].Transition.StateBefore = source_is_game_backbuffer ? D3D12_RESOURCE_STATE_PRESENT : D3D12_RESOURCE_STATE_COMMON;
-    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    barriers[2] = barriers[0]; barriers[2].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET; barriers[2].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-    barriers[3] = barriers[1]; barriers[3].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    barriers[3].Transition.StateAfter = source_is_game_backbuffer ? D3D12_RESOURCE_STATE_PRESENT : D3D12_RESOURCE_STATE_COMMON;
-    g_proxy_list->ResourceBarrier(2, barriers);
-    ID3D12DescriptorHeap *heaps[] = {g_proxy_srv_heap.Get()}; g_proxy_list->SetDescriptorHeaps(1, heaps);
-    g_proxy_list->SetGraphicsRootSignature(g_proxy_root_signature.Get()); g_proxy_list->SetPipelineState(g_proxy_pipeline.Get());
-    g_proxy_list->SetGraphicsRootDescriptorTable(0, g_proxy_srv_heap->GetGPUDescriptorHandleForHeapStart());
-    D3D12_VIEWPORT viewport = {0, 0, static_cast<float>(g_output_width.load()), static_cast<float>(g_output_height.load()), 0, 1};
-    D3D12_RECT scissor = {0, 0, static_cast<LONG>(g_output_width.load()), static_cast<LONG>(g_output_height.load())};
-    g_proxy_list->RSSetViewports(1, &viewport); g_proxy_list->RSSetScissorRects(1, &scissor);
-    auto rtv = g_proxy_rtv_heap->GetCPUDescriptorHandleForHeapStart(); rtv.ptr += g_proxy_swapchain->GetCurrentBackBufferIndex() * g_proxy_rtv_stride;
-    g_proxy_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr); g_proxy_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    g_proxy_list->DrawInstanced(3, 1, 0, 0);
-    g_proxy_list->ResourceBarrier(2, barriers + 2);
-    if (FAILED(g_proxy_list->Close())) return;
-    ID3D12CommandList *lists[] = {g_proxy_list.Get()};
-    g_command_queue->ExecuteCommandLists(1, lists);
-    ++g_proxy_fence_value; g_command_queue->Signal(g_proxy_fence.Get(), g_proxy_fence_value);
-    if (SUCCEEDED(g_proxy_swapchain->Present(0, 0))) ++g_frames_presented;
+    if (g_nr_output != nullptr && EnsureProxy(g_nr_output)) g_pending_proxy_frame = true;
 }
 
 static void OnInitSwapchain(reshade::api::swapchain *swapchain, bool)
@@ -1497,6 +1551,8 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         Log("overlay presentation A/B changed to %s",
             g_show_neural_output ? "neural native output" : "linearly stretched original backbuffer");
     }
+    if (ImGui::Checkbox("Composite ReShade effects/overlay", &g_composite_reshade_output))
+        reshade::set_config_value(nullptr, section, "CompositeReshade", g_composite_reshade_output ? "1" : "0");
     ImGui::TextDisabled("Off keeps the full-screen proxy but displays a simple linear stretch of Conan's original frame.");
 
     ImGui::Separator();
@@ -1509,10 +1565,11 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g_using_external_guides ? "same-frame VORT optical flow" : "internal zero-motion fallback",
         g_mask_available ? "valid" : "automatic mask");
     ImGui::Text("Current-frame guide submissions: %llu", g_current_guide_frames.load());
-    ImGui::Text("Native proxy: %s; frames=%llu", g_proxy_swapchain ? "presenting" : (g_proxy_failed ? "failed" : "waiting"), g_frames_presented.load());
+    ImGui::Text("Native proxy: %s; frames=%llu; post-ReShade=%llu", g_proxy_swapchain ? "presenting" : (g_proxy_failed ? "failed" : "waiting"),
+        g_frames_presented.load(), g_post_reshade_frames.load());
     ImGui::Text("Presented image: %s", g_show_neural_output ? "neural native output" : "stretched original backbuffer");
     ImGui::TextWrapped("Set the reduced render resolution in Conan's fullscreen menu. The addon keeps the desktop at native resolution and performs NR followed by DLSS Super Resolution.");
-    ImGui::TextUnformatted("Press F10 for neural/stretched-original A/B. Home and Alt+X hide the proxy for overlays.");
+    ImGui::TextUnformatted("Press F10 for neural/stretched-original A/B. Home is composited into the proxy; Alt+X hides it for NVIDIA.");
     ImGui::Text("Log: %s", g_log_path);
 }
 
@@ -1569,6 +1626,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("LocalStructure", "1.0", value, sizeof(value)); g_nr_local_structure = std::clamp(static_cast<float>(atof(value)), 0.0f, 2.0f);
         read_setting("SkinStructure", "-1.0", value, sizeof(value)); g_nr_skin_structure = std::clamp(static_cast<float>(atof(value)), -1.0f, 1.0f);
         read_setting("ResetEveryFrame", "0", value, sizeof(value)); g_reset_every_frame = strcmp(value, "0") != 0;
+        read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
         Log("Standalone DLSS-NR + SR %s attached; profile=%s model=%d", ADDON_VERSION, ProfileName(g_color_profile), g_nr_model);
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
@@ -1579,12 +1637,14 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
         reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
         reshade::register_event<reshade::addon_event::present>(OnPresent);
+        reshade::register_event<reshade::addon_event::reshade_present>(OnReshadePresent);
         reshade::register_overlay(nullptr, DrawOverlay);
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
         reshade::unregister_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
         reshade::unregister_overlay(nullptr, DrawOverlay);
+        reshade::unregister_event<reshade::addon_event::reshade_present>(OnReshadePresent);
         reshade::unregister_event<reshade::addon_event::present>(OnPresent);
         reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
         reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
