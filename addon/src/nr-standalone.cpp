@@ -28,7 +28,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.18"
+#define ADDON_VERSION "1.7.19-mask-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -134,6 +134,8 @@ static float g_nr_local_structure = 1.0f;
 static float g_nr_skin_structure = -1.0f;
 static bool g_reset_every_frame = false;
 static bool g_stable_sr_history = false;
+static bool g_nr_rejection_mask_enabled = false;
+static float g_nr_rejection_mask_strength = 1.0f;
 static bool g_nr_enabled = true;
 static bool g_framegen_enabled = true;
 static bool g_framegen_failed = false;
@@ -143,6 +145,7 @@ static bool g_depth_reversed = true;
 static bool g_neural_failed = false;
 static bool g_neural_ready = false;
 static bool g_mask_available = false;
+static bool g_nr_mask_available = false;
 static bool g_using_external_guides = false;
 static char g_neural_status[256] = "waiting for first game present";
 static std::atomic<unsigned long long> g_nr_frames{0};
@@ -155,6 +158,8 @@ static reshade::api::effect_technique g_motion_technique;
 static reshade::api::effect_texture_variable g_mv_variable;
 static reshade::api::effect_texture_variable g_depth_variable;
 static reshade::api::effect_texture_variable g_mask_variable;
+static reshade::api::effect_texture_variable g_nr_mask_variable;
+static reshade::api::effect_uniform_variable g_nr_mask_strength_variable;
 struct BackbufferView
 {
     ID3D12Resource *resource;
@@ -178,6 +183,7 @@ static Microsoft::WRL::ComPtr<ID3D12Resource> g_fallback_depth;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_captured_motion;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_captured_depth;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_captured_mask;
+static Microsoft::WRL::ComPtr<ID3D12Resource> g_captured_nr_mask;
 static reshade::api::device_api g_present_api = static_cast<reshade::api::device_api>(0);
 static Microsoft::WRL::ComPtr<ID3D11Device> g_legacy_device11;
 static Microsoft::WRL::ComPtr<ID3D11DeviceContext> g_legacy_context11;
@@ -1079,8 +1085,9 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
     g_need_history_reset = true;
     g_using_external_guides = false;
     g_mask_available = false;
+    g_nr_mask_available = false;
     g_pending_proxy_frame = false;
-    g_captured_motion.Reset(); g_captured_depth.Reset(); g_captured_mask.Reset();
+    g_captured_motion.Reset(); g_captured_depth.Reset(); g_captured_mask.Reset(); g_captured_nr_mask.Reset();
     g_fallback_motion.Reset(); g_fallback_depth.Reset();
     ReleaseLegacyFrameResources();
     g_fg_stage.Reset(); g_sr_stage.Reset(); g_nr_stage.Reset(); g_packed_color.Reset();
@@ -1660,7 +1667,8 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
     return true;
 }
 
-static void SetNrEvaluationContract(ID3D12Resource *depth, ID3D12Resource *motion, bool reset)
+static void SetNrEvaluationContract(ID3D12Resource *depth, ID3D12Resource *motion,
+    ID3D12Resource *control_mask, bool reset)
 {
     const UINT iw = g_resource_input_width, ih = g_resource_input_height;
     for (const char *name : {"Color", "DLSSNR.Color"}) g_ngx_params->Set(name, g_packed_color.Get());
@@ -1686,6 +1694,17 @@ static void SetNrEvaluationContract(ID3D12Resource *depth, ID3D12Resource *motio
     g_ngx_params->Set("DLSSNR.DepthSubrectWidth", static_cast<int>(iw)); g_ngx_params->Set("DLSSNR.DepthSubrectHeight", static_cast<int>(ih));
     g_ngx_params->Set("DLSSNR.OutputSubrectBaseX", 0); g_ngx_params->Set("DLSSNR.OutputSubrectBaseY", 0);
     g_ngx_params->Set("DLSSNR.OutputSubrectWidth", static_cast<int>(iw)); g_ngx_params->Set("DLSSNR.OutputSubrectHeight", static_cast<int>(ih));
+    // Publish null too, otherwise the shared parameter object retains the mask
+    // from the previous frame when the user disables this option or VORT drops
+    // out and feature 18 continues consuming a stale texture.
+    g_ngx_params->Set("DLSSNR.ControlMask", control_mask);
+    if (control_mask != nullptr)
+    {
+        g_ngx_params->Set("DLSSNR.ControlMaskSubrectBaseX", 0);
+        g_ngx_params->Set("DLSSNR.ControlMaskSubrectBaseY", 0);
+        g_ngx_params->Set("DLSSNR.ControlMaskSubrectWidth", static_cast<int>(iw));
+        g_ngx_params->Set("DLSSNR.ControlMaskSubrectHeight", static_cast<int>(ih));
+    }
     g_ngx_params->Set("DLSSNR.DepthInverted", g_depth_reversed ? 1u : 0u);
     g_ngx_params->Set("DLSSNR.InputWidth", iw); g_ngx_params->Set("DLSSNR.InputHeight", ih);
     g_ngx_params->Set("DLSSNR.Width", iw); g_ngx_params->Set("DLSSNR.Height", ih);
@@ -1699,6 +1718,9 @@ static void SetNrEvaluationContract(ID3D12Resource *depth, ID3D12Resource *motio
     g_ngx_params->Set("DLSSNR.LocalStructureStrength", g_nr_local_structure);
     g_ngx_params->Set("DLSSNR.SkinStructureStrength", g_nr_skin_structure);
     g_ngx_params->Set("DLSSNR.Enabled", 1u);
+    // A supplied control mask overrides the runtime's generated mask. Keep
+    // automatic masking enabled as the fallback when VORT or the guide shader
+    // is unavailable.
     g_ngx_params->Set("DLSSNR.UseAutoMask", 1u);
     g_ngx_params->Set("DLSSNR.UICorrection", 0u);
 }
@@ -1787,6 +1809,8 @@ static void ResolveHandles(reshade::api::effect_runtime *runtime)
     g_mv_variable = runtime->find_texture_variable("DLSS5_AIO_Feed.fx", "DLSS5_AIO_MV");
     g_depth_variable = runtime->find_texture_variable("DLSS5_AIO_Feed.fx", "DLSS5_AIO_Depth");
     g_mask_variable = runtime->find_texture_variable("DLSS5_AIO_Feed.fx", "DLSS5_AIO_Mask");
+    g_nr_mask_variable = runtime->find_texture_variable("DLSS5_AIO_Feed.fx", "DLSS5_AIO_NRMask");
+    g_nr_mask_strength_variable = runtime->find_uniform_variable("DLSS5_AIO_Feed.fx", "DLSS5_AIO_NRMaskStrength");
     char reversed[16] = {};
     g_depth_reversed = !runtime->get_preprocessor_definition("RESHADE_DEPTH_INPUT_IS_REVERSED", reversed) || atoi(reversed) != 0;
     // These are rendered explicitly from OnPresent, in this order, so their
@@ -1796,10 +1820,12 @@ static void ResolveHandles(reshade::api::effect_runtime *runtime)
         runtime->set_technique_state(g_motion_technique, false);
     if (g_feed_technique.handle && runtime->get_technique_state(g_feed_technique))
         runtime->set_technique_state(g_feed_technique, false);
-    Log("current-frame guide handles: VORT=%s feed=%s mv=%s depth=%s mask=%s depth_reversed=%d",
+    Log("current-frame guide handles: VORT=%s feed=%s mv=%s depth=%s sr_mask=%s nr_mask=%s strength=%s depth_reversed=%d",
         g_motion_technique.handle ? "found" : "MISSING",
         g_feed_technique.handle ? "found" : "MISSING", g_mv_variable.handle ? "found" : "MISSING",
         g_depth_variable.handle ? "found" : "MISSING", g_mask_variable.handle ? "found" : "optional/missing",
+        g_nr_mask_variable.handle ? "found" : "optional/missing",
+        g_nr_mask_strength_variable.handle ? "found" : "optional/missing",
         g_depth_reversed ? 1 : 0);
     if (!g_motion_technique.handle || !g_feed_technique.handle || !g_mv_variable.handle || !g_depth_variable.handle)
         Log("same-frame optical-flow path unavailable; internal zero-motion fallback will be used");
@@ -1908,8 +1934,10 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *runtime)
         if (entry.rtv.handle) device->destroy_resource_view(entry.rtv);
     g_backbuffer_views.clear();
     g_runtime = nullptr; g_feed_technique = {}; g_motion_technique = {};
-    g_mv_variable = {}; g_depth_variable = {}; g_mask_variable = {};
-    g_captured_motion.Reset(); g_captured_depth.Reset(); g_captured_mask.Reset();
+    g_mv_variable = {}; g_depth_variable = {}; g_mask_variable = {}; g_nr_mask_variable = {};
+    g_nr_mask_strength_variable = {};
+    g_captured_motion.Reset(); g_captured_depth.Reset(); g_captured_mask.Reset(); g_captured_nr_mask.Reset();
+    g_mask_available = false; g_nr_mask_available = false;
     g_using_external_guides = false;
     g_reshade_overlay_open = false;
     if (g_proxy_overlay_bypass.exchange(false) && g_proxy_window != nullptr &&
@@ -1926,15 +1954,18 @@ static void OnRenderTechnique(reshade::api::effect_runtime *runtime, reshade::ap
         technique.handle != g_feed_technique.handle ||
         runtime->get_device()->get_api() != device_api::d3d12) return;
     resource_view mv_srv = {}, mv_srgb = {}, depth_srv = {}, depth_srgb = {}, mask_srv = {}, mask_srgb = {};
+    resource_view nr_mask_srv = {}, nr_mask_srgb = {};
     runtime->get_texture_binding(g_mv_variable, &mv_srv, &mv_srgb);
     runtime->get_texture_binding(g_depth_variable, &depth_srv, &depth_srgb);
     if (g_mask_variable.handle) runtime->get_texture_binding(g_mask_variable, &mask_srv, &mask_srgb);
+    if (g_nr_mask_variable.handle) runtime->get_texture_binding(g_nr_mask_variable, &nr_mask_srv, &nr_mask_srgb);
     auto *device = runtime->get_device();
     const resource backbuffer_resource = device->get_resource_from_view(rtv);
     auto *backbuffer = reinterpret_cast<ID3D12Resource *>(backbuffer_resource.handle);
     auto *motion = reinterpret_cast<ID3D12Resource *>(device->get_resource_from_view(mv_srv).handle);
     auto *depth = reinterpret_cast<ID3D12Resource *>(device->get_resource_from_view(depth_srv).handle);
     auto *mask = mask_srv.handle ? reinterpret_cast<ID3D12Resource *>(device->get_resource_from_view(mask_srv).handle) : nullptr;
+    auto *nr_mask = nr_mask_srv.handle ? reinterpret_cast<ID3D12Resource *>(device->get_resource_from_view(nr_mask_srv).handle) : nullptr;
     if (!backbuffer || !motion || !depth) return;
     const D3D12_RESOURCE_DESC color_desc = backbuffer->GetDesc();
     const D3D12_RESOURCE_DESC mv_desc = motion->GetDesc();
@@ -1956,13 +1987,17 @@ static void OnRenderTechnique(reshade::api::effect_runtime *runtime, reshade::ap
     }
     g_mask_available = mask && mask->GetDesc().Width == color_desc.Width && mask->GetDesc().Height == color_desc.Height &&
         mask->GetDesc().Format == DXGI_FORMAT_R8_UNORM;
+    g_nr_mask_available = nr_mask && nr_mask->GetDesc().Width == color_desc.Width &&
+        nr_mask->GetDesc().Height == color_desc.Height && nr_mask->GetDesc().Format == DXGI_FORMAT_R8_UNORM;
     const bool first_capture = !g_captured_motion || !g_captured_depth;
     g_captured_motion = motion;
     g_captured_depth = depth;
     g_captured_mask = g_mask_available ? mask : nullptr;
+    g_captured_nr_mask = g_nr_mask_available ? nr_mask : nullptr;
     if (first_capture)
-        Log("captured DLSS5_AIO_Feed resources for same-frame on-present evaluation: %ux%u; DLSS history rejection mask=%s",
-            static_cast<unsigned int>(color_desc.Width), color_desc.Height, g_mask_available ? "active" : "missing");
+        Log("captured DLSS5_AIO_Feed resources for same-frame on-present evaluation: %ux%u; DLSS history mask=%s NR control mask=%s",
+            static_cast<unsigned int>(color_desc.Width), color_desc.Height,
+            g_mask_available ? "active" : "missing", g_nr_mask_available ? "active" : "missing");
 }
 
 static reshade::api::resource_view GetBackbufferRtv(ID3D12Resource *backbuffer)
@@ -2000,6 +2035,8 @@ static bool RenderCurrentFrameGuides(ID3D12Resource *backbuffer)
     const reshade::api::resource resource = {reinterpret_cast<uint64_t>(backbuffer)};
     commands->barrier(resource, reshade::api::resource_usage::present, reshade::api::resource_usage::render_target);
     g_runtime->render_technique(g_motion_technique, commands, rtv);
+    if (g_nr_mask_strength_variable.handle)
+        g_runtime->set_uniform_value_float(g_nr_mask_strength_variable, g_nr_rejection_mask_strength);
     g_runtime->render_technique(g_feed_technique, commands, rtv);
     commands->barrier(resource, reshade::api::resource_usage::render_target, reshade::api::resource_usage::present);
     queue->flush_immediate_command_list();
@@ -2137,9 +2174,11 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     g_neural_list->ResourceBarrier(1, &sr_to_uav);
     DWORD exception = 0;
     NVSDK_NGX_Result nr_result = NVSDK_NGX_Result_Success;
+    ID3D12Resource *nr_control_mask = g_nr_rejection_mask_enabled && use_external_guides &&
+        g_nr_mask_available ? g_captured_nr_mask.Get() : nullptr;
     if (evaluate_nr)
     {
-        SetNrEvaluationContract(depth, motion, reset);
+        SetNrEvaluationContract(depth, motion, nr_control_mask, reset);
         nr_result = SafeEvaluate(true, &exception);
         if (exception)
         {
@@ -2252,9 +2291,10 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         SetStatus("active on present: NR disabled + %s + FG %s (%s guides)",
             SrModeName(), fg_status, guide_status);
     if (frame <= 8 || frame % 1800 == 0)
-        Log("on-present frame %llu: NR=%s, %s=Success, model=%d, NR-reset=%d, NR-guides=%s, SR-history=%s, DLSS history mask=%s, input=%ux%u, output=%ux%u",
+        Log("on-present frame %llu: NR=%s, %s=Success, model=%d, NR-reset=%d, NR-guides=%s, NR-control-mask=%s strength=%.2f, SR-history=%s, DLSS history mask=%s, input=%ux%u, output=%ux%u",
             frame, evaluate_nr ? "Success" : "DISABLED", SrModeName(), g_active_nr_model,
             reset ? 1 : 0, use_external_guides ? "same-frame-motion" : "fallback",
+            nr_control_mask ? "BOUND" : "none", g_nr_rejection_mask_strength,
             g_stable_sr_history ? "per-frame-reset/zero-motion" : "temporal/VORT",
             history_mask ? "BOUND" : "none",
             g_resource_input_width, g_resource_input_height, g_resource_output_width, g_resource_output_height);
@@ -3406,6 +3446,19 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     if (ImGui::SliderFloat("Local tone strength", &g_nr_local_tone, 0.0f, 2.0f, "%.2f")) save_float("LocalTone", g_nr_local_tone);
     if (ImGui::SliderFloat("Local structure strength", &g_nr_local_structure, 0.0f, 2.0f, "%.2f")) save_float("LocalStructure", g_nr_local_structure);
     if (ImGui::SliderFloat("Skin / character structure", &g_nr_skin_structure, -1.0f, 1.0f, "%.2f")) save_float("SkinStructure", g_nr_skin_structure);
+    if (ImGui::Checkbox("VORT NR rejection mask (experimental)", &g_nr_rejection_mask_enabled))
+    {
+        reshade::set_config_value(nullptr, section, "NrRejectionMask",
+            g_nr_rejection_mask_enabled ? "1" : "0");
+        g_need_history_reset = true;
+        Log("VORT NR rejection mask changed to %s", g_nr_rejection_mask_enabled ? "enabled" : "disabled");
+    }
+    if (ImGui::SliderFloat("NR rejection strength", &g_nr_rejection_mask_strength, 0.0f, 1.0f, "%.2f"))
+    {
+        save_float("NrRejectionStrength", g_nr_rejection_mask_strength);
+        g_need_history_reset = true;
+    }
+    ImGui::TextDisabled("Only active with same-frame VORT guides. Higher values bypass NR at unreliable motion/depth edges.");
     if (ImGui::Checkbox("Reset temporal history every frame", &g_reset_every_frame))
         reshade::set_config_value(nullptr, section, "ResetEveryFrame", g_reset_every_frame ? "1" : "0");
     ImGui::SameLine();
@@ -3452,6 +3505,10 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g_using_external_guides ? "same-frame VORT optical flow" : "internal zero-motion fallback",
         g_stable_sr_history ? "per-frame reset / zero motion" : "experimental temporal VORT",
         g_mask_available ? "valid" : "automatic mask");
+    ImGui::Text("NR rejection mask: %s (strength %.2f)",
+        !g_nr_rejection_mask_enabled ? "disabled" :
+        g_using_external_guides && g_nr_mask_available ? "active" : "waiting for VORT/guide texture",
+        g_nr_rejection_mask_strength);
     ImGui::Text("Current-frame guide submissions: %llu", g_current_guide_frames.load());
     ImGui::Text("Native proxy: %s; frames=%llu; post-ReShade=%llu",
         g_proxy_failed ? "failed/quarantined" : (g_proxy_swapchain ? "presenting" : "waiting"),
@@ -3557,6 +3614,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("LocalTone", "1.0", value, sizeof(value)); g_nr_local_tone = std::clamp(static_cast<float>(atof(value)), 0.0f, 2.0f);
         read_setting("LocalStructure", "1.0", value, sizeof(value)); g_nr_local_structure = std::clamp(static_cast<float>(atof(value)), 0.0f, 2.0f);
         read_setting("SkinStructure", "-1.0", value, sizeof(value)); g_nr_skin_structure = std::clamp(static_cast<float>(atof(value)), -1.0f, 1.0f);
+        read_setting("NrRejectionMask", "0", value, sizeof(value)); g_nr_rejection_mask_enabled = strcmp(value, "0") != 0;
+        read_setting("NrRejectionStrength", "1.0", value, sizeof(value)); g_nr_rejection_mask_strength = std::clamp(static_cast<float>(atof(value)), 0.0f, 1.0f);
         read_setting("ResetEveryFrame", "0", value, sizeof(value)); g_reset_every_frame = strcmp(value, "0") != 0;
         read_setting("StableSrHistory", "0", value, sizeof(value)); g_stable_sr_history = strcmp(value, "0") != 0;
         read_setting("NeuralRendering", "1", value, sizeof(value)); g_nr_enabled = strcmp(value, "0") != 0;
@@ -3564,8 +3623,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
         read_setting("EarlyProxyInitialization", "0", value, sizeof(value)); g_early_proxy_initialization = strcmp(value, "0") != 0;
-        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d style=%u NR=%s early_proxy=%s",
+        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d style=%u NR=%s NR-mask=%s strength=%.2f early_proxy=%s",
             ADDON_VERSION, ProfileName(g_color_profile), g_nr_model, NrStyle(), g_nr_enabled ? "enabled" : "disabled",
+            g_nr_rejection_mask_enabled ? "enabled" : "disabled", g_nr_rejection_mask_strength,
             g_early_proxy_initialization ? "enabled" : "disabled");
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
@@ -3611,7 +3671,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         if (g_proxy_window_thread) CloseHandle(g_proxy_window_thread);
         if (g_proxy_window_ready) CloseHandle(g_proxy_window_ready);
         if (g_nr_output) g_nr_output->Release();
-        g_captured_depth.Reset(); g_captured_motion.Reset(); g_captured_mask.Reset();
+        g_captured_depth.Reset(); g_captured_motion.Reset(); g_captured_mask.Reset(); g_captured_nr_mask.Reset();
         g_fallback_depth.Reset(); g_fallback_motion.Reset(); g_guide_rtv_heap.Reset();
         ReleaseLegacyFrameResources();
         if (g_vulkan.ok && g_vulkan_semaphore != VK_NULL_HANDLE)

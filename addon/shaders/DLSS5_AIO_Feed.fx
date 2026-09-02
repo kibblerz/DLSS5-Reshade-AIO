@@ -55,6 +55,18 @@ texture DLSS5_AIO_Mask
     Format = R8;
 };
 
+texture DLSS5_AIO_NRMask
+{
+    Width = BUFFER_WIDTH;
+    Height = BUFFER_HEIGHT;
+    Format = R8;
+};
+
+uniform float DLSS5_AIO_NRMaskStrength
+<
+    hidden = true;
+> = 1.0;
+
 void DLSS5_AIO_FullscreenVS(uint id : SV_VertexID, out float4 position : SV_Position, out float2 texcoord : TEXCOORD)
 {
     texcoord = float2((id << 1) & 2, id & 2);
@@ -62,7 +74,8 @@ void DLSS5_AIO_FullscreenVS(uint id : SV_VertexID, out float4 position : SV_Posi
 }
 
 void DLSS5_AIO_CaptureGuides(float4 position : SV_Position, float2 texcoord : TEXCOORD,
-    out float2 motion : SV_Target0, out float depth : SV_Target1, out float mask : SV_Target2)
+    out float2 motion : SV_Target0, out float depth : SV_Target1, out float mask : SV_Target2,
+    out float nr_mask : SV_Target3)
 {
     // VORT publishes previous_uv = current_uv + motion. DLSS uses the same
     // direction but expects pixels rather than normalized UV units.
@@ -83,6 +96,11 @@ void DLSS5_AIO_CaptureGuides(float4 position : SV_Position, float2 texcoord : TE
     float relative_depth_edge = max(depth_dx, depth_dy) / max(abs(depth), 1e-4);
     float depth_edge = smoothstep(0.015, 0.08, relative_depth_edge);
     mask = saturate(max(outside, max(extreme_flow, depth_edge)));
+
+    // DLSS SR interprets one as "prefer the current frame", while feature-18's
+    // ControlMask uses the opposite convention: one applies NR and zero
+    // bypasses it. Keep both forms so each stage receives its native polarity.
+    nr_mask = saturate(1.0 - mask * DLSS5_AIO_NRMaskStrength);
 }
 
 technique DLSS5_AIO_Feed
@@ -98,5 +116,6 @@ technique DLSS5_AIO_Feed
         RenderTarget0 = DLSS5_AIO_MV;
         RenderTarget1 = DLSS5_AIO_Depth;
         RenderTarget2 = DLSS5_AIO_Mask;
+        RenderTarget3 = DLSS5_AIO_NRMask;
     }
 }
