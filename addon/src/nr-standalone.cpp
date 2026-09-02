@@ -28,7 +28,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.8-ngx-core-discovery"
+#define ADDON_VERSION "1.7.9-sr-quality-compat"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -373,6 +373,7 @@ static const char *ResultName(NVSDK_NGX_Result result)
     case 0xBAD0000A: return "MissingInput";
     case 0xBAD0000B: return "UnableToInitializeFeature";
     case 0xBAD0000D: return "OutOfGPUMemory";
+    case 0xBAD00010: return "UnsupportedParameter";
     default: return "Unknown";
     }
 }
@@ -761,8 +762,11 @@ static bool CreateFeatures()
     if (NVSDK_NGX_FAILED(result) || !g_nr_feature) { Fail("NR feature creation", static_cast<unsigned int>(result)); return false; }
 
     const float ratio = static_cast<float>(g_resource_input_width) / static_cast<float>(g_resource_output_width);
-    const int quality = ratio >= 0.72f ? NVSDK_NGX_PerfQuality_Value_UltraQuality :
-        ratio >= 0.62f ? NVSDK_NGX_PerfQuality_Value_MaxQuality :
+    // UltraQuality is an extended NGX enum that is rejected by otherwise
+    // compatible production DLSS runtimes (0xBAD00010). Quality is the
+    // highest broadly supported SR preset and also accepts ratios above its
+    // nominal recommendation, including common ultrawide inputs.
+    const int quality = ratio >= 0.62f ? NVSDK_NGX_PerfQuality_Value_MaxQuality :
         ratio >= 0.54f ? NVSDK_NGX_PerfQuality_Value_Balanced :
         ratio >= 0.42f ? NVSDK_NGX_PerfQuality_Value_MaxPerf : NVSDK_NGX_PerfQuality_Value_UltraPerformance;
     g_ngx_params->Reset();

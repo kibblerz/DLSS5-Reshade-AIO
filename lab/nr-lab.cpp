@@ -320,6 +320,7 @@ static const char *ResultName(NVSDK_NGX_Result result)
     case 0xBAD0000A: return "MissingInput";
     case 0xBAD0000B: return "UnableToInitializeFeature";
     case 0xBAD0000D: return "OutOfGPUMemory";
+    case 0xBAD00010: return "UnsupportedParameter";
     default: return "Unknown";
     }
 }
@@ -1137,8 +1138,7 @@ static bool CreateSrFeature(const Options &o, int flags)
     g.params->Set("OutWidth", o.output_w);
     g.params->Set("OutHeight", o.output_h);
     const float ratio = static_cast<float>(o.input_w) / static_cast<float>(o.output_w);
-    const int quality = ratio >= 0.72f ? NVSDK_NGX_PerfQuality_Value_UltraQuality
-        : ratio >= 0.62f ? NVSDK_NGX_PerfQuality_Value_MaxQuality
+    const int quality = ratio >= 0.62f ? NVSDK_NGX_PerfQuality_Value_MaxQuality
         : ratio >= 0.54f ? NVSDK_NGX_PerfQuality_Value_Balanced
         : ratio >= 0.42f ? NVSDK_NGX_PerfQuality_Value_MaxPerf
         : NVSDK_NGX_PerfQuality_Value_UltraPerformance;

@@ -27,6 +27,17 @@ if ($cases.Count -ne 9) { throw "Expected 9 matrix results, found $($cases.Count
 if (($cases | Where-Object { -not $_.upscalingValidated }).Count -ne 0) { throw 'At least one matrix case did not pass' }
 if (($cases | Where-Object { $_.changedPercent -le 95 }).Count -ne 0) { throw 'At least one matrix case did not cover the native output' }
 
+# Regression for drivers that reject the optional UltraQuality enum. This
+# common 21:9 scaling contract previously reached SR creation with quality=4
+# and failed with NVSDK_NGX_Result_FAIL_UnsupportedParameter (0xBAD00010).
+& .\nr-lab.exe --profile srgb --model 1 --input 2560x1080 --output 3440x1440 --frames 3 --compact-nr
+if ($LASTEXITCODE -ne 0) { throw "Ultrawide SR compatibility probe failed with exit code $LASTEXITCODE" }
+$ultrawide = Get-Content -LiteralPath .\nr-lab-result.json -Raw | ConvertFrom-Json
+Copy-Item -LiteralPath .\nr-lab-result.json -Destination .\result-ultrawide-2560x1080-to-3440x1440.json -Force
+if (-not $ultrawide.upscalingValidated -or $ultrawide.changedPercent -le 95) {
+    throw 'Ultrawide SR compatibility probe did not cover the native output'
+}
+
 $intensityChecks = @()
 foreach ($intensity in @(0.0, 0.5, 1.0)) {
     & .\nr-lab.exe --profile hdr10 --model 1 --input 960x540 --output 1920x1080 --frames 4 --intensity $intensity --compact-nr
@@ -54,6 +65,7 @@ $summary = [ordered]@{
     nrDirectUpscalingAdvertised = $false
     nrProviderScalingRatio = $nrOnly.nrResolvedScalingRatio
     compactNrResources = $true
+    ultrawideSrCompatibility = $true
     intensityChecks = $intensityChecks
     generatedAt = (Get-Date).ToString('o')
 }
