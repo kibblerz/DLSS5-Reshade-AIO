@@ -16,7 +16,7 @@ This can provide **massive performance improvements** compared with native-resol
 ## Known issues
 
 - Occasional stuttering may occur.
-- Mouse clicks do not currently work in the ReShade interface. Use ReShade's keyboard shortcuts to navigate for now.
+- In games without a secondary ReShade runtime on the native proxy, opening ReShade temporarily shows the game's lower-resolution presentation. The native-size DLSS output returns when the menu closes.
 - Changing resolution may cause visual glitching. Restarting the game should fix it.
 - No Man's Sky, and potentially other Vulkan games, may not display the ReShade menu correctly.
 - Additional Vulkan-specific issues may still be present.
@@ -93,6 +93,8 @@ Version 1.7.8 removes the NVIDIA-driver-package-specific `nvmdi.inf` assumption 
 Version 1.7.9 avoids the optional NGX `UltraQuality` enum for DLSS Super Resolution feature creation. High input/output ratios now use the standard Quality preset, fixing `0xBAD00010 (UnsupportedParameter)` on drivers that otherwise initialize DLSS-NR successfully, including 2560x1080 to 3440x1440 ultrawide scaling.
 
 Version 1.7.10 serializes native proxy initialization. Some injectors can re-enter or concurrently invoke Present while `CreateSwapChainForHwnd` is still running; previous builds could respond by creating multiple proxy threads and topmost windows before either swapchain became ready. Nested Presents now defer until the single in-progress proxy initialization completes.
+
+Version 1.7.13 fixes mouse buttons being swallowed by the native presentation proxy. Gameplay retains the established proxy-to-game button forwarding and the addon no longer installs a global low-level mouse hook. If the proxy does not receive its own ReShade runtime, opening the ReShade menu temporarily hides the proxy so the native-sized game/ReShade window receives genuine Windows mouse input; closing the menu restores the DLSS output automatically. This removes the frozen duplicate cursor and makes ReShade controls clickable, with the temporary reduced-resolution menu view documented above.
 
 Version 1.4 uses `GetCapabilityParameters`, restores the snippet's provider callbacks after each parameter reset, and invokes NVIDIA's scaling-ratio callback during NR creation. Packed color and NR output are now allocated at the game's reduced render resolution; only the DLSS SR output is native-sized. This is the tested low-cost topology and removes the previous native-sized NR intermediates.
 
