@@ -28,7 +28,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.19-mask-prototype"
+#define ADDON_VERSION "1.7.19-f10-raw-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -2740,8 +2740,9 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
         "if(x<5&&y<7&&((GlyphRow(code,y)>>(4-x))&1)!=0)return float3(0.25,0.95,0.35);return color;}"
         "float4 PS(O i):SV_Target{float3 post=Post.SampleLevel(Samp,i.uv,0);float3 neural=Neural.SampleLevel(Samp,i.uv,0);float3 result;"
         "uint w,h; Post.GetDimensions(w,h); uint2 p=min(uint2(i.uv*float2(w,h)),uint2(w-1,h-1));"
-        "float3 postPoint=Post.Load(int3(p,0)); float3 original=Original.Load(int3(p,0)); float3 d=abs(postPoint-original);"
-        "if(Mode==0)result=post;else if(Mode==1)result=neural;else result=max(d.r,max(d.g,d.b))>Threshold?post:neural;"
+        "uint ow,oh; Original.GetDimensions(ow,oh); uint2 op=min(uint2(i.uv*float2(ow,oh)),uint2(ow-1,oh-1));"
+        "float3 postPoint=Post.Load(int3(p,0)); float3 original=Original.Load(int3(op,0)); float3 d=abs(postPoint-original);"
+        "if(Mode==0)result=original;else if(Mode==1)result=neural;else result=max(d.r,max(d.g,d.b))>Threshold?post:neural;"
         "bool cursorNow=CursorInput.x>=0&&all(float2(p)>=CursorInput-float2(6,6))&&all(float2(p)<=CursorInput+float2(36,44));"
         "bool cursorPrevious=PreviousCursorInput.x>=0&&all(float2(p)>=PreviousCursorInput-float2(6,6))&&all(float2(p)<=PreviousCursorInput+float2(36,44));"
         "if((cursorNow||cursorPrevious)&&Mode!=1)result=Mode==0?original:neural;"
@@ -3210,14 +3211,14 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
             g_proxy_hidden = false;
             ShowWindow(g_proxy_window, g_proxy_overlay_bypass ? SW_HIDE : SW_SHOWNOACTIVATE);
             Log("native presentation restored after overlay access; output=%s",
-                g_show_neural_output ? "neural native" : "stretched original");
+                g_show_neural_output ? "neural native" : "point-stretched raw game frame");
         }
         else
         {
             g_show_neural_output = !g_show_neural_output;
             g_need_history_reset = true;
             Log("F10 presentation A/B changed to %s",
-                g_show_neural_output ? "processed native output" : "linearly stretched original backbuffer");
+                g_show_neural_output ? "processed native output" : "point-stretched raw pre-ReShade game frame");
         }
     }
     g_f10_down = f10;
@@ -3484,13 +3485,13 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     {
         g_need_history_reset = true;
         Log("overlay presentation A/B changed to %s",
-            g_show_neural_output ? "processed native output" : "linearly stretched original backbuffer");
+            g_show_neural_output ? "processed native output" : "point-stretched raw pre-ReShade game frame");
     }
     if (ImGui::Checkbox("Composite ReShade menu while open", &g_composite_reshade_output))
         reshade::set_config_value(nullptr, section, "CompositeReshade", g_composite_reshade_output ? "1" : "0");
     if (ImGui::Checkbox("Show native proxy FPS counter", &g_show_proxy_fps))
         reshade::set_config_value(nullptr, section, "ShowProxyFps", g_show_proxy_fps ? "1" : "0");
-    ImGui::TextDisabled("Off keeps the native-size proxy but displays a simple linear stretch of the game's original frame.");
+    ImGui::TextDisabled("Off shows a point-stretched raw pre-ReShade game frame for a clean temporal diagnostic.");
 
     ImGui::Separator();
     ImGui::Text("Status: %s", g_neural_status);
@@ -3522,7 +3523,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g_source_fps.load(), g_proxy_fps.load(),
         g_reshade_overlay_open.load() ? (g_proxy_runtime.load() ? "native proxy overlay" : "direct game window") : "game forwarding");
     ImGui::Text("Forwarded proxy gameplay mouse events: %llu", g_overlay_mouse_events.load());
-    ImGui::Text("Presented image: %s", g_show_neural_output ? "processed native output" : "stretched original backbuffer");
+    ImGui::Text("Presented image: %s", g_show_neural_output ? "processed native output" : "point-stretched raw game frame");
     ImGui::TextWrapped("At native screen resolution the pipeline uses DLAA. At a reduced game resolution it uses DLSS Super Resolution to reach the native output size. NR and optional Frame Generation remain available in either mode.");
     ImGui::TextUnformatted("Press F10 for neural/stretched-original A/B. Home is composited into the proxy; Alt+X hides it for NVIDIA.");
     ImGui::Text("Log: %s", g_log_path);
