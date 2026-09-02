@@ -22,7 +22,7 @@
 #include <nvsdk_ngx_params.h>
 #include <nvsdk_ngx_defs_dlssd.h>
 
-#define ADDON_VERSION "1.3.3-overlay-input-fps"
+#define ADDON_VERSION "1.3.4-overlay-click-bridge"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -45,6 +45,7 @@ static HWND g_game_window;
 static HWND g_proxy_window;
 static HANDLE g_proxy_window_thread;
 static HANDLE g_proxy_window_ready;
+static HHOOK g_proxy_mouse_hook;
 static Microsoft::WRL::ComPtr<IDXGISwapChain3> g_proxy_swapchain;
 static Microsoft::WRL::ComPtr<ID3D12CommandAllocator> g_proxy_allocator;
 static Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> g_proxy_list;
@@ -65,6 +66,8 @@ static bool g_pending_proxy_frame;
 static bool g_composite_reshade_output = true;
 static std::atomic<unsigned long long> g_post_reshade_frames{0};
 static std::atomic<bool> g_reshade_overlay_open{false};
+static std::atomic<unsigned long long> g_overlay_mouse_events{0};
+static unsigned long long g_last_logged_mouse_event;
 static bool g_show_proxy_fps = true;
 static std::atomic<unsigned int> g_proxy_fps{0};
 static ULONGLONG g_fps_sample_start;
@@ -1059,6 +1062,64 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     return true;
 }
 
+static WPARAM MouseMessageKeyState(UINT message, DWORD mouse_data)
+{
+    UINT keys = 0;
+    if ((GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0) keys |= MK_SHIFT;
+    if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0) keys |= MK_CONTROL;
+    if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0) keys |= MK_LBUTTON;
+    if ((GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0) keys |= MK_RBUTTON;
+    if ((GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0) keys |= MK_MBUTTON;
+    if ((GetAsyncKeyState(VK_XBUTTON1) & 0x8000) != 0) keys |= MK_XBUTTON1;
+    if ((GetAsyncKeyState(VK_XBUTTON2) & 0x8000) != 0) keys |= MK_XBUTTON2;
+    if (message == WM_LBUTTONDOWN) keys |= MK_LBUTTON;
+    if (message == WM_LBUTTONUP) keys &= ~MK_LBUTTON;
+    if (message == WM_RBUTTONDOWN) keys |= MK_RBUTTON;
+    if (message == WM_RBUTTONUP) keys &= ~MK_RBUTTON;
+    if (message == WM_MBUTTONDOWN) keys |= MK_MBUTTON;
+    if (message == WM_MBUTTONUP) keys &= ~MK_MBUTTON;
+    if (message == WM_XBUTTONDOWN)
+        keys |= HIWORD(mouse_data) == XBUTTON1 ? MK_XBUTTON1 : MK_XBUTTON2;
+    if (message == WM_XBUTTONUP)
+        keys &= ~(HIWORD(mouse_data) == XBUTTON1 ? MK_XBUTTON1 : MK_XBUTTON2);
+
+    if (message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL ||
+        message == WM_XBUTTONDOWN || message == WM_XBUTTONUP)
+        return MAKEWPARAM(keys, HIWORD(mouse_data));
+    return keys;
+}
+
+static LRESULT CALLBACK ProxyLowLevelMouseProc(int code, WPARAM wparam, LPARAM lparam)
+{
+    if (code < 0 || !g_reshade_overlay_open.load() || g_game_window == nullptr)
+        return CallNextHookEx(g_proxy_mouse_hook, code, wparam, lparam);
+
+    const UINT message = static_cast<UINT>(wparam);
+    const bool routed_message = message == WM_LBUTTONDOWN || message == WM_LBUTTONUP ||
+        message == WM_RBUTTONDOWN || message == WM_RBUTTONUP ||
+        message == WM_MBUTTONDOWN || message == WM_MBUTTONUP ||
+        message == WM_XBUTTONDOWN || message == WM_XBUTTONUP ||
+        message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL;
+    if (!routed_message)
+        return CallNextHookEx(g_proxy_mouse_hook, code, wparam, lparam);
+
+    const HWND foreground = GetForegroundWindow();
+    if (foreground != g_game_window && GetAncestor(foreground, GA_ROOT) != g_game_window)
+        return CallNextHookEx(g_proxy_mouse_hook, code, wparam, lparam);
+
+    const auto *mouse = reinterpret_cast<const MSLLHOOKSTRUCT *>(lparam);
+    POINT point = mouse->pt;
+    const bool screen_coordinates = message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL;
+    if (!screen_coordinates) ScreenToClient(g_game_window, &point);
+    const LPARAM position = MAKELPARAM(static_cast<short>(point.x), static_cast<short>(point.y));
+    if (PostMessageW(g_game_window, message, MouseMessageKeyState(message, mouse->mouseData), position))
+    {
+        ++g_overlay_mouse_events;
+        return 1; // Suppress the original proxy-targeted event; ReShade receives exactly one routed event.
+    }
+    return CallNextHookEx(g_proxy_mouse_hook, code, wparam, lparam);
+}
+
 static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
 {
     if (message == WM_NCHITTEST) return g_reshade_overlay_open.load() ? HTTRANSPARENT : HTCLIENT;
@@ -1113,6 +1174,9 @@ static DWORD WINAPI ProxyWindowThread(void *)
             info.rcMonitor.left, info.rcMonitor.top, g_output_width.load(), g_output_height.load(),
             nullptr, nullptr, g_self, nullptr);
     }
+    g_proxy_mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, ProxyLowLevelMouseProc, g_self, 0);
+    Log("proxy overlay click bridge: %s (hook=%p error=%lu)",
+        g_proxy_mouse_hook ? "ready" : "FAILED", g_proxy_mouse_hook, g_proxy_mouse_hook ? 0 : GetLastError());
     SetEvent(g_proxy_window_ready);
     if (g_proxy_window == nullptr) return 1;
     MSG message;
@@ -1121,6 +1185,7 @@ static DWORD WINAPI ProxyWindowThread(void *)
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
+    if (g_proxy_mouse_hook) { UnhookWindowsHookEx(g_proxy_mouse_hook); g_proxy_mouse_hook = nullptr; }
     g_proxy_window = nullptr;
     return 0;
 }
@@ -1212,7 +1277,7 @@ static bool EnsureProxy(ID3D12Resource *source)
     root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     root_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     root_parameters[1].Constants.ShaderRegister = 0;
-    root_parameters[1].Constants.Num32BitValues = 4;
+    root_parameters[1].Constants.Num32BitValues = 8;
     root_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_STATIC_SAMPLER_DESC sampler = {};
     // Native neural output remains a 1:1 sample. The same sampler also gives
@@ -1228,7 +1293,7 @@ static bool EnsureProxy(ID3D12Resource *source)
     if (SUCCEEDED(hr)) { failed_stage = "CreateRootSignature"; hr = device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&g_proxy_root_signature)); }
     static const char *shader_source =
         "Texture2D<float3> Neural:register(t0); Texture2D<float3> Original:register(t1); Texture2D<float3> Post:register(t2);"
-        "SamplerState Samp:register(s0); cbuffer C:register(b0){uint Mode;uint Fps;uint ShowFps;float Threshold;}"
+        "SamplerState Samp:register(s0); cbuffer C:register(b0){uint Mode;uint Fps;uint ShowFps;float Threshold;float2 CursorInput;float2 PreviousCursorInput;}"
         "struct O{float4 p:SV_Position;float2 uv:TEXCOORD0;};"
         "O VS(uint id:SV_VertexID){O o; float2 p=float2((id<<1)&2,id&2); o.uv=p; o.p=float4(p*float2(2,-2)+float2(-1,1),0,1); return o;}"
         "uint GlyphRow(uint c,uint y){static const uint r[91]={"
@@ -1246,6 +1311,9 @@ static bool EnsureProxy(ID3D12Resource *source)
         "uint w,h; Post.GetDimensions(w,h); uint2 p=min(uint2(i.uv*float2(w,h)),uint2(w-1,h-1));"
         "float3 postPoint=Post.Load(int3(p,0)); float3 original=Original.Load(int3(p,0)); float3 d=abs(postPoint-original);"
         "if(Mode==0)result=post;else if(Mode==1)result=neural;else result=max(d.r,max(d.g,d.b))>Threshold?post:neural;"
+        "bool cursorNow=CursorInput.x>=0&&all(float2(p)>=CursorInput-float2(6,6))&&all(float2(p)<=CursorInput+float2(36,44));"
+        "bool cursorPrevious=PreviousCursorInput.x>=0&&all(float2(p)>=PreviousCursorInput-float2(6,6))&&all(float2(p)<=PreviousCursorInput+float2(36,44));"
+        "if((cursorNow||cursorPrevious)&&Mode!=1)result=Mode==0?original:neural;"
         "return float4(AddFps(result,i.p.xy),1);}";
     if (SUCCEEDED(hr)) { failed_stage = "Compile vertex shader"; hr = D3DCompile(shader_source, strlen(shader_source), nullptr, nullptr, nullptr, "VS", "vs_5_0", 0, 0, &vertex_shader, &error_blob); }
     if (SUCCEEDED(hr)) { failed_stage = "Compile pixel shader"; hr = D3DCompile(shader_source, strlen(shader_source), nullptr, nullptr, nullptr, "PS", "ps_5_0", 0, 0, &pixel_shader, &error_blob); }
@@ -1360,13 +1428,36 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
     ID3D12DescriptorHeap *heaps[] = {g_proxy_srv_heap.Get()}; g_proxy_list->SetDescriptorHeaps(1, heaps);
     g_proxy_list->SetGraphicsRootSignature(g_proxy_root_signature.Get()); g_proxy_list->SetPipelineState(g_proxy_pipeline.Get());
     g_proxy_list->SetGraphicsRootDescriptorTable(0, g_proxy_srv_heap->GetGPUDescriptorHandleForHeapStart());
-    struct ProxyConstants { UINT mode; UINT fps; UINT show_fps; float threshold; } constants = {
+    float cursor_x = -1000.0f, cursor_y = -1000.0f;
+    static float previous_cursor_x = -1000.0f, previous_cursor_y = -1000.0f;
+    if (g_reshade_overlay_open.load())
+    {
+        POINT cursor = {};
+        RECT client = {};
+        if (GetCursorPos(&cursor) && ScreenToClient(g_game_window, &cursor) && GetClientRect(g_game_window, &client) &&
+            client.right > client.left && client.bottom > client.top)
+        {
+            cursor_x = static_cast<float>(cursor.x) * g_resource_input_width / (client.right - client.left);
+            cursor_y = static_cast<float>(cursor.y) * g_resource_input_height / (client.bottom - client.top);
+        }
+    }
+    else
+    {
+        previous_cursor_x = previous_cursor_y = -1000.0f;
+    }
+    struct ProxyConstants
+    {
+        UINT mode; UINT fps; UINT show_fps; float threshold;
+        float cursor_x; float cursor_y; float previous_cursor_x; float previous_cursor_y;
+    } constants = {
         g_show_neural_output ? (g_composite_reshade_output ? 2u : 1u) : 0u,
         g_proxy_fps.load(),
         g_show_proxy_fps ? 1u : 0u,
-        0.0f
+        0.0f,
+        cursor_x, cursor_y, previous_cursor_x, previous_cursor_y
     };
-    g_proxy_list->SetGraphicsRoot32BitConstants(1, 4, &constants, 0);
+    previous_cursor_x = cursor_x; previous_cursor_y = cursor_y;
+    g_proxy_list->SetGraphicsRoot32BitConstants(1, 8, &constants, 0);
     D3D12_VIEWPORT viewport = {0, 0, static_cast<float>(g_output_width.load()), static_cast<float>(g_output_height.load()), 0, 1};
     D3D12_RECT scissor = {0, 0, static_cast<LONG>(g_output_width.load()), static_cast<LONG>(g_output_height.load())};
     g_proxy_list->RSSetViewports(1, &viewport); g_proxy_list->RSSetScissorRects(1, &scissor);
@@ -1421,6 +1512,12 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     if (!g_game_window && present_window) g_game_window = present_window;
     if (!AdoptPresentQueue(queue)) return;
     UpdateProxyFps();
+    const unsigned long long routed_mouse_events = g_overlay_mouse_events.load();
+    if (routed_mouse_events != g_last_logged_mouse_event && routed_mouse_events <= 8)
+    {
+        g_last_logged_mouse_event = routed_mouse_events;
+        Log("overlay mouse bridge routed event=%llu", routed_mouse_events);
+    }
     g_pending_proxy_frame = false;
     if (!g_enabled || g_neural_failed)
     {
@@ -1610,6 +1707,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g_frames_presented.load(), g_post_reshade_frames.load());
     ImGui::Text("Proxy FPS: %u; ReShade menu input: %s", g_proxy_fps.load(),
         g_reshade_overlay_open.load() ? "click-through" : "game forwarding");
+    ImGui::Text("Routed ReShade mouse events: %llu", g_overlay_mouse_events.load());
     ImGui::Text("Presented image: %s", g_show_neural_output ? "neural native output" : "stretched original backbuffer");
     ImGui::TextWrapped("Set the reduced render resolution in Conan's fullscreen menu. The addon keeps the desktop at native resolution and performs NR followed by DLSS Super Resolution.");
     ImGui::TextUnformatted("Press F10 for neural/stretched-original A/B. Home is composited into the proxy; Alt+X hides it for NVIDIA.");
