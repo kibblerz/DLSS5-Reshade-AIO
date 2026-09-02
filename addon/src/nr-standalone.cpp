@@ -21,7 +21,7 @@
 #include <nvsdk_ngx_params.h>
 #include <nvsdk_ngx_defs_dlssd.h>
 
-#define ADDON_VERSION "1.1.0-on-present"
+#define ADDON_VERSION "1.2.0-verifiable"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -65,11 +65,14 @@ static bool g_alt_x_down;
 enum class ColorProfile : int { Srgb = 0, ScRgb = 1, Hdr10Pq = 2 };
 static ColorProfile g_color_profile = ColorProfile::Hdr10Pq;
 static int g_nr_model = 1;
+static int g_active_nr_model;
 static float g_nr_intensity = 1.0f;
 static float g_nr_local_tone = 1.0f;
 static float g_nr_local_structure = 1.0f;
 static float g_nr_skin_structure = -1.0f;
 static bool g_reset_every_frame = false;
+static bool g_bypass_nr_for_ab = false;
+static std::atomic<bool> g_feature_recreate_requested{false};
 static bool g_need_history_reset = true;
 static bool g_depth_reversed = true;
 static bool g_neural_failed = false;
@@ -114,9 +117,11 @@ using NgxSnippetInitD3D12Ext = NVSDK_NGX_Result (NVSDK_CONV *)(unsigned long lon
 using NgxAllocateParameters = NVSDK_NGX_Result (NVSDK_CONV *)(NVSDK_NGX_Parameter **);
 using NgxCreateFeature = NVSDK_NGX_Result (NVSDK_CONV *)(ID3D12GraphicsCommandList *, NVSDK_NGX_Feature, NVSDK_NGX_Parameter *, NVSDK_NGX_Handle **);
 using NgxEvaluateFeature = NVSDK_NGX_Result (NVSDK_CONV *)(ID3D12GraphicsCommandList *, const NVSDK_NGX_Handle *, const NVSDK_NGX_Parameter *, PFN_NVSDK_NGX_ProgressCallback_C);
+using NgxReleaseFeature = NVSDK_NGX_Result (NVSDK_CONV *)(NVSDK_NGX_Handle *);
 using NgxBridgeInitD3D12Ext = NVSDK_NGX_Result (NVSDK_CONV *)(NgxSnippetInitD3D12Ext, unsigned long long, const wchar_t *, ID3D12Device *, NVSDK_NGX_Version, const NVSDK_NGX_Parameter *);
 using NgxBridgeCreateFeature = NVSDK_NGX_Result (NVSDK_CONV *)(NgxCreateFeature, ID3D12GraphicsCommandList *, NVSDK_NGX_Feature, NVSDK_NGX_Parameter *, NVSDK_NGX_Handle **);
 using NgxBridgeEvaluateFeature = NVSDK_NGX_Result (NVSDK_CONV *)(NgxEvaluateFeature, ID3D12GraphicsCommandList *, const NVSDK_NGX_Handle *, const NVSDK_NGX_Parameter *, PFN_NVSDK_NGX_ProgressCallback_C);
+using NgxBridgeReleaseFeature = NVSDK_NGX_Result (NVSDK_CONV *)(NgxReleaseFeature, NVSDK_NGX_Handle *);
 
 static HMODULE g_core_module;
 static HMODULE g_nr_module;
@@ -127,10 +132,13 @@ static NVSDK_NGX_Handle *g_nr_feature;
 static NVSDK_NGX_Handle *g_sr_feature;
 static NgxCreateFeature g_nr_create;
 static NgxEvaluateFeature g_nr_evaluate;
+static NgxReleaseFeature g_nr_release;
 static NgxCreateFeature g_sr_create;
 static NgxEvaluateFeature g_sr_evaluate;
+static NgxReleaseFeature g_sr_release;
 static NgxBridgeCreateFeature g_bridge_create;
 static NgxBridgeEvaluateFeature g_bridge_evaluate;
+static NgxBridgeReleaseFeature g_bridge_release;
 
 static void Log(const char *format, ...)
 {
@@ -349,11 +357,14 @@ static bool InitializeNgx()
     auto nr_init = g_nr_module ? reinterpret_cast<NgxSnippetInitD3D12Ext>(GetProcAddress(g_nr_module, "NVSDK_NGX_D3D12_Init_Ext")) : nullptr;
     g_nr_create = g_nr_module ? reinterpret_cast<NgxCreateFeature>(GetProcAddress(g_nr_module, "NVSDK_NGX_D3D12_CreateFeature")) : nullptr;
     g_nr_evaluate = g_nr_module ? reinterpret_cast<NgxEvaluateFeature>(GetProcAddress(g_nr_module, "NVSDK_NGX_D3D12_EvaluateFeature")) : nullptr;
+    g_nr_release = g_nr_module ? reinterpret_cast<NgxReleaseFeature>(GetProcAddress(g_nr_module, "NVSDK_NGX_D3D12_ReleaseFeature")) : nullptr;
     g_bridge_module = LoadLibraryExW(bridge_path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     auto bridge_init = g_bridge_module ? reinterpret_cast<NgxBridgeInitD3D12Ext>(GetProcAddress(g_bridge_module, "NVNGXBridge_D3D12_InitExt")) : nullptr;
     g_bridge_create = g_bridge_module ? reinterpret_cast<NgxBridgeCreateFeature>(GetProcAddress(g_bridge_module, "NVNGXBridge_D3D12_CreateFeature")) : nullptr;
     g_bridge_evaluate = g_bridge_module ? reinterpret_cast<NgxBridgeEvaluateFeature>(GetProcAddress(g_bridge_module, "NVNGXBridge_D3D12_EvaluateFeature")) : nullptr;
-    if (!nr_init || !g_nr_create || !g_nr_evaluate || !bridge_init || !g_bridge_create || !g_bridge_evaluate)
+    g_bridge_release = g_bridge_module ? reinterpret_cast<NgxBridgeReleaseFeature>(GetProcAddress(g_bridge_module, "NVNGXBridge_D3D12_ReleaseFeature")) : nullptr;
+    if (!nr_init || !g_nr_create || !g_nr_evaluate || !g_nr_release || !bridge_init ||
+        !g_bridge_create || !g_bridge_evaluate || !g_bridge_release)
     {
         Fail("NR snippet/caller bridge exports", static_cast<unsigned int>(GetLastError()));
         return false;
@@ -381,7 +392,8 @@ static bool InitializeNgx()
     auto dlss_init = g_dlss_module ? reinterpret_cast<NgxSnippetInitD3D12Ext>(GetProcAddress(g_dlss_module, "NVSDK_NGX_D3D12_Init_Ext")) : nullptr;
     g_sr_create = g_dlss_module ? reinterpret_cast<NgxCreateFeature>(GetProcAddress(g_dlss_module, "NVSDK_NGX_D3D12_CreateFeature")) : nullptr;
     g_sr_evaluate = g_dlss_module ? reinterpret_cast<NgxEvaluateFeature>(GetProcAddress(g_dlss_module, "NVSDK_NGX_D3D12_EvaluateFeature")) : nullptr;
-    if (!dlss_init || !g_sr_create || !g_sr_evaluate) { Fail("DLSS SR snippet exports", static_cast<unsigned int>(GetLastError())); return false; }
+    g_sr_release = g_dlss_module ? reinterpret_cast<NgxReleaseFeature>(GetProcAddress(g_dlss_module, "NVSDK_NGX_D3D12_ReleaseFeature")) : nullptr;
+    if (!dlss_init || !g_sr_create || !g_sr_evaluate || !g_sr_release) { Fail("DLSS SR snippet exports", static_cast<unsigned int>(GetLastError())); return false; }
     result = bridge_init(dlss_init, kGenericCustomCoreId, dlss_path, g_neural_device.Get(), NVSDK_NGX_Version_API, nullptr);
     Log("DLSS SR snippet Init_Ext = 0x%08X (%s)", static_cast<unsigned int>(result), ResultName(result));
     if (NVSDK_NGX_FAILED(result)) { Fail("DLSS SR snippet Init_Ext", static_cast<unsigned int>(result)); return false; }
@@ -464,6 +476,20 @@ static NVSDK_NGX_Result SafeEvaluate(bool nr, DWORD *exception)
     }
 }
 
+static NVSDK_NGX_Result SafeRelease(NgxReleaseFeature release, NVSDK_NGX_Handle *handle, DWORD *exception)
+{
+    *exception = 0;
+    __try
+    {
+        return g_bridge_release(release, handle);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        *exception = GetExceptionCode();
+        return static_cast<NVSDK_NGX_Result>(0x7fffffff);
+    }
+}
+
 static bool CreateFeatures()
 {
     SetNrCreationContract();
@@ -497,6 +523,35 @@ static bool CreateFeatures()
     Log("standalone contract ready: NR feature 18 %ux%u active rect, DLSS SR -> %ux%u, model=%d, profile=%s",
         g_resource_input_width, g_resource_input_height, g_resource_output_width, g_resource_output_height,
         g_nr_model, ProfileName(g_color_profile));
+    g_active_nr_model = g_nr_model;
+    return true;
+}
+
+static bool RecreateFeatures()
+{
+    if (!g_neural_ready || !g_nr_feature || !g_sr_feature) return false;
+    if (!WaitForNeuralGpu()) return false;
+    DWORD exception = 0;
+    NVSDK_NGX_Result sr_result = SafeRelease(g_sr_release, g_sr_feature, &exception);
+    if (exception || NVSDK_NGX_FAILED(sr_result))
+    {
+        Fail(exception ? "DLSS SR release exception" : "DLSS SR release",
+            exception ? exception : static_cast<unsigned int>(sr_result));
+        return false;
+    }
+    g_sr_feature = nullptr;
+    NVSDK_NGX_Result nr_result = SafeRelease(g_nr_release, g_nr_feature, &exception);
+    if (exception || NVSDK_NGX_FAILED(nr_result))
+    {
+        Fail(exception ? "NR release exception" : "NR release",
+            exception ? exception : static_cast<unsigned int>(nr_result));
+        return false;
+    }
+    g_nr_feature = nullptr;
+    Log("released live features for model change: old=%d requested=%d", g_active_nr_model, g_nr_model);
+    g_need_history_reset = true;
+    if (!CreateFeatures()) return false;
+    Log("live model switch complete: active model=%d", g_active_nr_model);
     return true;
 }
 
@@ -669,9 +724,9 @@ static void SetNrEvaluationContract(ID3D12Resource *depth, ID3D12Resource *motio
     g_ngx_params->Set("DLSSNR.UICorrection", 0u);
 }
 
-static void SetSrEvaluationContract(ID3D12Resource *depth, ID3D12Resource *motion, bool reset)
+static void SetSrEvaluationContract(ID3D12Resource *color, ID3D12Resource *depth, ID3D12Resource *motion, bool reset)
 {
-    g_ngx_params->Set("Color", g_nr_stage.Get()); g_ngx_params->Set("Output", g_sr_stage.Get());
+    g_ngx_params->Set("Color", color); g_ngx_params->Set("Output", g_sr_stage.Get());
     g_ngx_params->Set("Depth", depth); g_ngx_params->Set("MotionVectors", motion);
     g_ngx_params->Set("Reset", reset ? 1 : 0);
     g_ngx_params->Set("Jitter.Offset.X", 0.0f); g_ngx_params->Set("Jitter.Offset.Y", 0.0f);
@@ -788,6 +843,7 @@ static D3D12_RESOURCE_BARRIER Transition(ID3D12Resource *resource,
 static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
 {
     if (!EnsureStandaloneResources(backbuffer)) return false;
+    if (g_feature_recreate_requested.exchange(false) && !RecreateFeatures()) return false;
 
     const bool use_external_guides = CapturedGuidesMatchInput();
     if (use_external_guides != g_using_external_guides)
@@ -844,22 +900,31 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
 
     const bool reset = g_need_history_reset || g_reset_every_frame;
     g_need_history_reset = false;
-    SetNrEvaluationContract(depth, motion, reset);
     D3D12_RESOURCE_BARRIER sr_to_uav = Transition(
         g_sr_stage.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     g_neural_list->ResourceBarrier(1, &sr_to_uav);
     DWORD exception = 0;
-    const NVSDK_NGX_Result nr_result = SafeEvaluate(true, &exception);
-    if (exception)
+    NVSDK_NGX_Result nr_result = NVSDK_NGX_Result_Success;
+    if (!g_bypass_nr_for_ab)
     {
-        g_neural_list->Close();
-        Fail("on-present NR evaluation exception", exception);
-        return false;
+        SetNrEvaluationContract(depth, motion, reset);
+        nr_result = SafeEvaluate(true, &exception);
+        if (exception)
+        {
+            g_neural_list->Close();
+            Fail("on-present NR evaluation exception", exception);
+            return false;
+        }
     }
-    D3D12_RESOURCE_BARRIER nr_to_srv = Transition(
-        g_nr_stage.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    g_neural_list->ResourceBarrier(1, &nr_to_srv);
-    SetSrEvaluationContract(depth, motion, reset);
+    D3D12_RESOURCE_BARRIER nr_to_srv = {};
+    ID3D12Resource *sr_color = g_packed_color.Get();
+    if (!g_bypass_nr_for_ab)
+    {
+        nr_to_srv = Transition(g_nr_stage.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        g_neural_list->ResourceBarrier(1, &nr_to_srv);
+        sr_color = g_nr_stage.Get();
+    }
+    SetSrEvaluationContract(sr_color, depth, motion, reset);
     NVSDK_NGX_Result sr_result = static_cast<NVSDK_NGX_Result>(0xBAD00004);
     if (NVSDK_NGX_SUCCEED(nr_result)) sr_result = SafeEvaluate(false, &exception);
     if (exception)
@@ -868,11 +933,20 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         Fail("on-present DLSS SR evaluation exception", exception);
         return false;
     }
-    D3D12_RESOURCE_BARRIER restore[2] = {
-        Transition(g_nr_stage.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-        Transition(g_sr_stage.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON)
-    };
-    g_neural_list->ResourceBarrier(2, restore);
+    D3D12_RESOURCE_BARRIER sr_restore = Transition(
+        g_sr_stage.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    if (!g_bypass_nr_for_ab)
+    {
+        D3D12_RESOURCE_BARRIER restore[2] = {
+            Transition(g_nr_stage.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            sr_restore
+        };
+        g_neural_list->ResourceBarrier(2, restore);
+    }
+    else
+    {
+        g_neural_list->ResourceBarrier(1, &sr_restore);
+    }
     if (!SubmitNeuralCommands(false)) return false;
     if (NVSDK_NGX_FAILED(nr_result) || NVSDK_NGX_FAILED(sr_result))
     {
@@ -884,12 +958,15 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         return false;
     }
 
-    const unsigned long long frame = ++g_nr_frames;
+    const unsigned long long frame = g_bypass_nr_for_ab ? g_sr_frames.load() + 1 : ++g_nr_frames;
     ++g_sr_frames;
-    SetStatus("active on present: NR + DLSS SR (%s guides)", use_external_guides ? "captured" : "fallback");
+    SetStatus(g_bypass_nr_for_ab ? "diagnostic: NR BYPASSED; DLSS SR only" :
+        "active on present: NR model %d + DLSS SR (%s guides)",
+        g_active_nr_model, use_external_guides ? "captured" : "fallback");
     if (frame <= 8 || frame % 1800 == 0)
-        Log("on-present frame %llu: NR=Success, SR=Success, reset=%d, guides=%s %ux%u, output=%ux%u",
-            frame, reset ? 1 : 0, use_external_guides ? "captured" : "fallback",
+        Log("on-present frame %llu: NR=%s, SR=Success, model=%d, reset=%d, guides=%s %ux%u, output=%ux%u",
+            frame, g_bypass_nr_for_ab ? "BYPASSED" : "Success", g_active_nr_model,
+            reset ? 1 : 0, use_external_guides ? "captured" : "fallback",
             g_resource_input_width, g_resource_input_height, g_resource_output_width, g_resource_output_height);
     return true;
 }
@@ -1276,14 +1353,25 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         reshade::set_config_value(nullptr, section, "ColorProfile", static_cast<const char *>(value));
         if (g_neural_ready) SetStatus("color profile changed; restart required");
     }
-    int model_index = std::clamp(g_nr_model - 1, 0, 2);
-    if (ImGui::Combo("DLSS-NR model", &model_index, "Model 1\0Model 2\0Model 3\0"))
+    ImGui::TextUnformatted("DLSS-NR model:");
+    bool model_changed = false;
+    if (ImGui::RadioButton("Model 1", g_nr_model == 1)) { g_nr_model = 1; model_changed = true; }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Model 2", g_nr_model == 2)) { g_nr_model = 2; model_changed = true; }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Model 3", g_nr_model == 3)) { g_nr_model = 3; model_changed = true; }
+    if (model_changed)
     {
-        g_nr_model = model_index + 1;
         char value[16]; sprintf_s(value, "%d", g_nr_model);
         reshade::set_config_value(nullptr, section, "Model", static_cast<const char *>(value));
-        if (g_neural_ready) SetStatus("NR model changed; restart required");
+        if (g_neural_ready)
+        {
+            g_feature_recreate_requested = true;
+            SetStatus("switching live feature from model %d to model %d", g_active_nr_model, g_nr_model);
+        }
     }
+    ImGui::TextDisabled("Active feature model: %d%s", g_active_nr_model,
+        g_feature_recreate_requested.load() ? " (switch queued for next Present)" : "");
 
     auto save_float = [section](const char *key, float value)
     {
@@ -1298,11 +1386,18 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         reshade::set_config_value(nullptr, section, "ResetEveryFrame", g_reset_every_frame ? "1" : "0");
     ImGui::SameLine();
     if (ImGui::Button("Reset history now")) g_need_history_reset = true;
+    if (ImGui::Checkbox("Diagnostic A/B: bypass feature 18 (DLSS SR only)", &g_bypass_nr_for_ab))
+    {
+        g_need_history_reset = true;
+        Log("user A/B diagnostic changed: NR feature 18 is now %s", g_bypass_nr_for_ab ? "BYPASSED" : "ENABLED");
+    }
+    ImGui::TextDisabled("Toggle this while viewing a detailed static scene to isolate NR's contribution from upscaling.");
 
     ImGui::Separator();
     ImGui::Text("Status: %s", g_neural_status);
     ImGui::TextUnformatted("Activation boundary: game OnPresent (standalone private NGX runtime)");
-    ImGui::Text("Pipeline: feature 18 NR frames=%llu; DLSS SR frames=%llu", g_nr_frames.load(), g_sr_frames.load());
+    ImGui::Text("Pipeline: feature 18 NR frames=%llu; DLSS SR frames=%llu; active model=%d%s",
+        g_nr_frames.load(), g_sr_frames.load(), g_active_nr_model, g_bypass_nr_for_ab ? " (NR BYPASSED)" : "");
     ImGui::Text("Contract: %ux%u -> %ux%u", g_input_width.load(), g_input_height.load(), g_output_width.load(), g_output_height.load());
     ImGui::Text("Guides: %s; validation mask=%s",
         g_using_external_guides ? "captured DLSS5_Feed" : "internal fallback",

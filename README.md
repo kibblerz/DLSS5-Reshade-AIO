@@ -58,4 +58,6 @@ The game `OnPresent` event is the activation and evaluation boundary. The addon 
 
 The persistent game log is `%LOCALAPPDATA%\RHI\Logs\standalone-dlssnr.log`. It reports runtime discovery, core/snippet initialization, both feature creation results, per-stage evaluation failures, the active input/output contract, and initial successful frames.
 
-Color profile and model changes require a game restart because they affect feature creation. Strength sliders are applied live. F10 hides or shows the native proxy; Home and Alt+X hide it so ReShade or NVIDIA overlays can receive input.
+Color-profile changes require a game restart because they change the intermediate resource format. Model 1/2/3 changes are applied live: the addon waits for the prior neural frame, releases both NGX handles, and recreates feature 18 plus DLSS SR at the next game `Present`. The overlay reports the actually active model.
+
+The `Diagnostic A/B: bypass feature 18` checkbox keeps the same DLSS Super Resolution stage and native proxy while routing the packed game color directly into SR. This provides an in-game NR-on versus NR-bypassed comparison instead of treating a successful NGX return code as proof of a materially different image. Strength sliders are applied live. F10 hides or shows the native proxy; Home and Alt+X hide it so ReShade or NVIDIA overlays can receive input.
