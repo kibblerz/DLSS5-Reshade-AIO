@@ -1,12 +1,27 @@
 /*
     Standalone guide capture for the DLSS-NR OnPresent addon.
 
-    This intentionally has no external include or motion-provider dependency, so
-    RHI can install it into an otherwise empty ReShade shader directory. It gives
-    the addon the game's real raw depth. Motion remains zero until a native game
-    motion-vector capture path is added; the addon reports that limitation rather
-    than pretending the fallback is production-quality temporal input.
+    VORT's technique is rendered explicitly by the addon inside the Present
+    callback before this pass. ReShade pools MotVectTexVort by name, so this
+    effect consumes current-frame optical flow and converts delta UV to the pixel
+    units expected by NGX. It also supplies the game's real raw depth.
 */
+
+texture2D MotVectTexVort
+{
+    Width = BUFFER_WIDTH;
+    Height = BUFFER_HEIGHT;
+    Format = RG16F;
+};
+sampler sMotVectTexVort
+{
+    Texture = MotVectTexVort;
+    AddressU = Clamp;
+    AddressV = Clamp;
+    MipFilter = Point;
+    MinFilter = Point;
+    MagFilter = Point;
+};
 
 texture DLSS5_GameDepth : DEPTH;
 sampler sDLSS5_GameDepth
@@ -49,15 +64,18 @@ void DLSS5_FullscreenVS(uint id : SV_VertexID, out float4 position : SV_Position
 void DLSS5_CaptureGuides(float4 position : SV_Position, float2 texcoord : TEXCOORD,
     out float2 motion : SV_Target0, out float depth : SV_Target1, out float mask : SV_Target2)
 {
-    motion = 0.0;
+    // VORT publishes previous_uv = current_uv + motion. DLSS uses the same
+    // direction but expects pixels rather than normalized UV units.
+    motion = tex2Dlod(sMotVectTexVort, float4(texcoord, 0.0, 0.0)).xy *
+        float2(BUFFER_WIDTH, BUFFER_HEIGHT);
     depth = tex2Dlod(sDLSS5_GameDepth, float4(texcoord, 0.0, 0.0)).x;
     mask = 0.0;
 }
 
 technique DLSS5_Feed
 <
-    ui_label = "Standalone DLSS-NR guides (real depth, zero motion)";
-    ui_tooltip = "Supplies raw game depth to the standalone OnPresent pipeline. Motion is deliberately zero until a native motion-vector capture is available.";
+    ui_label = "Standalone DLSS-NR guides (same-frame VORT motion + depth)";
+    ui_tooltip = "Rendered manually at Present after VORT, before the standalone NGX pipeline.";
 >
 {
     pass
