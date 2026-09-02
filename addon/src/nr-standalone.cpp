@@ -23,7 +23,7 @@
 #include <nvsdk_ngx_defs_dlssd.h>
 #include <nvsdk_ngx_defs_dlssg.h>
 
-#define ADDON_VERSION "1.5.0-experimental-framegen"
+#define ADDON_VERSION "1.5.1-borderless-framegen"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -61,7 +61,7 @@ static DXGI_FORMAT g_proxy_present_format;
 static HANDLE g_proxy_fence_event;
 static UINT64 g_proxy_fence_value;
 static bool g_proxy_failed;
-static bool g_proxy_hidden;
+static std::atomic<bool> g_proxy_hidden{false};
 static bool g_show_neural_output = true;
 static bool g_pending_proxy_frame;
 static bool g_composite_reshade_output = true;
@@ -76,6 +76,9 @@ static unsigned int g_fps_sample_frames;
 static bool g_f10_down;
 static bool g_home_down;
 static bool g_alt_x_down;
+static std::atomic<unsigned long long> g_last_primary_present_tick{0};
+static std::atomic<bool> g_proxy_watchdog_hidden{false};
+static std::atomic<unsigned long long> g_ignored_secondary_surfaces{0};
 
 enum class ColorProfile : int { Srgb = 0, ScRgb = 1, Hdr10Pq = 2 };
 static ColorProfile g_color_profile = ColorProfile::Hdr10Pq;
@@ -1076,7 +1079,32 @@ static void ResolveHandles(reshade::api::effect_runtime *runtime)
         Log("same-frame optical-flow path unavailable; internal zero-motion fallback will be used");
 }
 
-static void OnInitEffectRuntime(reshade::api::effect_runtime *runtime) { ResolveHandles(runtime); }
+static void OnInitEffectRuntime(reshade::api::effect_runtime *runtime)
+{
+    if (runtime == nullptr) return;
+    const HWND runtime_window = static_cast<HWND>(runtime->get_hwnd());
+    const auto runtime_backbuffer = runtime->get_current_back_buffer();
+    const auto runtime_desc = runtime->get_device()->get_resource_desc(runtime_backbuffer);
+    if (runtime_window == nullptr || runtime_desc.texture.width < 640 || runtime_desc.texture.height < 360)
+    {
+        Log("ignored helper ReShade runtime: hwnd=%p surface=%llux%u", runtime_window,
+            runtime_desc.texture.width, runtime_desc.texture.height);
+        return;
+    }
+    if (g_game_window != nullptr && runtime_window != nullptr && runtime_window != g_game_window)
+    {
+        Log("ignored secondary ReShade runtime: hwnd=%p primary=%p", runtime_window, g_game_window);
+        return;
+    }
+    if (g_runtime != nullptr && runtime != g_runtime)
+    {
+        Log("ignored additional ReShade runtime on primary window: runtime=%p primary=%p", runtime, g_runtime);
+        return;
+    }
+    if (g_game_window == nullptr && runtime_window != nullptr)
+        g_game_window = runtime_window;
+    ResolveHandles(runtime);
+}
 static void OnReloadedEffects(reshade::api::effect_runtime *runtime) { if (!g_runtime || runtime == g_runtime) ResolveHandles(runtime); }
 static void OnDestroyEffectRuntime(reshade::api::effect_runtime *runtime)
 {
@@ -1473,7 +1501,23 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
     if (message == WM_NCHITTEST) return g_reshade_overlay_open.load() ? HTTRANSPARENT : HTCLIENT;
     if (message == WM_ERASEBKGND) return 1;
     if (message == WM_CLOSE) { DestroyWindow(hwnd); return 0; }
-    if (message == WM_DESTROY) { PostQuitMessage(0); return 0; }
+    if (message == WM_DESTROY) { KillTimer(hwnd, 1); PostQuitMessage(0); return 0; }
+    if (message == WM_TIMER && wparam == 1)
+    {
+        const ULONGLONG now = GetTickCount64();
+        const ULONGLONG last_present = g_last_primary_present_tick.load();
+        const HWND foreground = GetForegroundWindow();
+        const bool game_foreground = g_game_window != nullptr &&
+            (foreground == g_game_window || GetAncestor(foreground, GA_ROOT) == g_game_window);
+        const bool primary_alive = g_game_window != nullptr && IsWindow(g_game_window) &&
+            last_present != 0 && now - last_present < 5000;
+        if ((!primary_alive || !game_foreground) && !g_proxy_hidden && IsWindowVisible(hwnd))
+        {
+            ShowWindow(hwnd, SW_HIDE);
+            g_proxy_watchdog_hidden = true;
+        }
+        return 0;
+    }
     if (message == WM_SETCURSOR)
     {
         SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)));
@@ -1522,6 +1566,7 @@ static DWORD WINAPI ProxyWindowThread(void *)
             info.rcMonitor.left, info.rcMonitor.top, g_output_width.load(), g_output_height.load(),
             nullptr, nullptr, g_self, nullptr);
     }
+    if (g_proxy_window) SetTimer(g_proxy_window, 1, 500, nullptr);
     g_proxy_mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, ProxyLowLevelMouseProc, g_self, 0);
     Log("proxy overlay click bridge: %s (hook=%p error=%lu)",
         g_proxy_mouse_hook ? "ready" : "FAILED", g_proxy_mouse_hook, g_proxy_mouse_hook ? 0 : GetLastError());
@@ -1881,6 +1926,15 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     const HWND present_window = static_cast<HWND>(swapchain->get_hwnd());
     if (g_game_window && present_window && present_window != g_game_window) return;
     if (!g_game_window && present_window) g_game_window = present_window;
+    g_last_primary_present_tick = GetTickCount64();
+    const HWND foreground = GetForegroundWindow();
+    const bool primary_foreground = foreground == g_game_window || GetAncestor(foreground, GA_ROOT) == g_game_window;
+    if (g_proxy_watchdog_hidden.load() && primary_foreground && g_proxy_window != nullptr && !g_proxy_hidden)
+    {
+        g_proxy_watchdog_hidden = false;
+        ShowWindow(g_proxy_window, SW_SHOWNOACTIVATE);
+        Log("native proxy restored after primary borderless presentation resumed");
+    }
     if (!AdoptPresentQueue(queue)) return;
     UpdateProxyFps();
     const unsigned long long routed_mouse_events = g_overlay_mouse_events.load();
@@ -1947,18 +2001,43 @@ static void OnInitSwapchain(reshade::api::swapchain *swapchain, bool)
     if (swapchain == nullptr) return;
     const auto resource = swapchain->get_current_back_buffer();
     const auto desc = swapchain->get_device()->get_resource_desc(resource);
-    g_input_width = static_cast<unsigned int>(desc.texture.width);
-    g_input_height = desc.texture.height;
     HWND hwnd = static_cast<HWND>(swapchain->get_hwnd());
-    if (hwnd != nullptr) g_game_window = hwnd;
+    const UINT width = static_cast<unsigned int>(desc.texture.width);
+    const UINT height = desc.texture.height;
+    if (hwnd == nullptr || width < 640 || height < 360)
+    {
+        const unsigned long long ignored = ++g_ignored_secondary_surfaces;
+        if (ignored <= 8)
+            Log("ignored helper swapchain: hwnd=%p surface=%ux%u", hwnd, width, height);
+        return;
+    }
+    if (g_game_window != nullptr && hwnd != g_game_window && IsWindow(g_game_window))
+    {
+        const unsigned long long ignored = ++g_ignored_secondary_surfaces;
+        if (ignored <= 8)
+            Log("ignored secondary swapchain: hwnd=%p surface=%ux%u primary=%p", hwnd, width, height, g_game_window);
+        return;
+    }
+    g_game_window = hwnd;
+    g_input_width = width;
+    g_input_height = height;
     MONITORINFO info = {sizeof(info)};
     if (hwnd != nullptr && GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &info))
     {
         g_output_width = static_cast<unsigned int>(info.rcMonitor.right - info.rcMonitor.left);
         g_output_height = static_cast<unsigned int>(info.rcMonitor.bottom - info.rcMonitor.top);
+        if (g_proxy_window != nullptr)
+            SetWindowPos(g_proxy_window, HWND_TOPMOST, info.rcMonitor.left, info.rcMonitor.top,
+                static_cast<int>(g_output_width.load()), static_cast<int>(g_output_height.load()),
+                SWP_NOACTIVATE | (g_proxy_hidden ? 0 : SWP_SHOWWINDOW));
     }
-    Log("observed render/output surfaces: render=%ux%u monitor=%ux%u",
-        g_input_width.load(), g_input_height.load(), g_output_width.load(), g_output_height.load());
+    RECT client = {};
+    GetClientRect(hwnd, &client);
+    Log("adopted primary swapchain: render=%ux%u client=%ldx%ld monitor=%ux%u hwnd=%p mode=%s",
+        g_input_width.load(), g_input_height.load(), client.right - client.left, client.bottom - client.top,
+        g_output_width.load(), g_output_height.load(), hwnd,
+        (client.right - client.left == static_cast<LONG>(g_output_width.load()) &&
+         client.bottom - client.top == static_cast<LONG>(g_output_height.load())) ? "borderless/native-client" : "reduced borderless/windowed");
 }
 
 static bool OnSetFullscreenState(reshade::api::swapchain *swapchain, bool fullscreen, void *)
@@ -2003,7 +2082,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         }
     }
     ImGui::SameLine();
-    ImGui::TextDisabled("fullscreen interception changes require restart");
+    ImGui::TextDisabled("supports reduced-resolution fullscreen and borderless swapchains");
 
     int profile = static_cast<int>(g_color_profile);
     if (ImGui::Combo("Input color profile", &profile, "sRGB\0scRGB (linear HDR)\0HDR10 (PQ/Rec.2020)\0"))
@@ -2079,7 +2158,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         reshade::set_config_value(nullptr, section, "CompositeReshade", g_composite_reshade_output ? "1" : "0");
     if (ImGui::Checkbox("Show native proxy FPS counter", &g_show_proxy_fps))
         reshade::set_config_value(nullptr, section, "ShowProxyFps", g_show_proxy_fps ? "1" : "0");
-    ImGui::TextDisabled("Off keeps the full-screen proxy but displays a simple linear stretch of Conan's original frame.");
+    ImGui::TextDisabled("Off keeps the native-size proxy but displays a simple linear stretch of the game's original frame.");
 
     ImGui::Separator();
     ImGui::Text("Status: %s", g_neural_status);
@@ -2100,7 +2179,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g_reshade_overlay_open.load() ? "click-through" : "game forwarding");
     ImGui::Text("Routed ReShade mouse events: %llu", g_overlay_mouse_events.load());
     ImGui::Text("Presented image: %s", g_show_neural_output ? "neural native output" : "stretched original backbuffer");
-    ImGui::TextWrapped("Set the reduced render resolution in Conan's fullscreen menu. The addon keeps the desktop at native resolution and performs NR followed by DLSS Super Resolution.");
+    ImGui::TextWrapped("Set a reduced game resolution in fullscreen or borderless mode. The addon keeps the presentation proxy at the monitor's native resolution and performs NR followed by DLSS Super Resolution.");
     ImGui::TextUnformatted("Press F10 for neural/stretched-original A/B. Home is composited into the proxy; Alt+X hides it for NVIDIA.");
     ImGui::Text("Log: %s", g_log_path);
 }
