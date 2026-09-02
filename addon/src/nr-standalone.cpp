@@ -28,7 +28,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.7-runtime-discovery"
+#define ADDON_VERSION "1.7.8-ngx-core-discovery"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -434,10 +434,14 @@ static HMODULE LoadInstalledNgxCore()
     }
     wchar_t system[MAX_PATH] = {}, pattern[MAX_PATH] = {};
     if (GetSystemDirectoryW(system, MAX_PATH) == 0) return nullptr;
-    swprintf_s(pattern, L"%s\\DriverStore\\FileRepository\\nvmdi.inf_amd64_*", system);
+    swprintf_s(pattern, L"%s\\DriverStore\\FileRepository\\nv*.inf_amd64_*", system);
     WIN32_FIND_DATAW found = {};
     HANDLE search = FindFirstFileW(pattern, &found);
-    if (search == INVALID_HANDLE_VALUE) return nullptr;
+    if (search == INVALID_HANDLE_VALUE)
+    {
+        Log("NGX core: no NVIDIA DriverStore packages matched %ls error=%lu", pattern, GetLastError());
+        return nullptr;
+    }
     std::wstring best;
     FILETIME best_time = {};
     do
@@ -454,7 +458,11 @@ static HMODULE LoadInstalledNgxCore()
         }
     } while (FindNextFileW(search, &found));
     FindClose(search);
-    if (best.empty()) return nullptr;
+    if (best.empty())
+    {
+        Log("NGX core: no _nvngx.dll found in NVIDIA DriverStore packages matching %ls", pattern);
+        return nullptr;
+    }
     HMODULE module = LoadLibraryExW(best.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     Log("NGX core: LoadLibraryExW(%ls) -> %p error=%lu", best.c_str(), module, module ? 0 : GetLastError());
     return module;

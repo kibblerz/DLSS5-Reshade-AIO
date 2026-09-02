@@ -499,7 +499,7 @@ static HMODULE LoadInstalledNgxCore()
     wchar_t system[MAX_PATH] = {};
     if (GetSystemDirectoryW(system, MAX_PATH) == 0) return nullptr;
     wchar_t pattern[MAX_PATH] = {};
-    swprintf_s(pattern, L"%s\\DriverStore\\FileRepository\\nvmdi.inf_amd64_*", system);
+    swprintf_s(pattern, L"%s\\DriverStore\\FileRepository\\nv*.inf_amd64_*", system);
     WIN32_FIND_DATAW found = {};
     HANDLE search = FindFirstFileW(pattern, &found);
     if (search == INVALID_HANDLE_VALUE) return nullptr;
