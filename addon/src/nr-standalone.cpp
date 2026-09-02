@@ -22,7 +22,7 @@
 #include <nvsdk_ngx_params.h>
 #include <nvsdk_ngx_defs_dlssd.h>
 
-#define ADDON_VERSION "1.3.6-live-resolution-reconfigure"
+#define ADDON_VERSION "1.3.7-stable-sr-history"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -85,6 +85,7 @@ static float g_nr_local_tone = 1.0f;
 static float g_nr_local_structure = 1.0f;
 static float g_nr_skin_structure = -1.0f;
 static bool g_reset_every_frame = false;
+static bool g_stable_sr_history = true;
 static bool g_bypass_nr_for_ab = false;
 static std::atomic<bool> g_feature_recreate_requested{false};
 static bool g_need_history_reset = true;
@@ -1082,6 +1083,21 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         };
         g_neural_list->ResourceBarrier(2, guides_to_srv);
     }
+    else if (g_stable_sr_history)
+    {
+        // The stable SR path deliberately does not consume VORT motion. Keep
+        // its dedicated motion texture deterministically zero after every
+        // resolution recreation rather than relying on allocation contents.
+        D3D12_RESOURCE_BARRIER to_rtv = Transition(g_fallback_motion.Get(),
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        g_neural_list->ResourceBarrier(1, &to_rtv);
+        const float zero_motion[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        g_neural_list->ClearRenderTargetView(g_guide_rtv_heap->GetCPUDescriptorHandleForHeapStart(),
+            zero_motion, 0, nullptr);
+        D3D12_RESOURCE_BARRIER to_srv = Transition(g_fallback_motion.Get(),
+            D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        g_neural_list->ResourceBarrier(1, &to_srv);
+    }
 
     const bool reset = g_need_history_reset || g_reset_every_frame;
     g_need_history_reset = false;
@@ -1109,8 +1125,12 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         g_neural_list->ResourceBarrier(1, &nr_to_srv);
         sr_color = g_nr_stage.Get();
     }
-    ID3D12Resource *history_mask = use_external_guides && g_mask_available ? g_captured_mask.Get() : nullptr;
-    SetSrEvaluationContract(sr_color, depth, motion, history_mask, reset);
+    // Keep motion-guided NR, but do not let generic optical-flow errors persist
+    // through DLSS SR's temporal accumulator in the stable mode.
+    ID3D12Resource *sr_motion = g_stable_sr_history ? g_fallback_motion.Get() : motion;
+    ID3D12Resource *history_mask = !g_stable_sr_history && use_external_guides && g_mask_available ? g_captured_mask.Get() : nullptr;
+    const bool sr_reset = g_stable_sr_history || reset;
+    SetSrEvaluationContract(sr_color, depth, sr_motion, history_mask, sr_reset);
     NVSDK_NGX_Result sr_result = static_cast<NVSDK_NGX_Result>(0xBAD00004);
     if (NVSDK_NGX_SUCCEED(nr_result)) sr_result = SafeEvaluate(false, &exception);
     if (exception)
@@ -1150,9 +1170,10 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         "active on present: NR model %d + DLSS SR (%s guides)",
         g_active_nr_model, use_external_guides ? "same-frame motion" : "fallback");
     if (frame <= 8 || frame % 1800 == 0)
-        Log("on-present frame %llu: NR=%s, SR=Success, model=%d, reset=%d, guides=%s, DLSS history mask=%s, input=%ux%u, output=%ux%u",
+        Log("on-present frame %llu: NR=%s, SR=Success, model=%d, NR-reset=%d, NR-guides=%s, SR-history=%s, DLSS history mask=%s, input=%ux%u, output=%ux%u",
             frame, g_bypass_nr_for_ab ? "BYPASSED" : "Success", g_active_nr_model,
             reset ? 1 : 0, use_external_guides ? "same-frame-motion" : "fallback",
+            g_stable_sr_history ? "per-frame-reset/zero-motion" : "temporal/VORT",
             history_mask ? "BOUND" : "none",
             g_resource_input_width, g_resource_input_height, g_resource_output_width, g_resource_output_height);
     return true;
@@ -1546,7 +1567,7 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
         UINT mode; UINT fps; UINT show_fps; float threshold;
         float cursor_x; float cursor_y; float previous_cursor_x; float previous_cursor_y;
     } constants = {
-        g_show_neural_output ? (g_composite_reshade_output ? 2u : 1u) : 0u,
+        g_show_neural_output ? (g_composite_reshade_output && g_reshade_overlay_open.load() ? 2u : 1u) : 0u,
         g_proxy_fps.load(),
         g_show_proxy_fps ? 1u : 0u,
         0.0f,
@@ -1771,6 +1792,14 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         reshade::set_config_value(nullptr, section, "ResetEveryFrame", g_reset_every_frame ? "1" : "0");
     ImGui::SameLine();
     if (ImGui::Button("Reset history now")) g_need_history_reset = true;
+    if (ImGui::Checkbox("Stable DLSS SR (no persistent SR history)", &g_stable_sr_history))
+    {
+        reshade::set_config_value(nullptr, section, "StableSrHistory", g_stable_sr_history ? "1" : "0");
+        g_need_history_reset = true;
+        Log("DLSS SR history mode changed to %s",
+            g_stable_sr_history ? "per-frame reset with zero motion" : "experimental temporal VORT motion");
+    }
+    ImGui::TextDisabled("Recommended for generic OnPresent use; NR still receives VORT motion.");
     if (ImGui::Checkbox("Diagnostic A/B: bypass feature 18 (DLSS SR only)", &g_bypass_nr_for_ab))
     {
         g_need_history_reset = true;
@@ -1783,7 +1812,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         Log("overlay presentation A/B changed to %s",
             g_show_neural_output ? "neural native output" : "linearly stretched original backbuffer");
     }
-    if (ImGui::Checkbox("Composite ReShade effects/overlay", &g_composite_reshade_output))
+    if (ImGui::Checkbox("Composite ReShade menu while open", &g_composite_reshade_output))
         reshade::set_config_value(nullptr, section, "CompositeReshade", g_composite_reshade_output ? "1" : "0");
     if (ImGui::Checkbox("Show native proxy FPS counter", &g_show_proxy_fps))
         reshade::set_config_value(nullptr, section, "ShowProxyFps", g_show_proxy_fps ? "1" : "0");
@@ -1795,8 +1824,9 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::Text("Pipeline: feature 18 NR frames=%llu; DLSS SR frames=%llu; active model=%d%s",
         g_nr_frames.load(), g_sr_frames.load(), g_active_nr_model, g_bypass_nr_for_ab ? " (NR BYPASSED)" : "");
     ImGui::Text("Contract: %ux%u -> %ux%u", g_input_width.load(), g_input_height.load(), g_output_width.load(), g_output_height.load());
-    ImGui::Text("Guides: %s; validation mask=%s",
+    ImGui::Text("NR guides: %s; DLSS SR history: %s; validation mask=%s",
         g_using_external_guides ? "same-frame VORT optical flow" : "internal zero-motion fallback",
+        g_stable_sr_history ? "per-frame reset / zero motion" : "experimental temporal VORT",
         g_mask_available ? "valid" : "automatic mask");
     ImGui::Text("Current-frame guide submissions: %llu", g_current_guide_frames.load());
     ImGui::Text("Native proxy: %s; frames=%llu; post-ReShade=%llu", g_proxy_swapchain ? "presenting" : (g_proxy_failed ? "failed" : "waiting"),
@@ -1863,6 +1893,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("LocalStructure", "1.0", value, sizeof(value)); g_nr_local_structure = std::clamp(static_cast<float>(atof(value)), 0.0f, 2.0f);
         read_setting("SkinStructure", "-1.0", value, sizeof(value)); g_nr_skin_structure = std::clamp(static_cast<float>(atof(value)), -1.0f, 1.0f);
         read_setting("ResetEveryFrame", "0", value, sizeof(value)); g_reset_every_frame = strcmp(value, "0") != 0;
+        read_setting("StableSrHistory", "1", value, sizeof(value)); g_stable_sr_history = strcmp(value, "0") != 0;
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
         Log("Standalone DLSS-NR + SR %s attached; profile=%s model=%d", ADDON_VERSION, ProfileName(g_color_profile), g_nr_model);
