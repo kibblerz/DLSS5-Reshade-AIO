@@ -25,7 +25,7 @@
 #include <nvsdk_ngx_defs_dlssd.h>
 #include <nvsdk_ngx_defs_dlssg.h>
 
-#define ADDON_VERSION "1.6.0-legacy-interop"
+#define ADDON_VERSION "1.6.1-color-auto"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -86,8 +86,21 @@ static std::atomic<unsigned long long> g_last_primary_present_tick{0};
 static std::atomic<bool> g_proxy_watchdog_hidden{false};
 static std::atomic<unsigned long long> g_ignored_secondary_surfaces{0};
 
-enum class ColorProfile : int { Srgb = 0, ScRgb = 1, Hdr10Pq = 2 };
-static ColorProfile g_color_profile = ColorProfile::Hdr10Pq;
+enum class ColorProfile : int
+{
+    Auto = 0,
+    Srgb = 1,
+    ScRgb = 2,
+    Hdr10Pq = 3,
+    Hdr10Hlg = 4
+};
+// Keep the user's requested convention separate from the convention actually
+// fed to NGX and presented by the proxy. Auto is resolved from the primary
+// game swapchain, with a format fallback for older ReShade/DXGI paths.
+static ColorProfile g_color_profile = ColorProfile::Auto;
+static ColorProfile g_active_color_profile = ColorProfile::Srgb;
+static reshade::api::color_space g_detected_color_space = reshade::api::color_space::unknown;
+static DXGI_FORMAT g_detected_swapchain_format = DXGI_FORMAT_UNKNOWN;
 static int g_nr_model = 1;
 static int g_active_nr_model;
 static float g_nr_intensity = 1.0f;
@@ -247,10 +260,79 @@ static const char *ProfileName(ColorProfile profile)
 {
     switch (profile)
     {
+    case ColorProfile::Auto: return "Auto";
     case ColorProfile::Srgb: return "sRGB";
-    case ColorProfile::ScRgb: return "scRGB";
-    case ColorProfile::Hdr10Pq: return "HDR10/PQ";
+    case ColorProfile::ScRgb: return "Linear BT.709 / scRGB";
+    case ColorProfile::Hdr10Pq: return "BT.2100 PQ / HDR10";
+    case ColorProfile::Hdr10Hlg: return "BT.2100 HLG";
     default: return "unknown";
+    }
+}
+
+static const char *ColorSpaceName(reshade::api::color_space color_space)
+{
+    switch (color_space)
+    {
+    case reshade::api::color_space::srgb: return "sRGB nonlinear / BT.709";
+    case reshade::api::color_space::scrgb: return "extended sRGB linear / scRGB";
+    case reshade::api::color_space::hdr10_pq: return "HDR10 ST.2084 / BT.2020";
+    case reshade::api::color_space::hdr10_hlg: return "HDR10 HLG / BT.2020";
+    default: return "unknown";
+    }
+}
+
+static ColorProfile DetectColorProfile(reshade::api::color_space color_space, DXGI_FORMAT format)
+{
+    switch (color_space)
+    {
+    case reshade::api::color_space::srgb: return ColorProfile::Srgb;
+    case reshade::api::color_space::scrgb: return ColorProfile::ScRgb;
+    case reshade::api::color_space::hdr10_pq: return ColorProfile::Hdr10Pq;
+    case reshade::api::color_space::hdr10_hlg: return ColorProfile::Hdr10Hlg;
+    default: break;
+    }
+
+    // D3D9 and some D3D11 wrappers cannot report a DXGI color space. Float
+    // swapchains are conventionally scRGB; RGB10A2 is conventionally HDR10.
+    // All ordinary 8-bit surfaces remain SDR instead of inheriting a global
+    // HDR setting, which was the source of the green/red casts.
+    switch (format)
+    {
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+        return ColorProfile::ScRgb;
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+        return ColorProfile::Hdr10Pq;
+    default:
+        return ColorProfile::Srgb;
+    }
+}
+
+static void RefreshColorProfile(reshade::api::swapchain *swapchain, DXGI_FORMAT format, const char *boundary)
+{
+    if (swapchain == nullptr) return;
+    const reshade::api::color_space color_space = swapchain->get_color_space();
+    const ColorProfile detected = DetectColorProfile(color_space, format);
+    const ColorProfile resolved = g_color_profile == ColorProfile::Auto ? detected : g_color_profile;
+    const bool observation_changed = color_space != g_detected_color_space || format != g_detected_swapchain_format;
+    g_detected_color_space = color_space;
+    g_detected_swapchain_format = format;
+
+    if (g_neural_ready && resolved != g_active_color_profile)
+    {
+        if (observation_changed)
+            Log("color auto-detect changed after NGX creation at %s: swapchain=%s fmt=%u resolved=%s; restart required",
+                boundary, ColorSpaceName(color_space), static_cast<unsigned int>(format), ProfileName(resolved));
+        return;
+    }
+
+    if (resolved != g_active_color_profile || observation_changed)
+    {
+        g_active_color_profile = resolved;
+        Log("color profile resolved at %s: requested=%s swapchain=%s fmt=%u active=%s",
+            boundary, ProfileName(g_color_profile), ColorSpaceName(color_space),
+            static_cast<unsigned int>(format), ProfileName(g_active_color_profile));
     }
 }
 
@@ -510,7 +592,7 @@ static int FeatureFlags()
     return NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
         NVSDK_NGX_DLSS_Feature_Flags_AutoExposure |
         (g_depth_reversed ? NVSDK_NGX_DLSS_Feature_Flags_DepthInverted : 0) |
-        (g_color_profile == ColorProfile::Srgb ? 0 : NVSDK_NGX_DLSS_Feature_Flags_IsHDR);
+        (g_active_color_profile == ColorProfile::Srgb ? 0 : NVSDK_NGX_DLSS_Feature_Flags_IsHDR);
 }
 
 static void SetNrCreationContract()
@@ -645,7 +727,7 @@ static bool CreateFeatures()
             static_cast<unsigned int>(populate_result), ResultName(populate_result));
         g_ngx_params->Set("CreationNodeMask", 1u); g_ngx_params->Set("VisibilityNodeMask", 1u);
         g_ngx_params->Set("Width", g_resource_output_width); g_ngx_params->Set("Height", g_resource_output_height);
-        const DXGI_FORMAT fg_format = g_color_profile == ColorProfile::Srgb ?
+        const DXGI_FORMAT fg_format = g_active_color_profile == ColorProfile::Srgb ?
             DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
         g_ngx_params->Set("DLSSG.BackbufferFormat", static_cast<unsigned int>(fg_format));
         g_ngx_params->Set("DLSSG.InternalWidth", g_resource_input_width);
@@ -671,7 +753,7 @@ static bool CreateFeatures()
     Log("standalone contract ready: NR feature 18 %ux%u active rect, DLSS SR -> %ux%u, DLSS-G=%s, model=%d, profile=%s",
         g_resource_input_width, g_resource_input_height, g_resource_output_width, g_resource_output_height,
         (!g_framegen_failed && g_fg_feature) ? "ready" : "fallback-off",
-        g_nr_model, ProfileName(g_color_profile));
+        g_nr_model, ProfileName(g_active_color_profile));
     g_active_nr_model = g_nr_model;
     return true;
 }
@@ -1216,7 +1298,7 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
     g_resource_input_width = iw; g_resource_input_height = ih;
     g_resource_output_width = ow; g_resource_output_height = oh;
     g_resource_input_format = input_format;
-    const DXGI_FORMAT result_format = g_color_profile == ColorProfile::Srgb ?
+    const DXGI_FORMAT result_format = g_active_color_profile == ColorProfile::Srgb ?
         DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
     const bool legacy = g_present_api == reshade::api::device_api::d3d11 ||
         g_present_api == reshade::api::device_api::d3d9;
@@ -1339,7 +1421,7 @@ static void SetFgEvaluationContract(ID3D12Resource *depth, ID3D12Resource *motio
     g_ngx_params->Set("DLSSG.CameraFwdX", 0.0f); g_ngx_params->Set("DLSSG.CameraFwdY", 0.0f); g_ngx_params->Set("DLSSG.CameraFwdZ", 1.0f);
     g_ngx_params->Set("DLSSG.CameraNear", 0.1f); g_ngx_params->Set("DLSSG.CameraFar", 1000.0f);
     g_ngx_params->Set("DLSSG.CameraFOV", 1.04719755f); g_ngx_params->Set("DLSSG.CameraAspectRatio", static_cast<float>(ow) / oh);
-    g_ngx_params->Set("DLSSG.ColorBuffersHDR", g_color_profile == ColorProfile::Srgb ? 0u : 1u);
+    g_ngx_params->Set("DLSSG.ColorBuffersHDR", g_active_color_profile == ColorProfile::Srgb ? 0u : 1u);
     g_ngx_params->Set("DLSSG.DepthInverted", g_depth_reversed ? 1u : 0u);
     g_ngx_params->Set("DLSSG.CameraMotionIncluded", 1u);
     g_ngx_params->Set("DLSSG.Reset", reset ? 1u : 0u);
@@ -1963,9 +2045,15 @@ static bool EnsureProxy(ID3D12Resource *source)
     case DXGI_FORMAT_R11G11B10_FLOAT: present_format = DXGI_FORMAT_R10G10B10A2_UNORM; break;
     default: break;
     }
-    // HDR10/PQ is evaluated into a float working surface, then quantized into
-    // an HDR10 swapchain while retaining the PQ/Rec.2020 signal values.
-    if (g_color_profile == ColorProfile::Hdr10Pq)
+    // Match the proxy swapchain to the resolved game convention. The shader
+    // intentionally remains a pass-through: both F10 and neural output retain
+    // the game's signal values while DXGI applies the correct presentation
+    // metadata instead of unconditionally interpreting them as PQ/BT.2020.
+    if (g_active_color_profile == ColorProfile::Srgb)
+        present_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    else if (g_active_color_profile == ColorProfile::ScRgb)
+        present_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    else
         present_format = DXGI_FORMAT_R10G10B10A2_UNORM;
     Log("native proxy initialization: source=%llux%u source_format=%u present_format=%u queue=%p window=%p",
         source_desc.Width, source_desc.Height, static_cast<unsigned int>(source_desc.Format),
@@ -1990,15 +2078,27 @@ static bool EnsureProxy(ID3D12Resource *source)
     Microsoft::WRL::ComPtr<IDXGISwapChain1> swapchain1;
     if (SUCCEEDED(hr)) { failed_stage = "CreateSwapChainForHwnd"; hr = factory->CreateSwapChainForHwnd(g_command_queue, g_proxy_window, &desc, nullptr, nullptr, &swapchain1); }
     if (SUCCEEDED(hr)) { failed_stage = "IDXGISwapChain3"; hr = swapchain1.As(&g_proxy_swapchain); }
-    if (SUCCEEDED(hr) && present_format == DXGI_FORMAT_R16G16B16A16_FLOAT)
+    if (SUCCEEDED(hr) && g_active_color_profile == ColorProfile::Srgb)
+    {
+        const HRESULT color_hr = g_proxy_swapchain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+        Log("native proxy sRGB/BT.709 color space: hr=0x%08X", static_cast<unsigned int>(color_hr));
+    }
+    if (SUCCEEDED(hr) && g_active_color_profile == ColorProfile::ScRgb)
     {
         const HRESULT color_hr = g_proxy_swapchain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
         Log("native proxy scRGB color space: hr=0x%08X", static_cast<unsigned int>(color_hr));
     }
-    if (SUCCEEDED(hr) && present_format == DXGI_FORMAT_R10G10B10A2_UNORM)
+    if (SUCCEEDED(hr) && g_active_color_profile == ColorProfile::Hdr10Pq)
     {
         const HRESULT color_hr = g_proxy_swapchain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
         Log("native proxy HDR10 PQ/Rec.2020 color space: hr=0x%08X", static_cast<unsigned int>(color_hr));
+    }
+    if (SUCCEEDED(hr) && g_active_color_profile == ColorProfile::Hdr10Hlg)
+    {
+        // Match ReShade's DXGI compatibility mapping for hdr10_hlg on SDKs
+        // that predate DXGI_COLOR_SPACE_RGB_FULL_GHLG_NONE_P2020.
+        const HRESULT color_hr = g_proxy_swapchain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020);
+        Log("native proxy HLG/Rec.2020 compatibility color space: hr=0x%08X", static_cast<unsigned int>(color_hr));
     }
     Microsoft::WRL::ComPtr<ID3D12Device> device;
     if (SUCCEEDED(hr)) { failed_stage = "ID3D12CommandQueue::GetDevice"; hr = g_command_queue->GetDevice(IID_PPV_ARGS(&device)); }
@@ -2320,6 +2420,15 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         Log("native proxy restored after primary borderless presentation resumed");
     }
     const reshade::api::device_api api = queue->get_device()->get_api();
+    if (!g_neural_ready)
+    {
+        const auto color_resource = swapchain->get_current_back_buffer();
+        if (color_resource.handle)
+        {
+            const auto color_desc = swapchain->get_device()->get_resource_desc(color_resource);
+            RefreshColorProfile(swapchain, static_cast<DXGI_FORMAT>(color_desc.texture.format), "first present");
+        }
+    }
     if (api == reshade::api::device_api::d3d12)
     {
         g_present_api = api;
@@ -2441,6 +2550,7 @@ static void OnInitSwapchain(reshade::api::swapchain *swapchain, bool)
             Log("ignored secondary swapchain: hwnd=%p surface=%ux%u primary=%p", hwnd, width, height, g_game_window);
         return;
     }
+    RefreshColorProfile(swapchain, static_cast<DXGI_FORMAT>(desc.texture.format), "init_swapchain");
     g_game_window = hwnd;
     g_input_width = width;
     g_input_height = height;
@@ -2512,13 +2622,17 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::TextDisabled("supports reduced-resolution fullscreen and borderless swapchains");
 
     int profile = static_cast<int>(g_color_profile);
-    if (ImGui::Combo("Input color profile", &profile, "sRGB\0scRGB (linear HDR)\0HDR10 (PQ/Rec.2020)\0"))
+    if (ImGui::Combo("Input color profile", &profile,
+        "Auto (swapchain + format)\0sRGB (nonlinear BT.709)\0Linear BT.709 / scRGB\0BT.2100 PQ / HDR10\0BT.2100 HLG\0"))
     {
         g_color_profile = static_cast<ColorProfile>(profile);
         char value[16]; sprintf_s(value, "%d", profile);
-        reshade::set_config_value(nullptr, section, "ColorProfile", static_cast<const char *>(value));
-        if (g_neural_ready) SetStatus("color profile changed; restart required");
+        reshade::set_config_value(nullptr, section, "InputColorProfile", static_cast<const char *>(value));
+        SetStatus("color profile changed; restart required");
     }
+    ImGui::TextDisabled("Active: %s | detected: %s (format %u)", ProfileName(g_active_color_profile),
+        ColorSpaceName(g_detected_color_space), static_cast<unsigned int>(g_detected_swapchain_format));
+    ImGui::TextDisabled("Auto follows the primary swapchain; use a manual profile only when a game reports it incorrectly.");
     ImGui::TextUnformatted("DLSS-NR model:");
     bool model_changed = false;
     if (ImGui::RadioButton("Model 1", g_nr_model == 1)) { g_nr_model = 1; model_changed = true; }
@@ -2666,7 +2780,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             reshade::get_config_value(nullptr, section, key, buffer, &size);
         };
         char value[32];
-        read_setting("ColorProfile", "2", value, sizeof(value)); g_color_profile = static_cast<ColorProfile>(std::clamp(atoi(value), 0, 2));
+        // InputColorProfile is intentionally a new key. Older builds defaulted
+        // ColorProfile to HDR10 globally, so importing that value would retain
+        // the cross-game color bug instead of migrating installations to Auto.
+        read_setting("InputColorProfile", "0", value, sizeof(value)); g_color_profile = static_cast<ColorProfile>(std::clamp(atoi(value), 0, 4));
         read_setting("Model", "1", value, sizeof(value)); g_nr_model = std::clamp(atoi(value), 1, 3);
         read_setting("Intensity", "1.0", value, sizeof(value)); g_nr_intensity = std::clamp(static_cast<float>(atof(value)), 0.0f, 2.0f);
         read_setting("LocalTone", "1.0", value, sizeof(value)); g_nr_local_tone = std::clamp(static_cast<float>(atof(value)), 0.0f, 2.0f);
@@ -2677,7 +2794,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("FrameGeneration", "1", value, sizeof(value)); g_framegen_enabled = strcmp(value, "0") != 0;
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
-        Log("Standalone DLSS-NR + SR %s attached; profile=%s model=%d", ADDON_VERSION, ProfileName(g_color_profile), g_nr_model);
+        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d", ADDON_VERSION, ProfileName(g_color_profile), g_nr_model);
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
