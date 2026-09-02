@@ -28,7 +28,7 @@
 #include "../../../work/DLSS5-Feeder/src/feed_vk.h"
 #include "../../../work/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.1-vulkan-render-extent"
+#define ADDON_VERSION "1.7.2-vulkan-present-sync"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -190,6 +190,9 @@ static VkDeviceMemory g_vulkan_input_memory = VK_NULL_HANDLE;
 static VkDeviceMemory g_vulkan_post_memory = VK_NULL_HANDLE;
 static bool g_vulkan_input_layout_initialized;
 static bool g_vulkan_post_layout_initialized;
+static bool g_vulkan_release_wait_queued;
+static bool g_vulkan_input_copy_recorded;
+static bool g_vulkan_post_copy_recorded;
 static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> g_guide_rtv_heap;
 static UINT g_guide_rtv_stride;
 static UINT g_resource_input_width;
@@ -1154,7 +1157,7 @@ static bool BuildVulkanFrameResources(UINT width, UINT height, DXGI_FORMAT forma
     return true;
 }
 
-static bool CopyVulkanFrameToD3D12(reshade::api::command_queue *queue,
+static bool RecordVulkanFrameCopy(reshade::api::command_queue *queue,
     reshade::api::resource source, reshade::api::resource_usage source_usage, bool post_effects)
 {
     if (!queue || !g_vulkan.ok || source.handle == 0 || !g_command_queue || !g_legacy_fence12)
@@ -1163,11 +1166,13 @@ static bool CopyVulkanFrameToD3D12(reshade::api::command_queue *queue,
     bool &layout_initialized = post_effects ? g_vulkan_post_layout_initialized : g_vulkan_input_layout_initialized;
     if (destination == VK_NULL_HANDLE) return false;
 
-    if (g_legacy_d3d12_done_value != 0 && !queue->wait(g_vulkan_fence, g_legacy_d3d12_done_value))
+    if (!g_vulkan_release_wait_queued && g_legacy_d3d12_done_value != 0 &&
+        !queue->wait(g_vulkan_fence, g_legacy_d3d12_done_value))
     {
         Log("Vulkan queue failed to wait for D3D12 shared image release value %llu", g_legacy_d3d12_done_value);
         return false;
     }
+    g_vulkan_release_wait_queued = true;
     reshade::api::command_list *list = queue->get_immediate_command_list();
     if (!list) return false;
     VkCommandBuffer command_buffer = FeedVkDispatch<VkCommandBuffer>(list->get_native());
@@ -1185,12 +1190,20 @@ static bool CopyVulkanFrameToD3D12(reshade::api::command_queue *queue,
         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination, VK_IMAGE_LAYOUT_GENERAL,
         g_legacy_width, g_legacy_height);
     list->barrier(1, resources, copy_source, &source_usage);
-    queue->flush_immediate_command_list();
 
+    if (post_effects) g_vulkan_post_copy_recorded = true;
+    else g_vulkan_input_copy_recorded = true;
+    return true;
+}
+
+static bool CompleteVulkanFrameCopies(reshade::api::command_queue *queue)
+{
+    if (!queue || !g_vulkan_input_copy_recorded || !g_command_queue || !g_legacy_fence12)
+        return false;
     const UINT64 value = ++g_legacy_fence_value;
     if (!queue->signal(g_vulkan_fence, value) || FAILED(g_command_queue->Wait(g_legacy_fence12.Get(), value)))
     {
-        Log("Vulkan -> D3D12 timeline handoff failed at value %llu", value);
+        Log("Vulkan -> D3D12 deferred present handoff failed at value %llu", value);
         return false;
     }
     return true;
@@ -2600,20 +2613,53 @@ static void OnReshadePresent(reshade::api::effect_runtime *runtime)
     const reshade::api::resource resource = runtime->get_current_back_buffer();
     if (!resource.handle) return;
 
-    // ReShade emits this event after recording effects and its overlay, but
-    // before the D3D12 immediate list is normally submitted. Submit it now so
-    // the native proxy samples the completed ReShade frame on the same queue.
     reshade::api::command_queue *queue = runtime->get_command_queue();
-    if (queue) queue->flush_immediate_command_list();
     const reshade::api::device_api api = runtime->get_device()->get_api();
+    // Vulkan's present hook owns the immediate-list submission and attaches
+    // the application's render-complete semaphore. Record both copies now and
+    // let ReShade submit them at that synchronization boundary. A manual flush
+    // here races NMS's present semaphore and can device-loss the queue.
+    if (api != reshade::api::device_api::vulkan && queue)
+        queue->flush_immediate_command_list();
     if (api == reshade::api::device_api::d3d12)
         PresentProxyAfterReshade(reinterpret_cast<ID3D12Resource *>(resource.handle));
     else if ((api == reshade::api::device_api::d3d11 || api == reshade::api::device_api::d3d9) &&
         CopyLegacyFrameToD3D12(reinterpret_cast<void *>(resource.handle), true))
         PresentProxyAfterReshade(g_legacy_post12.Get());
-    else if (api == reshade::api::device_api::vulkan &&
-        CopyVulkanFrameToD3D12(queue, resource, reshade::api::resource_usage::present, true))
-        PresentProxyAfterReshade(g_legacy_post12.Get());
+    else if (api == reshade::api::device_api::vulkan)
+        RecordVulkanFrameCopy(queue, resource, reshade::api::resource_usage::present, true);
+}
+
+static void OnFinishPresent(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain)
+{
+    if (!queue || !swapchain || queue->get_device()->get_api() != reshade::api::device_api::vulkan ||
+        !g_vulkan_input_copy_recorded)
+        return;
+    const HWND present_window = static_cast<HWND>(swapchain->get_hwnd());
+    if (g_game_window && present_window && present_window != g_game_window) return;
+
+    // At finish_present, ReShade has submitted the recorded copies with the
+    // application's present waits and vkQueuePresentKHR has returned. Signal
+    // the imported D3D12 timeline only now, then run NGX and the native proxy.
+    const bool completed = CompleteVulkanFrameCopies(queue);
+    const bool has_post_copy = g_vulkan_post_copy_recorded;
+    g_vulkan_release_wait_queued = false;
+    g_vulkan_input_copy_recorded = false;
+    g_vulkan_post_copy_recorded = false;
+    g_pending_proxy_frame = false;
+    if (!completed)
+    {
+        if (g_proxy_window && !g_proxy_hidden)
+        {
+            g_proxy_hidden = true;
+            ShowWindow(g_proxy_window, SW_HIDE);
+        }
+        SetStatus("Vulkan present-synchronized handoff failed; see log");
+        return;
+    }
+    if (!ExecuteOnPresentPipeline(nullptr)) return;
+    if (!g_enabled || g_neural_failed || g_proxy_hidden || !g_nr_output || !EnsureProxy(g_nr_output)) return;
+    PresentProxyAfterReshade(has_post_copy ? g_legacy_post12.Get() : g_packed_color.Get());
 }
 
 static bool OnReshadeOpenOverlay(reshade::api::effect_runtime *runtime, bool open, reshade::api::input_source)
@@ -2688,6 +2734,9 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         Log("overlay mouse bridge routed event=%llu", routed_mouse_events);
     }
     g_pending_proxy_frame = false;
+    g_vulkan_release_wait_queued = false;
+    g_vulkan_input_copy_recorded = false;
+    g_vulkan_post_copy_recorded = false;
     if (!g_enabled || g_neural_failed)
     {
         if (g_proxy_window && !g_proxy_hidden)
@@ -2764,12 +2813,17 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         const DXGI_FORMAT format = VulkanSharedFormat(static_cast<DXGI_FORMAT>(desc.texture.format));
         g_input_width = width; g_input_height = height;
         if (!EnsureStandaloneResources(width, height, format)) return;
-        if (!CopyVulkanFrameToD3D12(queue, backbuffer_resource, reshade::api::resource_usage::present, false) ||
-            !ExecuteOnPresentPipeline(nullptr))
+        if (!RecordVulkanFrameCopy(queue, backbuffer_resource, reshade::api::resource_usage::present, false))
         {
             if (!g_neural_failed) SetStatus("waiting for a valid Vulkan shared frame");
             return;
         }
+        // Arm the post-ReShade copy, but do not create/show the proxy until the
+        // first synchronized Vulkan handoff and NGX evaluation have succeeded.
+        // This is the Vulkan fail-open path: startup remains the game's normal
+        // presentation instead of exposing an uninitialized black proxy.
+        g_pending_proxy_frame = true;
+        return;
     }
     if (g_nr_output != nullptr && EnsureProxy(g_nr_output)) g_pending_proxy_frame = true;
 }
@@ -3132,6 +3186,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
         reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
         reshade::register_event<reshade::addon_event::present>(OnPresent);
+        reshade::register_event<reshade::addon_event::finish_present>(OnFinishPresent);
         reshade::register_event<reshade::addon_event::reshade_present>(OnReshadePresent);
         reshade::register_event<reshade::addon_event::reshade_open_overlay>(OnReshadeOpenOverlay);
         reshade::register_overlay(nullptr, DrawOverlay);
@@ -3144,6 +3199,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::unregister_overlay(nullptr, DrawOverlay);
         reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(OnReshadeOpenOverlay);
         reshade::unregister_event<reshade::addon_event::reshade_present>(OnReshadePresent);
+        reshade::unregister_event<reshade::addon_event::finish_present>(OnFinishPresent);
         reshade::unregister_event<reshade::addon_event::present>(OnPresent);
         reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
         reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
