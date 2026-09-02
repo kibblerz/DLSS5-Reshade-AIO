@@ -22,7 +22,7 @@
 #include <nvsdk_ngx_params.h>
 #include <nvsdk_ngx_defs_dlssd.h>
 
-#define ADDON_VERSION "1.3.2-post-reshade-overlay"
+#define ADDON_VERSION "1.3.3-overlay-input-fps"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -64,6 +64,11 @@ static bool g_show_neural_output = true;
 static bool g_pending_proxy_frame;
 static bool g_composite_reshade_output = true;
 static std::atomic<unsigned long long> g_post_reshade_frames{0};
+static std::atomic<bool> g_reshade_overlay_open{false};
+static bool g_show_proxy_fps = true;
+static std::atomic<unsigned int> g_proxy_fps{0};
+static ULONGLONG g_fps_sample_start;
+static unsigned int g_fps_sample_frames;
 static bool g_f10_down;
 static bool g_home_down;
 static bool g_alt_x_down;
@@ -794,6 +799,7 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *runtime)
     g_mv_variable = {}; g_depth_variable = {}; g_mask_variable = {};
     g_captured_motion.Reset(); g_captured_depth.Reset();
     g_using_external_guides = false;
+    g_reshade_overlay_open = false;
 }
 
 static void OnRenderTechnique(reshade::api::effect_runtime *runtime, reshade::api::effect_technique technique,
@@ -1055,7 +1061,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
 
 static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
 {
-    if (message == WM_NCHITTEST) return HTCLIENT;
+    if (message == WM_NCHITTEST) return g_reshade_overlay_open.load() ? HTTRANSPARENT : HTCLIENT;
     if (message == WM_ERASEBKGND) return 1;
     if (message == WM_CLOSE) { DestroyWindow(hwnd); return 0; }
     if (message == WM_DESTROY) { PostQuitMessage(0); return 0; }
@@ -1076,6 +1082,18 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
         return 0;
     }
     return DefWindowProcW(hwnd, message, wparam, lparam);
+}
+
+static void UpdateProxyFps()
+{
+    const ULONGLONG now = GetTickCount64();
+    if (g_fps_sample_start == 0) g_fps_sample_start = now;
+    ++g_fps_sample_frames;
+    const ULONGLONG elapsed = now - g_fps_sample_start;
+    if (elapsed < 500) return;
+    g_proxy_fps = static_cast<unsigned int>((static_cast<ULONGLONG>(g_fps_sample_frames) * 1000 + elapsed / 2) / elapsed);
+    g_fps_sample_frames = 0;
+    g_fps_sample_start = now;
 }
 
 static DWORD WINAPI ProxyWindowThread(void *)
@@ -1210,14 +1228,25 @@ static bool EnsureProxy(ID3D12Resource *source)
     if (SUCCEEDED(hr)) { failed_stage = "CreateRootSignature"; hr = device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&g_proxy_root_signature)); }
     static const char *shader_source =
         "Texture2D<float3> Neural:register(t0); Texture2D<float3> Original:register(t1); Texture2D<float3> Post:register(t2);"
-        "SamplerState Samp:register(s0); cbuffer C:register(b0){uint Mode;float2 PackedScale;float Threshold;}"
+        "SamplerState Samp:register(s0); cbuffer C:register(b0){uint Mode;uint Fps;uint ShowFps;float Threshold;}"
         "struct O{float4 p:SV_Position;float2 uv:TEXCOORD0;};"
         "O VS(uint id:SV_VertexID){O o; float2 p=float2((id<<1)&2,id&2); o.uv=p; o.p=float4(p*float2(2,-2)+float2(-1,1),0,1); return o;}"
-        "float4 PS(O i):SV_Target{float3 post=Post.SampleLevel(Samp,i.uv,0); if(Mode==0)return float4(post,1);"
-        "float3 neural=Neural.SampleLevel(Samp,i.uv,0); if(Mode==1)return float4(neural,1);"
+        "uint GlyphRow(uint c,uint y){static const uint r[91]={"
+        "14,17,17,17,17,17,14,4,12,4,4,4,4,14,14,17,1,2,4,8,31,30,1,1,14,1,1,30,"
+        "2,6,10,18,31,2,2,31,16,16,30,1,1,30,14,16,16,30,17,17,14,31,1,2,4,8,8,8,"
+        "14,17,17,14,17,17,14,14,17,17,15,1,1,14,31,16,16,30,16,16,16,30,17,17,30,16,16,16,"
+        "15,16,16,14,1,1,30};return(c<13&&y<7)?r[c*7+y]:0;}"
+        "float3 AddFps(float3 color,float2 pos){if(ShowFps==0)return color;const uint scale=4;"
+        "int2 q=int2(pos)-int2(16,16);if(q.x< -8||q.y< -6||q.x>=176||q.y>=36)return color;"
+        "color*=0.25;if(q.x<0||q.y<0)return color;uint ch=(uint)q.x/(6*scale);uint x=((uint)q.x%(6*scale))/scale;uint y=(uint)q.y/scale;"
+        "uint code=99;if(ch==0)code=10;else if(ch==1)code=11;else if(ch==2)code=12;else if(ch==4)code=min(Fps,999)/100;"
+        "else if(ch==5)code=(min(Fps,999)/10)%10;else if(ch==6)code=min(Fps,999)%10;"
+        "if(x<5&&y<7&&((GlyphRow(code,y)>>(4-x))&1)!=0)return float3(0.25,0.95,0.35);return color;}"
+        "float4 PS(O i):SV_Target{float3 post=Post.SampleLevel(Samp,i.uv,0);float3 neural=Neural.SampleLevel(Samp,i.uv,0);float3 result;"
         "uint w,h; Post.GetDimensions(w,h); uint2 p=min(uint2(i.uv*float2(w,h)),uint2(w-1,h-1));"
         "float3 postPoint=Post.Load(int3(p,0)); float3 original=Original.Load(int3(p,0)); float3 d=abs(postPoint-original);"
-        "return float4(max(d.r,max(d.g,d.b))>Threshold?post:neural,1);}";
+        "if(Mode==0)result=post;else if(Mode==1)result=neural;else result=max(d.r,max(d.g,d.b))>Threshold?post:neural;"
+        "return float4(AddFps(result,i.p.xy),1);}";
     if (SUCCEEDED(hr)) { failed_stage = "Compile vertex shader"; hr = D3DCompile(shader_source, strlen(shader_source), nullptr, nullptr, nullptr, "VS", "vs_5_0", 0, 0, &vertex_shader, &error_blob); }
     if (SUCCEEDED(hr)) { failed_stage = "Compile pixel shader"; hr = D3DCompile(shader_source, strlen(shader_source), nullptr, nullptr, nullptr, "PS", "ps_5_0", 0, 0, &pixel_shader, &error_blob); }
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline_desc = {};
@@ -1331,10 +1360,10 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
     ID3D12DescriptorHeap *heaps[] = {g_proxy_srv_heap.Get()}; g_proxy_list->SetDescriptorHeaps(1, heaps);
     g_proxy_list->SetGraphicsRootSignature(g_proxy_root_signature.Get()); g_proxy_list->SetPipelineState(g_proxy_pipeline.Get());
     g_proxy_list->SetGraphicsRootDescriptorTable(0, g_proxy_srv_heap->GetGPUDescriptorHandleForHeapStart());
-    struct ProxyConstants { UINT mode; float packed_scale_x; float packed_scale_y; float threshold; } constants = {
+    struct ProxyConstants { UINT mode; UINT fps; UINT show_fps; float threshold; } constants = {
         g_show_neural_output ? (g_composite_reshade_output ? 2u : 1u) : 0u,
-        static_cast<float>(g_resource_input_width) / static_cast<float>(g_resource_output_width),
-        static_cast<float>(g_resource_input_height) / static_cast<float>(g_resource_output_height),
+        g_proxy_fps.load(),
+        g_show_proxy_fps ? 1u : 0u,
         0.0f
     };
     g_proxy_list->SetGraphicsRoot32BitConstants(1, 4, &constants, 0);
@@ -1374,6 +1403,15 @@ static void OnReshadePresent(reshade::api::effect_runtime *runtime)
     PresentProxyAfterReshade(backbuffer);
 }
 
+static bool OnReshadeOpenOverlay(reshade::api::effect_runtime *runtime, bool open, reshade::api::input_source)
+{
+    if (runtime != g_runtime) return false;
+    g_reshade_overlay_open = open;
+    Log("ReShade overlay %s; native proxy hit testing is now %s",
+        open ? "opened" : "closed", open ? "click-through" : "interactive forwarding");
+    return false;
+}
+
 static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain,
     const reshade::api::rect *, const reshade::api::rect *, uint32_t, const reshade::api::rect *)
 {
@@ -1382,6 +1420,7 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     if (g_game_window && present_window && present_window != g_game_window) return;
     if (!g_game_window && present_window) g_game_window = present_window;
     if (!AdoptPresentQueue(queue)) return;
+    UpdateProxyFps();
     g_pending_proxy_frame = false;
     if (!g_enabled || g_neural_failed)
     {
@@ -1553,6 +1592,8 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     }
     if (ImGui::Checkbox("Composite ReShade effects/overlay", &g_composite_reshade_output))
         reshade::set_config_value(nullptr, section, "CompositeReshade", g_composite_reshade_output ? "1" : "0");
+    if (ImGui::Checkbox("Show native proxy FPS counter", &g_show_proxy_fps))
+        reshade::set_config_value(nullptr, section, "ShowProxyFps", g_show_proxy_fps ? "1" : "0");
     ImGui::TextDisabled("Off keeps the full-screen proxy but displays a simple linear stretch of Conan's original frame.");
 
     ImGui::Separator();
@@ -1567,6 +1608,8 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::Text("Current-frame guide submissions: %llu", g_current_guide_frames.load());
     ImGui::Text("Native proxy: %s; frames=%llu; post-ReShade=%llu", g_proxy_swapchain ? "presenting" : (g_proxy_failed ? "failed" : "waiting"),
         g_frames_presented.load(), g_post_reshade_frames.load());
+    ImGui::Text("Proxy FPS: %u; ReShade menu input: %s", g_proxy_fps.load(),
+        g_reshade_overlay_open.load() ? "click-through" : "game forwarding");
     ImGui::Text("Presented image: %s", g_show_neural_output ? "neural native output" : "stretched original backbuffer");
     ImGui::TextWrapped("Set the reduced render resolution in Conan's fullscreen menu. The addon keeps the desktop at native resolution and performs NR followed by DLSS Super Resolution.");
     ImGui::TextUnformatted("Press F10 for neural/stretched-original A/B. Home is composited into the proxy; Alt+X hides it for NVIDIA.");
@@ -1627,6 +1670,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("SkinStructure", "-1.0", value, sizeof(value)); g_nr_skin_structure = std::clamp(static_cast<float>(atof(value)), -1.0f, 1.0f);
         read_setting("ResetEveryFrame", "0", value, sizeof(value)); g_reset_every_frame = strcmp(value, "0") != 0;
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
+        read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
         Log("Standalone DLSS-NR + SR %s attached; profile=%s model=%d", ADDON_VERSION, ProfileName(g_color_profile), g_nr_model);
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
@@ -1638,12 +1682,14 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
         reshade::register_event<reshade::addon_event::present>(OnPresent);
         reshade::register_event<reshade::addon_event::reshade_present>(OnReshadePresent);
+        reshade::register_event<reshade::addon_event::reshade_open_overlay>(OnReshadeOpenOverlay);
         reshade::register_overlay(nullptr, DrawOverlay);
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
         reshade::unregister_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
         reshade::unregister_overlay(nullptr, DrawOverlay);
+        reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(OnReshadeOpenOverlay);
         reshade::unregister_event<reshade::addon_event::reshade_present>(OnReshadePresent);
         reshade::unregister_event<reshade::addon_event::present>(OnPresent);
         reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
