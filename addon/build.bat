@@ -19,6 +19,7 @@ if errorlevel 1 exit /b 1
 
 copy /y "..\lab\nvngx_dlssnr.sf.dll" "build\nvngx_dlssnr.dll" >nul || exit /b 1
 copy /y "..\..\nvngx_dlss.dll" "build\nvngx_dlss.dll" >nul || exit /b 1
+copy /y "..\..\renodx\external\DLSS\lib\Windows_x86_64\rel\nvngx_dlssg.dll" "build\nvngx_dlssg.dll" >nul || exit /b 1
 copy /y "shaders\DLSS5_Feed.fx" "build\DLSS5_Feed.fx" >nul || exit /b 1
 echo Standalone addon package built in %CD%\build
 endlocal

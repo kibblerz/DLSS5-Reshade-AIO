@@ -13,6 +13,7 @@ cl /nologo /std:c++17 /O2 /EHsc /W4 /MD ^
   d3d12.lib dxgi.lib dxguid.lib user32.lib advapi32.lib ole32.lib
 if errorlevel 1 exit /b 1
 copy /y "..\..\nvngx_dlss.dll" "." >nul || exit /b 1
+copy /y "..\..\renodx\external\DLSS\lib\Windows_x86_64\rel\nvngx_dlssg.dll" "." >nul || exit /b 1
 if exist "nvngx_dlssnr.sf.dll" (
   copy /y "nvngx_dlssnr.sf.dll" "nvngx_dlssnr.dll" >nul || exit /b 1
 ) else (

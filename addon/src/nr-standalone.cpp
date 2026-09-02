@@ -21,8 +21,9 @@
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_params.h>
 #include <nvsdk_ngx_defs_dlssd.h>
+#include <nvsdk_ngx_defs_dlssg.h>
 
-#define ADDON_VERSION "1.4.0-compact-nr-provider"
+#define ADDON_VERSION "1.5.0-experimental-framegen"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -87,6 +88,8 @@ static float g_nr_skin_structure = -1.0f;
 static bool g_reset_every_frame = false;
 static bool g_stable_sr_history = true;
 static bool g_bypass_nr_for_ab = false;
+static bool g_framegen_enabled = true;
+static bool g_framegen_failed = false;
 static std::atomic<bool> g_feature_recreate_requested{false};
 static bool g_need_history_reset = true;
 static bool g_depth_reversed = true;
@@ -97,6 +100,7 @@ static bool g_using_external_guides = false;
 static char g_neural_status[256] = "waiting for first game present";
 static std::atomic<unsigned long long> g_nr_frames{0};
 static std::atomic<unsigned long long> g_sr_frames{0};
+static std::atomic<unsigned long long> g_fg_frames{0};
 
 static reshade::api::effect_runtime *g_runtime;
 static reshade::api::effect_technique g_feed_technique;
@@ -121,6 +125,7 @@ static UINT64 g_neural_fence_value;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_packed_color;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_nr_stage;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_sr_stage;
+static Microsoft::WRL::ComPtr<ID3D12Resource> g_fg_stage;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_fallback_motion;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_fallback_depth;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_captured_motion;
@@ -153,16 +158,22 @@ using NgxBridgePopulateParameters = NVSDK_NGX_Result (NVSDK_CONV *)(NgxPopulateP
 static HMODULE g_core_module;
 static HMODULE g_nr_module;
 static HMODULE g_dlss_module;
+static HMODULE g_dlssg_module;
 static HMODULE g_bridge_module;
 static NVSDK_NGX_Parameter *g_ngx_params;
 static NVSDK_NGX_Handle *g_nr_feature;
 static NVSDK_NGX_Handle *g_sr_feature;
+static NVSDK_NGX_Handle *g_fg_feature;
 static NgxCreateFeature g_nr_create;
 static NgxEvaluateFeature g_nr_evaluate;
 static NgxReleaseFeature g_nr_release;
 static NgxCreateFeature g_sr_create;
 static NgxEvaluateFeature g_sr_evaluate;
 static NgxReleaseFeature g_sr_release;
+static NgxCreateFeature g_fg_create;
+static NgxEvaluateFeature g_fg_evaluate;
+static NgxReleaseFeature g_fg_release;
+static NgxPopulateParameters g_fg_populate;
 static NgxBridgeCreateFeature g_bridge_create;
 static NgxBridgeEvaluateFeature g_bridge_evaluate;
 static NgxBridgeReleaseFeature g_bridge_release;
@@ -366,12 +377,13 @@ static bool InitializeNgx()
         Fail("private runtime dependency set missing", ERROR_FILE_NOT_FOUND);
         return false;
     }
-    wchar_t nr_path[MAX_PATH] = {}, dlss_path[MAX_PATH] = {}, bridge_path[MAX_PATH] = {};
+    wchar_t nr_path[MAX_PATH] = {}, dlss_path[MAX_PATH] = {}, dlssg_path[MAX_PATH] = {}, bridge_path[MAX_PATH] = {};
     BuildRuntimePath(nr_path, runtime_directory, L"nvngx_dlssnr.dll");
     BuildRuntimePath(dlss_path, runtime_directory, L"nvngx_dlss.dll");
+    BuildRuntimePath(dlssg_path, runtime_directory, L"nvngx_dlssg.dll");
     BuildRuntimePath(bridge_path, runtime_directory, L"nvngx.dll");
     Log("standalone private runtime directory: %ls", runtime_directory);
-    for (const wchar_t *path : {nr_path, dlss_path, bridge_path})
+    for (const wchar_t *path : {nr_path, dlss_path, dlssg_path, bridge_path})
     {
         WIN32_FILE_ATTRIBUTE_DATA data = {};
         if (!GetFileAttributesExW(path, GetFileExInfoStandard, &data))
@@ -430,6 +442,24 @@ static bool InitializeNgx()
     result = bridge_init(dlss_init, kGenericCustomCoreId, dlss_path, g_neural_device.Get(), NVSDK_NGX_Version_API, nullptr);
     Log("DLSS SR snippet Init_Ext = 0x%08X (%s)", static_cast<unsigned int>(result), ResultName(result));
     if (NVSDK_NGX_FAILED(result)) { Fail("DLSS SR snippet Init_Ext", static_cast<unsigned int>(result)); return false; }
+
+    g_dlssg_module = LoadLibraryExW(dlssg_path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    auto dlssg_init = g_dlssg_module ? reinterpret_cast<NgxSnippetInitD3D12Ext>(GetProcAddress(g_dlssg_module, "NVSDK_NGX_D3D12_Init_Ext")) : nullptr;
+    g_fg_create = g_dlssg_module ? reinterpret_cast<NgxCreateFeature>(GetProcAddress(g_dlssg_module, "NVSDK_NGX_D3D12_CreateFeature")) : nullptr;
+    g_fg_evaluate = g_dlssg_module ? reinterpret_cast<NgxEvaluateFeature>(GetProcAddress(g_dlssg_module, "NVSDK_NGX_D3D12_EvaluateFeature")) : nullptr;
+    g_fg_release = g_dlssg_module ? reinterpret_cast<NgxReleaseFeature>(GetProcAddress(g_dlssg_module, "NVSDK_NGX_D3D12_ReleaseFeature")) : nullptr;
+    g_fg_populate = g_dlssg_module ? reinterpret_cast<NgxPopulateParameters>(GetProcAddress(g_dlssg_module, "NVSDK_NGX_D3D12_PopulateParameters_Impl")) : nullptr;
+    if (!dlssg_init || !g_fg_create || !g_fg_evaluate || !g_fg_release || !g_fg_populate)
+    {
+        Log("DLSS-G runtime unavailable; frame generation will remain disabled");
+        g_framegen_failed = true;
+    }
+    else
+    {
+        result = bridge_init(dlssg_init, kGenericCustomCoreId, dlssg_path, g_neural_device.Get(), NVSDK_NGX_Version_API, nullptr);
+        Log("DLSS-G snippet Init_Ext = 0x%08X (%s)", static_cast<unsigned int>(result), ResultName(result));
+        if (NVSDK_NGX_FAILED(result)) g_framegen_failed = true;
+    }
     result = get_capabilities(&g_ngx_params);
     Log("driver-core GetCapabilityParameters = 0x%08X (%s), ptr=%p", static_cast<unsigned int>(result), ResultName(result), g_ngx_params);
     if (NVSDK_NGX_FAILED(result) || !g_ngx_params) { Fail("GetCapabilityParameters", static_cast<unsigned int>(result)); return false; }
@@ -541,6 +571,9 @@ static NVSDK_NGX_Result SafeRelease(NgxReleaseFeature release, NVSDK_NGX_Handle 
     }
 }
 
+static NVSDK_NGX_Result SafeCreateFg(DWORD *exception);
+static NVSDK_NGX_Result SafeEvaluateFg(DWORD *exception);
+
 static bool CreateFeatures()
 {
     SetNrCreationContract();
@@ -571,8 +604,41 @@ static bool CreateFeatures()
     if (!SubmitNeuralCommands(true)) return false;
     Log("CreateFeature(feature=SuperSampling) = 0x%08X (%s), handle=%p quality=%d", static_cast<unsigned int>(result), ResultName(result), g_sr_feature, quality);
     if (NVSDK_NGX_FAILED(result) || !g_sr_feature) { Fail("DLSS SR feature creation", static_cast<unsigned int>(result)); return false; }
-    Log("standalone contract ready: NR feature 18 %ux%u active rect, DLSS SR -> %ux%u, model=%d, profile=%s",
+
+    if (!g_framegen_failed)
+    {
+        g_ngx_params->Reset();
+        const NVSDK_NGX_Result populate_result = g_bridge_populate(g_fg_populate, g_ngx_params);
+        Log("DLSS-G PopulateParameters_Impl = 0x%08X (%s)",
+            static_cast<unsigned int>(populate_result), ResultName(populate_result));
+        g_ngx_params->Set("CreationNodeMask", 1u); g_ngx_params->Set("VisibilityNodeMask", 1u);
+        g_ngx_params->Set("Width", g_resource_output_width); g_ngx_params->Set("Height", g_resource_output_height);
+        const DXGI_FORMAT fg_format = g_color_profile == ColorProfile::Srgb ?
+            DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
+        g_ngx_params->Set("DLSSG.BackbufferFormat", static_cast<unsigned int>(fg_format));
+        g_ngx_params->Set("DLSSG.InternalWidth", g_resource_input_width);
+        g_ngx_params->Set("DLSSG.InternalHeight", g_resource_input_height);
+        g_ngx_params->Set("DLSSG.DynamicResolution", 0u);
+        if (!BeginNeuralCommands()) return false;
+        exception = 0;
+        result = SafeCreateFg(&exception);
+        if (exception)
+        {
+            g_neural_list->Close();
+            Log("DLSS-G creation exception 0x%08X; continuing without frame generation", exception);
+            g_framegen_failed = true;
+        }
+        else if (!SubmitNeuralCommands(true)) return false;
+        if (!exception)
+        {
+            Log("CreateFeature(feature=FrameGeneration) = 0x%08X (%s), handle=%p",
+                static_cast<unsigned int>(result), ResultName(result), g_fg_feature);
+            if (NVSDK_NGX_FAILED(result) || !g_fg_feature) g_framegen_failed = true;
+        }
+    }
+    Log("standalone contract ready: NR feature 18 %ux%u active rect, DLSS SR -> %ux%u, DLSS-G=%s, model=%d, profile=%s",
         g_resource_input_width, g_resource_input_height, g_resource_output_width, g_resource_output_height,
+        (!g_framegen_failed && g_fg_feature) ? "ready" : "fallback-off",
         g_nr_model, ProfileName(g_color_profile));
     g_active_nr_model = g_nr_model;
     return true;
@@ -583,6 +649,16 @@ static bool RecreateFeatures()
     if (!g_neural_ready || !g_nr_feature || !g_sr_feature) return false;
     if (!WaitForNeuralGpu()) return false;
     DWORD exception = 0;
+    if (g_fg_feature)
+    {
+        const NVSDK_NGX_Result fg_result = SafeRelease(g_fg_release, g_fg_feature, &exception);
+        if (exception || NVSDK_NGX_FAILED(fg_result))
+        {
+            Log("DLSS-G release failed during model change; disabling frame generation");
+            g_framegen_failed = true;
+        }
+        g_fg_feature = nullptr;
+    }
     NVSDK_NGX_Result sr_result = SafeRelease(g_sr_release, g_sr_feature, &exception);
     if (exception || NVSDK_NGX_FAILED(sr_result))
     {
@@ -600,6 +676,7 @@ static bool RecreateFeatures()
     }
     g_nr_feature = nullptr;
     Log("released live features for model change: old=%d requested=%d", g_active_nr_model, g_nr_model);
+    g_fg_frames = 0;
     g_need_history_reset = true;
     if (!CreateFeatures()) return false;
     Log("live model switch complete: active model=%d", g_active_nr_model);
@@ -668,6 +745,36 @@ static void PublishOutput(ID3D12Resource *resource)
     if (old) old->Release();
 }
 
+static NVSDK_NGX_Result SafeCreateFg(DWORD *exception)
+{
+    *exception = 0;
+    __try
+    {
+        return g_bridge_create(g_fg_create, g_neural_list.Get(),
+            NVSDK_NGX_Feature_FrameGeneration, g_ngx_params, &g_fg_feature);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        *exception = GetExceptionCode();
+        return static_cast<NVSDK_NGX_Result>(0x7fffffff);
+    }
+}
+
+static NVSDK_NGX_Result SafeEvaluateFg(DWORD *exception)
+{
+    *exception = 0;
+    __try
+    {
+        return g_bridge_evaluate(g_fg_evaluate, g_neural_list.Get(),
+            g_fg_feature, g_ngx_params, nullptr);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        *exception = GetExceptionCode();
+        return static_cast<NVSDK_NGX_Result>(0x7fffffff);
+    }
+}
+
 static void ClearPublishedOutput()
 {
     ID3D12Resource *old = static_cast<ID3D12Resource *>(
@@ -696,6 +803,16 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
     if (!WaitForNeuralGpu()) return false;
 
     DWORD exception = 0;
+    if (g_fg_feature)
+    {
+        const NVSDK_NGX_Result result = SafeRelease(g_fg_release, g_fg_feature, &exception);
+        if (exception || NVSDK_NGX_FAILED(result))
+        {
+            Log("DLSS-G release failed during resolution change; continuing with FG disabled");
+            g_framegen_failed = true;
+        }
+        g_fg_feature = nullptr;
+    }
     if (g_sr_feature)
     {
         const NVSDK_NGX_Result result = SafeRelease(g_sr_release, g_sr_feature, &exception);
@@ -721,13 +838,14 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
 
     ClearPublishedOutput();
     g_neural_ready = false;
+    g_fg_frames = 0;
     g_need_history_reset = true;
     g_using_external_guides = false;
     g_mask_available = false;
     g_pending_proxy_frame = false;
     g_captured_motion.Reset(); g_captured_depth.Reset(); g_captured_mask.Reset();
     g_fallback_motion.Reset(); g_fallback_depth.Reset();
-    g_sr_stage.Reset(); g_nr_stage.Reset(); g_packed_color.Reset();
+    g_fg_stage.Reset(); g_sr_stage.Reset(); g_nr_stage.Reset(); g_packed_color.Reset();
 
     if (g_runtime)
     {
@@ -793,7 +911,8 @@ static bool EnsureStandaloneResources(ID3D12Resource *backbuffer)
     if (!CreateTexture(iw, ih, input_format, false,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g_packed_color) ||
         !CreateTexture(iw, ih, result_format, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g_nr_stage) ||
-        !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, g_sr_stage)) return false;
+        !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, g_sr_stage) ||
+        !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, g_fg_stage)) return false;
     const float motion_clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     const float depth_clear[4] = {g_depth_reversed ? 0.0f : 1.0f, 0.0f, 0.0f, 0.0f};
     if (!CreateGuideTexture(iw, ih, DXGI_FORMAT_R16G16_FLOAT, motion_clear, 0, g_fallback_motion) ||
@@ -880,6 +999,55 @@ static void SetSrEvaluationContract(ID3D12Resource *color, ID3D12Resource *depth
     g_ngx_params->Set("DLSS.Output.Subrect.Base.X", 0u); g_ngx_params->Set("DLSS.Output.Subrect.Base.Y", 0u);
     g_ngx_params->Set("DLSS.Pre.Exposure", 1.0f); g_ngx_params->Set("DLSS.Exposure.Scale", 1.0f);
     g_ngx_params->Set("DLSS.Indicator.Invert.X.Axis", 0); g_ngx_params->Set("DLSS.Indicator.Invert.Y.Axis", 0);
+}
+
+static void SetFgEvaluationContract(ID3D12Resource *depth, ID3D12Resource *motion, bool reset)
+{
+    static float identity[4][4] = {
+        {1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}
+    };
+    const UINT iw = g_resource_input_width, ih = g_resource_input_height;
+    const UINT ow = g_resource_output_width, oh = g_resource_output_height;
+    g_ngx_params->Set("DLSSG.Backbuffer", g_sr_stage.Get());
+    g_ngx_params->Set("DLSSG.MVecs", motion);
+    g_ngx_params->Set("DLSSG.Depth", depth);
+    g_ngx_params->Set("DLSSG.HUDLess", g_sr_stage.Get());
+    g_ngx_params->Set("DLSSG.OutputInterpolated", g_fg_stage.Get());
+    g_ngx_params->Set("DLSSG.MultiFrameCount", 1u); g_ngx_params->Set("DLSSG.MultiFrameIndex", 1u);
+    for (const char *name : {"DLSSG.CameraViewToClip", "DLSSG.ClipToCameraView",
+        "DLSSG.ClipToLensClip", "DLSSG.ClipToPrevClip", "DLSSG.PrevClipToClip"})
+        g_ngx_params->Set(name, reinterpret_cast<void *>(identity));
+    g_ngx_params->Set("DLSSG.JitterOffsetX", 0.0f); g_ngx_params->Set("DLSSG.JitterOffsetY", 0.0f);
+    g_ngx_params->Set("DLSSG.MvecScaleX", 1.0f / iw); g_ngx_params->Set("DLSSG.MvecScaleY", 1.0f / ih);
+    g_ngx_params->Set("DLSSG.CameraPinholeOffsetX", 0.0f); g_ngx_params->Set("DLSSG.CameraPinholeOffsetY", 0.0f);
+    g_ngx_params->Set("DLSSG.CameraPosX", 0.0f); g_ngx_params->Set("DLSSG.CameraPosY", 0.0f); g_ngx_params->Set("DLSSG.CameraPosZ", 0.0f);
+    g_ngx_params->Set("DLSSG.CameraUpX", 0.0f); g_ngx_params->Set("DLSSG.CameraUpY", 1.0f); g_ngx_params->Set("DLSSG.CameraUpZ", 0.0f);
+    g_ngx_params->Set("DLSSG.CameraRightX", 1.0f); g_ngx_params->Set("DLSSG.CameraRightY", 0.0f); g_ngx_params->Set("DLSSG.CameraRightZ", 0.0f);
+    g_ngx_params->Set("DLSSG.CameraFwdX", 0.0f); g_ngx_params->Set("DLSSG.CameraFwdY", 0.0f); g_ngx_params->Set("DLSSG.CameraFwdZ", 1.0f);
+    g_ngx_params->Set("DLSSG.CameraNear", 0.1f); g_ngx_params->Set("DLSSG.CameraFar", 1000.0f);
+    g_ngx_params->Set("DLSSG.CameraFOV", 1.04719755f); g_ngx_params->Set("DLSSG.CameraAspectRatio", static_cast<float>(ow) / oh);
+    g_ngx_params->Set("DLSSG.ColorBuffersHDR", g_color_profile == ColorProfile::Srgb ? 0u : 1u);
+    g_ngx_params->Set("DLSSG.DepthInverted", g_depth_reversed ? 1u : 0u);
+    g_ngx_params->Set("DLSSG.CameraMotionIncluded", 1u);
+    g_ngx_params->Set("DLSSG.Reset", reset ? 1u : 0u);
+    g_ngx_params->Set("DLSSG.AutomodeOverrideReset", 0u); g_ngx_params->Set("DLSSG.NotRenderingGameFrames", 0u);
+    g_ngx_params->Set("DLSSG.OrthoProjection", 0u); g_ngx_params->Set("DLSSG.MvecInvalidValue", -99999.0f);
+    g_ngx_params->Set("DLSSG.MvecDilated", 0u); g_ngx_params->Set("DLSSG.MenuDetectionEnabled", 0u);
+    g_ngx_params->Set("DLSSG.BackbufferFrameID", static_cast<unsigned long long>(g_sr_frames.load() + 1));
+    for (const char *prefix : {"DLSSG.MVecsSubrect", "DLSSG.DepthSubrect"})
+    {
+        std::string key = std::string(prefix) + "BaseX"; g_ngx_params->Set(key.c_str(), 0u);
+        key = std::string(prefix) + "BaseY"; g_ngx_params->Set(key.c_str(), 0u);
+        key = std::string(prefix) + "Width"; g_ngx_params->Set(key.c_str(), iw);
+        key = std::string(prefix) + "Height"; g_ngx_params->Set(key.c_str(), ih);
+    }
+    for (const char *prefix : {"DLSSG.InputBackbufferSubrect", "DLSSG.HUDLessSubrect", "DLSSG.OutputInterpolatedSubrect"})
+    {
+        std::string key = std::string(prefix) + "BaseX"; g_ngx_params->Set(key.c_str(), 0u);
+        key = std::string(prefix) + "BaseY"; g_ngx_params->Set(key.c_str(), 0u);
+        key = std::string(prefix) + "Width"; g_ngx_params->Set(key.c_str(), ow);
+        key = std::string(prefix) + "Height"; g_ngx_params->Set(key.c_str(), oh);
+    }
 }
 
 static void ResolveHandles(reshade::api::effect_runtime *runtime)
@@ -1164,20 +1332,46 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         Fail("on-present DLSS SR evaluation exception", exception);
         return false;
     }
-    D3D12_RESOURCE_BARRIER sr_restore = Transition(
-        g_sr_stage.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-    if (!g_bypass_nr_for_ab)
+    NVSDK_NGX_Result fg_result = static_cast<NVSDK_NGX_Result>(0xBAD00004);
+    const bool evaluate_fg = g_framegen_enabled && !g_framegen_failed && g_fg_feature &&
+        NVSDK_NGX_SUCCEED(nr_result) && NVSDK_NGX_SUCCEED(sr_result);
+    if (evaluate_fg)
     {
-        D3D12_RESOURCE_BARRIER restore[2] = {
-            Transition(g_nr_stage.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-            sr_restore
+        D3D12_RESOURCE_BARRIER fg_begin[2] = {
+            Transition(g_sr_stage.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            Transition(g_fg_stage.Get(), D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
         };
-        g_neural_list->ResourceBarrier(2, restore);
+        g_neural_list->ResourceBarrier(2, fg_begin);
+        SetFgEvaluationContract(depth, motion, reset || g_fg_frames.load() == 0);
+        exception = 0;
+        fg_result = SafeEvaluateFg(&exception);
+        if (exception)
+        {
+            g_neural_list->Close();
+            Log("DLSS-G evaluation exception 0x%08X; frame generation disabled", exception);
+            g_framegen_failed = true;
+            return false;
+        }
+    }
+
+    D3D12_RESOURCE_BARRIER restore[3] = {};
+    UINT restore_count = 0;
+    if (!g_bypass_nr_for_ab)
+        restore[restore_count++] = Transition(g_nr_stage.Get(),
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (evaluate_fg)
+    {
+        restore[restore_count++] = Transition(g_sr_stage.Get(),
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        restore[restore_count++] = Transition(g_fg_stage.Get(),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
     }
     else
-    {
-        g_neural_list->ResourceBarrier(1, &sr_restore);
-    }
+        restore[restore_count++] = Transition(g_sr_stage.Get(),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    g_neural_list->ResourceBarrier(restore_count, restore);
     if (!SubmitNeuralCommands(false)) return false;
     if (NVSDK_NGX_FAILED(nr_result) || NVSDK_NGX_FAILED(sr_result))
     {
@@ -1189,11 +1383,23 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         return false;
     }
 
+    if (evaluate_fg)
+    {
+        if (NVSDK_NGX_SUCCEED(fg_result)) ++g_fg_frames;
+        else
+        {
+            Log("DLSS-G evaluation failed: 0x%08X (%s); falling back to real frames",
+                static_cast<unsigned int>(fg_result), ResultName(fg_result));
+            g_framegen_failed = true;
+        }
+    }
+
     const unsigned long long frame = g_bypass_nr_for_ab ? g_sr_frames.load() + 1 : ++g_nr_frames;
     ++g_sr_frames;
     SetStatus(g_bypass_nr_for_ab ? "diagnostic: NR BYPASSED; DLSS SR only" :
-        "active on present: NR model %d + DLSS SR (%s guides)",
-        g_active_nr_model, use_external_guides ? "same-frame motion" : "fallback");
+        "active on present: NR model %d + DLSS SR + FG %s (%s guides)",
+        g_active_nr_model, (!g_framegen_failed && g_fg_frames.load() > 1) ? "2x" : "warming/fallback",
+        use_external_guides ? "same-frame motion" : "fallback");
     if (frame <= 8 || frame % 1800 == 0)
         Log("on-present frame %llu: NR=%s, SR=Success, model=%d, NR-reset=%d, NR-guides=%s, SR-history=%s, DLSS history mask=%s, input=%ux%u, output=%ux%u",
             frame, g_bypass_nr_for_ab ? "BYPASSED" : "Success", g_active_nr_model,
@@ -1408,7 +1614,7 @@ static bool EnsureProxy(ID3D12Resource *source)
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; heap_desc.NumDescriptors = 2;
     if (SUCCEEDED(hr)) { failed_stage = "Create RTV heap"; hr = device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&g_proxy_rtv_heap)); }
-    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; heap_desc.NumDescriptors = 3; heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; heap_desc.NumDescriptors = 6; heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (SUCCEEDED(hr)) { failed_stage = "Create SRV heap"; hr = device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&g_proxy_srv_heap)); }
 
     D3D12_DESCRIPTOR_RANGE range = {};
@@ -1529,47 +1735,26 @@ static bool AdoptPresentQueue(reshade::api::command_queue *queue)
 
 static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
 {
-    ID3D12Resource *neural_source = g_nr_output;
+    ID3D12Resource *real_source = g_nr_output;
     ID3D12Resource *original_source = g_packed_color.Get();
-    if (g_proxy_hidden || g_sr_frames.load() == 0 || neural_source == nullptr ||
-        original_source == nullptr || backbuffer == nullptr || !EnsureProxy(neural_source)) return false;
+    if (g_proxy_hidden || g_sr_frames.load() == 0 || real_source == nullptr ||
+        original_source == nullptr || backbuffer == nullptr || !EnsureProxy(real_source)) return false;
+
+    const bool use_framegen = g_framegen_enabled && !g_framegen_failed &&
+        g_show_neural_output && g_fg_stage && g_fg_frames.load() >= 2;
+    ID3D12Resource *present_sources[2] = {
+        use_framegen ? g_fg_stage.Get() : real_source,
+        real_source
+    };
+    const UINT present_count = use_framegen ? 2u : 1u;
 
     if (g_proxy_fence_value != 0 && g_proxy_fence->GetCompletedValue() < g_proxy_fence_value)
     {
         g_proxy_fence->SetEventOnCompletion(g_proxy_fence_value, g_proxy_fence_event);
         if (WaitForSingleObject(g_proxy_fence_event, 1000) != WAIT_OBJECT_0) return false;
     }
-    if (FAILED(g_proxy_allocator->Reset()) || FAILED(g_proxy_list->Reset(g_proxy_allocator.Get(), nullptr))) return false;
-    Microsoft::WRL::ComPtr<ID3D12Resource> destination;
-    if (FAILED(g_proxy_swapchain->GetBuffer(g_proxy_swapchain->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&destination)))) return false;
     Microsoft::WRL::ComPtr<ID3D12Device> device;
     if (FAILED(g_command_queue->GetDevice(IID_PPV_ARGS(&device)))) return false;
-
-    ID3D12Resource *sources[3] = {neural_source, original_source, backbuffer};
-    auto srv_handle = g_proxy_srv_heap->GetCPUDescriptorHandleForHeapStart();
-    for (ID3D12Resource *source : sources)
-    {
-        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
-        srv.Format = TypedInputFormat(source->GetDesc().Format); srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; srv.Texture2D.MipLevels = 1;
-        device->CreateShaderResourceView(source, &srv, srv_handle);
-        srv_handle.ptr += g_proxy_srv_stride;
-    }
-
-    D3D12_RESOURCE_BARRIER barriers[8] = {
-        Transition(destination.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET),
-        Transition(neural_source, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-        Transition(original_source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-        Transition(backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-        Transition(destination.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT),
-        Transition(neural_source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-        Transition(original_source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-        Transition(backbuffer, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT)
-    };
-    g_proxy_list->ResourceBarrier(4, barriers);
-    ID3D12DescriptorHeap *heaps[] = {g_proxy_srv_heap.Get()}; g_proxy_list->SetDescriptorHeaps(1, heaps);
-    g_proxy_list->SetGraphicsRootSignature(g_proxy_root_signature.Get()); g_proxy_list->SetPipelineState(g_proxy_pipeline.Get());
-    g_proxy_list->SetGraphicsRootDescriptorTable(0, g_proxy_srv_heap->GetGPUDescriptorHandleForHeapStart());
     float cursor_x = -1000.0f, cursor_y = -1000.0f;
     static float previous_cursor_x = -1000.0f, previous_cursor_y = -1000.0f;
     if (g_reshade_overlay_open.load())
@@ -1599,23 +1784,67 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
         cursor_x, cursor_y, previous_cursor_x, previous_cursor_y
     };
     previous_cursor_x = cursor_x; previous_cursor_y = cursor_y;
-    g_proxy_list->SetGraphicsRoot32BitConstants(1, 8, &constants, 0);
     D3D12_VIEWPORT viewport = {0, 0, static_cast<float>(g_output_width.load()), static_cast<float>(g_output_height.load()), 0, 1};
     D3D12_RECT scissor = {0, 0, static_cast<LONG>(g_output_width.load()), static_cast<LONG>(g_output_height.load())};
-    g_proxy_list->RSSetViewports(1, &viewport); g_proxy_list->RSSetScissorRects(1, &scissor);
-    auto rtv = g_proxy_rtv_heap->GetCPUDescriptorHandleForHeapStart(); rtv.ptr += g_proxy_swapchain->GetCurrentBackBufferIndex() * g_proxy_rtv_stride;
-    g_proxy_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr); g_proxy_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    g_proxy_list->DrawInstanced(3, 1, 0, 0);
-    g_proxy_list->ResourceBarrier(4, barriers + 4);
-    if (FAILED(g_proxy_list->Close())) return false;
-    ID3D12CommandList *lists[] = {g_proxy_list.Get()};
-    g_command_queue->ExecuteCommandLists(1, lists);
-    ++g_proxy_fence_value; g_command_queue->Signal(g_proxy_fence.Get(), g_proxy_fence_value);
-    if (FAILED(g_proxy_swapchain->Present(0, 0))) return false;
-    ++g_frames_presented;
+
+    for (UINT present_index = 0; present_index < present_count; ++present_index)
+    {
+        if (FAILED(g_proxy_allocator->Reset()) ||
+            FAILED(g_proxy_list->Reset(g_proxy_allocator.Get(), nullptr))) return false;
+        Microsoft::WRL::ComPtr<ID3D12Resource> destination;
+        const UINT buffer_index = g_proxy_swapchain->GetCurrentBackBufferIndex();
+        if (FAILED(g_proxy_swapchain->GetBuffer(buffer_index, IID_PPV_ARGS(&destination)))) return false;
+        ID3D12Resource *neural_source = present_sources[present_index];
+        ID3D12Resource *sources[3] = {neural_source, original_source, backbuffer};
+        auto srv_handle = g_proxy_srv_heap->GetCPUDescriptorHandleForHeapStart();
+        srv_handle.ptr += static_cast<SIZE_T>(present_index) * 3 * g_proxy_srv_stride;
+        for (ID3D12Resource *source : sources)
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+            srv.Format = TypedInputFormat(source->GetDesc().Format); srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; srv.Texture2D.MipLevels = 1;
+            device->CreateShaderResourceView(source, &srv, srv_handle);
+            srv_handle.ptr += g_proxy_srv_stride;
+        }
+        D3D12_RESOURCE_BARRIER barriers[8] = {
+            Transition(destination.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET),
+            Transition(neural_source, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+            Transition(original_source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+            Transition(backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+            Transition(destination.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT),
+            Transition(neural_source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+            Transition(original_source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            Transition(backbuffer, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT)
+        };
+        g_proxy_list->ResourceBarrier(4, barriers);
+        ID3D12DescriptorHeap *heaps[] = {g_proxy_srv_heap.Get()}; g_proxy_list->SetDescriptorHeaps(1, heaps);
+        g_proxy_list->SetGraphicsRootSignature(g_proxy_root_signature.Get()); g_proxy_list->SetPipelineState(g_proxy_pipeline.Get());
+        auto gpu_srv = g_proxy_srv_heap->GetGPUDescriptorHandleForHeapStart();
+        gpu_srv.ptr += static_cast<UINT64>(present_index) * 3 * g_proxy_srv_stride;
+        g_proxy_list->SetGraphicsRootDescriptorTable(0, gpu_srv);
+        g_proxy_list->SetGraphicsRoot32BitConstants(1, 8, &constants, 0);
+        g_proxy_list->RSSetViewports(1, &viewport); g_proxy_list->RSSetScissorRects(1, &scissor);
+        auto rtv = g_proxy_rtv_heap->GetCPUDescriptorHandleForHeapStart(); rtv.ptr += buffer_index * g_proxy_rtv_stride;
+        g_proxy_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr); g_proxy_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g_proxy_list->DrawInstanced(3, 1, 0, 0);
+        g_proxy_list->ResourceBarrier(4, barriers + 4);
+        if (FAILED(g_proxy_list->Close())) return false;
+        ID3D12CommandList *lists[] = {g_proxy_list.Get()};
+        g_command_queue->ExecuteCommandLists(1, lists);
+        ++g_proxy_fence_value; g_command_queue->Signal(g_proxy_fence.Get(), g_proxy_fence_value);
+        if (FAILED(g_proxy_swapchain->Present(use_framegen ? 1u : 0u, 0))) return false;
+        ++g_frames_presented;
+        if (present_index + 1 < present_count)
+        {
+            g_proxy_fence->SetEventOnCompletion(g_proxy_fence_value, g_proxy_fence_event);
+            if (WaitForSingleObject(g_proxy_fence_event, 1000) != WAIT_OBJECT_0) return false;
+        }
+    }
     const unsigned long long post_frame = ++g_post_reshade_frames;
     if (post_frame == 1)
         Log("post-ReShade native presentation active; effects and overlay are available to the proxy compositor");
+    if (use_framegen && post_frame == 2)
+        Log("experimental DLSS-G presentation active: generated frame then real frame, synchronized at 2x cadence");
     return true;
 }
 
@@ -1825,6 +2054,15 @@ static void DrawOverlay(reshade::api::effect_runtime *)
             g_stable_sr_history ? "per-frame reset with zero motion" : "experimental temporal VORT motion");
     }
     ImGui::TextDisabled("Recommended for generic OnPresent use; NR still receives VORT motion.");
+    if (ImGui::Checkbox("Experimental DLSS Frame Generation (2x)", &g_framegen_enabled))
+    {
+        reshade::set_config_value(nullptr, section, "FrameGeneration", g_framegen_enabled ? "1" : "0");
+        g_fg_frames = 0;
+        g_need_history_reset = true;
+        Log("experimental DLSS-G changed to %s", g_framegen_enabled ? "enabled" : "disabled");
+    }
+    ImGui::TextDisabled(g_framegen_failed ? "DLSS-G unavailable/failed; real-frame fallback is active." :
+        "Presents one generated frame followed by one real frame; F10 original bypasses FG.");
     if (ImGui::Checkbox("Diagnostic A/B: bypass feature 18 (DLSS SR only)", &g_bypass_nr_for_ab))
     {
         g_need_history_reset = true;
@@ -1846,8 +2084,10 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::Separator();
     ImGui::Text("Status: %s", g_neural_status);
     ImGui::TextUnformatted("Activation boundary: game OnPresent (standalone private NGX runtime)");
-    ImGui::Text("Pipeline: feature 18 NR frames=%llu; DLSS SR frames=%llu; active model=%d%s",
-        g_nr_frames.load(), g_sr_frames.load(), g_active_nr_model, g_bypass_nr_for_ab ? " (NR BYPASSED)" : "");
+    ImGui::Text("Pipeline: NR=%llu; SR=%llu; generated=%llu; FG=%s; active model=%d%s",
+        g_nr_frames.load(), g_sr_frames.load(), g_fg_frames.load(),
+        g_framegen_failed ? "failed/off" : (g_framegen_enabled ? "2x" : "off"),
+        g_active_nr_model, g_bypass_nr_for_ab ? " (NR BYPASSED)" : "");
     ImGui::Text("Contract: %ux%u -> %ux%u", g_input_width.load(), g_input_height.load(), g_output_width.load(), g_output_height.load());
     ImGui::Text("NR guides: %s; DLSS SR history: %s; validation mask=%s",
         g_using_external_guides ? "same-frame VORT optical flow" : "internal zero-motion fallback",
@@ -1919,6 +2159,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("SkinStructure", "-1.0", value, sizeof(value)); g_nr_skin_structure = std::clamp(static_cast<float>(atof(value)), -1.0f, 1.0f);
         read_setting("ResetEveryFrame", "0", value, sizeof(value)); g_reset_every_frame = strcmp(value, "0") != 0;
         read_setting("StableSrHistory", "1", value, sizeof(value)); g_stable_sr_history = strcmp(value, "0") != 0;
+        read_setting("FrameGeneration", "1", value, sizeof(value)); g_framegen_enabled = strcmp(value, "0") != 0;
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
         Log("Standalone DLSS-NR + SR %s attached; profile=%s model=%d", ADDON_VERSION, ProfileName(g_color_profile), g_nr_model);
@@ -1958,7 +2199,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         if (g_nr_output) g_nr_output->Release();
         g_captured_depth.Reset(); g_captured_motion.Reset(); g_captured_mask.Reset();
         g_fallback_depth.Reset(); g_fallback_motion.Reset(); g_guide_rtv_heap.Reset();
-        g_sr_stage.Reset(); g_nr_stage.Reset(); g_packed_color.Reset();
+        g_fg_stage.Reset(); g_sr_stage.Reset(); g_nr_stage.Reset(); g_packed_color.Reset();
         g_neural_list.Reset(); g_neural_allocator.Reset(); g_neural_fence.Reset(); g_neural_device.Reset();
         if (g_neural_fence_event) CloseHandle(g_neural_fence_event);
         if (g_command_queue) g_command_queue->Release();

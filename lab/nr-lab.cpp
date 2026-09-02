@@ -14,6 +14,7 @@
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_params.h>
 #include <nvsdk_ngx_defs_dlssd.h>
+#include <nvsdk_ngx_defs_dlssg.h>
 
 #include <algorithm>
 #include <cstdarg>
@@ -47,6 +48,7 @@ struct Options {
     float skin_structure = -1.0f;
     bool nr_only = false;
     bool compact_nr = false;
+    bool framegen = false;
 };
 
 static UINT NrWidth(const Options &o) { return o.compact_nr ? o.input_w : o.output_w; }
@@ -67,6 +69,7 @@ struct Context {
     NVSDK_NGX_Parameter *params = nullptr;
     NVSDK_NGX_Handle *feature = nullptr;
     NVSDK_NGX_Handle *sr_feature = nullptr;
+    NVSDK_NGX_Handle *fg_feature = nullptr;
     bool ngx_initialized = false;
 };
 
@@ -103,6 +106,7 @@ using NgxBridgeShutdownD3D12 = NVSDK_NGX_Result (NVSDK_CONV *)(NgxShutdownD3D12,
 static HMODULE g_core_module = nullptr;
 static HMODULE g_nr_module = nullptr;
 static HMODULE g_dlss_module = nullptr;
+static HMODULE g_dlssg_module = nullptr;
 static HMODULE g_bridge_module = nullptr;
 static HMODULE g_nvapi_module = nullptr;
 static LUID g_nvapi_luid = {};
@@ -115,6 +119,10 @@ static NgxReleaseFeature g_nr_release_feature = nullptr;
 static NgxShutdownD3D12 g_nr_shutdown = nullptr;
 static NgxCreateFeature g_dlss_create_feature = nullptr;
 static NgxEvaluateFeature g_dlss_evaluate_feature = nullptr;
+static NgxCreateFeature g_dlssg_create_feature = nullptr;
+static NgxEvaluateFeature g_dlssg_evaluate_feature = nullptr;
+static NgxReleaseFeature g_dlssg_release_feature = nullptr;
+static NgxPopulateParameters g_dlssg_populate_parameters = nullptr;
 static NgxBridgeCreateFeature g_bridge_create_feature = nullptr;
 static NgxBridgeEvaluateFeature g_bridge_evaluate_feature = nullptr;
 static NgxBridgeReleaseFeature g_bridge_release_feature = nullptr;
@@ -721,6 +729,34 @@ static bool InitNgx()
         dlss_path_utf8, static_cast<unsigned>(result), ResultName(result));
     if (NVSDK_NGX_FAILED(result)) return false;
 
+    wchar_t dlssg_path[MAX_PATH] = {};
+    swprintf_s(dlssg_path, L"%snvngx_dlssg.dll", runtime_path);
+    g_dlssg_module = LoadLibraryExW(dlssg_path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    Log("DLSS-G snippet LoadLibraryEx = %p (error=%lu)", g_dlssg_module,
+        g_dlssg_module ? 0 : GetLastError());
+    if (g_dlssg_module == nullptr) return false;
+    InstallNgxDebugCapture(g_dlssg_module);
+    auto dlssg_init = reinterpret_cast<NgxSnippetInitD3D12Ext>(GetProcAddress(
+        g_dlssg_module, "NVSDK_NGX_D3D12_Init_Ext"));
+    g_dlssg_create_feature = reinterpret_cast<NgxCreateFeature>(GetProcAddress(
+        g_dlssg_module, "NVSDK_NGX_D3D12_CreateFeature"));
+    g_dlssg_evaluate_feature = reinterpret_cast<NgxEvaluateFeature>(GetProcAddress(
+        g_dlssg_module, "NVSDK_NGX_D3D12_EvaluateFeature"));
+    g_dlssg_release_feature = reinterpret_cast<NgxReleaseFeature>(GetProcAddress(
+        g_dlssg_module, "NVSDK_NGX_D3D12_ReleaseFeature"));
+    g_dlssg_populate_parameters = reinterpret_cast<NgxPopulateParameters>(GetProcAddress(
+        g_dlssg_module, "NVSDK_NGX_D3D12_PopulateParameters_Impl"));
+    if (dlssg_init == nullptr || g_dlssg_create_feature == nullptr ||
+        g_dlssg_evaluate_feature == nullptr || g_dlssg_release_feature == nullptr ||
+        g_dlssg_populate_parameters == nullptr) {
+        Log("FAIL DLSS-G snippet is missing required D3D12 exports");
+        return false;
+    }
+    result = bridge_init(dlssg_init, kGenericCustomCoreId, dlssg_path, g.device,
+        NVSDK_NGX_Version_API, nullptr);
+    Log("DLSS-G snippet Init_Ext = 0x%08X (%s)", static_cast<unsigned>(result), ResultName(result));
+    if (NVSDK_NGX_FAILED(result)) return false;
+
     result = core_get_capabilities(&g.params);
     Log("driver-core GetCapabilityParameters = 0x%08X (%s), ptr=%p", static_cast<unsigned>(result), ResultName(result), g.params);
     if (NVSDK_NGX_FAILED(result) || g.params == nullptr) return false;
@@ -982,6 +1018,27 @@ static NVSDK_NGX_Result SafeEvaluateSrFeature(DWORD *seh_code)
     __except (EXCEPTION_EXECUTE_HANDLER) { *seh_code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7fffffff); }
 }
 
+static NVSDK_NGX_Result SafeCreateFgFeature(DWORD *seh_code)
+{
+    *seh_code = 0;
+    __try {
+        return g_bridge_create_feature(g_dlssg_create_feature, g.list,
+            NVSDK_NGX_Feature_FrameGeneration,
+            g_traced_params != nullptr ? g_traced_params : g.params, &g.fg_feature);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *seh_code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7fffffff); }
+}
+
+static NVSDK_NGX_Result SafeEvaluateFgFeature(DWORD *seh_code)
+{
+    *seh_code = 0;
+    __try {
+        return g_bridge_evaluate_feature(g_dlssg_evaluate_feature, g.list, g.fg_feature,
+            g_traced_params != nullptr ? g_traced_params : g.params, nullptr);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *seh_code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7fffffff); }
+}
+
 static void SetCreationContract(const Options &o, int flags)
 {
     const UINT nr_width = NrWidth(o), nr_height = NrHeight(o);
@@ -1101,6 +1158,36 @@ static bool CreateSrFeature(const Options &o, int flags)
     Log("CreateFeature(feature=SuperSampling) = 0x%08X (%s), handle=%p quality=%d",
         static_cast<unsigned>(result), ResultName(result), g.sr_feature, quality);
     return NVSDK_NGX_SUCCEED(result) && g.sr_feature != nullptr;
+}
+
+static bool CreateFgFeature(const Options &o, DXGI_FORMAT format)
+{
+    g.params->Reset();
+    const NVSDK_NGX_Result populate_result =
+        g_bridge_populate_parameters(g_dlssg_populate_parameters, g.params);
+    Log("DLSS-G PopulateParameters_Impl = 0x%08X (%s)",
+        static_cast<unsigned>(populate_result), ResultName(populate_result));
+    g.params->Set("CreationNodeMask", 1u);
+    g.params->Set("VisibilityNodeMask", 1u);
+    g.params->Set("Width", o.output_w);
+    g.params->Set("Height", o.output_h);
+    g.params->Set("DLSSG.BackbufferFormat", static_cast<unsigned>(format));
+    g.params->Set("DLSSG.InternalWidth", o.input_w);
+    g.params->Set("DLSSG.InternalHeight", o.input_h);
+    g.params->Set("DLSSG.DynamicResolution", 0u);
+
+    if (!BeginCommands()) return false;
+    DWORD exception_code = 0;
+    const NVSDK_NGX_Result result = SafeCreateFgFeature(&exception_code);
+    if (exception_code != 0) {
+        g.list->Close();
+        Log("FAIL DLSS-G creation raised SEH 0x%08X", exception_code);
+        return false;
+    }
+    if (!SubmitAndWait()) return false;
+    Log("CreateFeature(feature=FrameGeneration) = 0x%08X (%s), handle=%p",
+        static_cast<unsigned>(result), ResultName(result), g.fg_feature);
+    return NVSDK_NGX_SUCCEED(result) && g.fg_feature != nullptr;
 }
 
 static void SetEvaluationContract(const Options &o, ID3D12Resource *color, ID3D12Resource *output,
@@ -1249,6 +1336,82 @@ static bool EvaluateSrFrame(const Options &o, ID3D12Resource *color, ID3D12Resou
     return NVSDK_NGX_SUCCEED(result);
 }
 
+static bool EvaluateFgFrame(const Options &o, ID3D12Resource *real_frame,
+    ID3D12Resource *interpolated_frame, ID3D12Resource *depth,
+    ID3D12Resource *motion, bool reset, UINT frame)
+{
+    static float identity[4][4] = {
+        {1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}
+    };
+    g.params->Set("DLSSG.Backbuffer", real_frame);
+    g.params->Set("DLSSG.MVecs", motion);
+    g.params->Set("DLSSG.Depth", depth);
+    g.params->Set("DLSSG.HUDLess", real_frame);
+    g.params->Set("DLSSG.OutputInterpolated", interpolated_frame);
+    g.params->Set("DLSSG.MultiFrameCount", 1u);
+    g.params->Set("DLSSG.MultiFrameIndex", 1u);
+    g.params->Set("DLSSG.CameraViewToClip", reinterpret_cast<void *>(identity));
+    g.params->Set("DLSSG.ClipToCameraView", reinterpret_cast<void *>(identity));
+    g.params->Set("DLSSG.ClipToLensClip", reinterpret_cast<void *>(identity));
+    g.params->Set("DLSSG.ClipToPrevClip", reinterpret_cast<void *>(identity));
+    g.params->Set("DLSSG.PrevClipToClip", reinterpret_cast<void *>(identity));
+    g.params->Set("DLSSG.JitterOffsetX", 0.0f);
+    g.params->Set("DLSSG.JitterOffsetY", 0.0f);
+    g.params->Set("DLSSG.MvecScaleX", 1.0f / static_cast<float>(o.input_w));
+    g.params->Set("DLSSG.MvecScaleY", 1.0f / static_cast<float>(o.input_h));
+    g.params->Set("DLSSG.CameraPinholeOffsetX", 0.0f);
+    g.params->Set("DLSSG.CameraPinholeOffsetY", 0.0f);
+    g.params->Set("DLSSG.CameraPosX", 0.0f); g.params->Set("DLSSG.CameraPosY", 0.0f); g.params->Set("DLSSG.CameraPosZ", 0.0f);
+    g.params->Set("DLSSG.CameraUpX", 0.0f); g.params->Set("DLSSG.CameraUpY", 1.0f); g.params->Set("DLSSG.CameraUpZ", 0.0f);
+    g.params->Set("DLSSG.CameraRightX", 1.0f); g.params->Set("DLSSG.CameraRightY", 0.0f); g.params->Set("DLSSG.CameraRightZ", 0.0f);
+    g.params->Set("DLSSG.CameraFwdX", 0.0f); g.params->Set("DLSSG.CameraFwdY", 0.0f); g.params->Set("DLSSG.CameraFwdZ", 1.0f);
+    g.params->Set("DLSSG.CameraNear", 0.1f);
+    g.params->Set("DLSSG.CameraFar", 1000.0f);
+    g.params->Set("DLSSG.CameraFOV", 1.04719755f);
+    g.params->Set("DLSSG.CameraAspectRatio", static_cast<float>(o.output_w) / o.output_h);
+    g.params->Set("DLSSG.ColorBuffersHDR", o.profile == ColorProfile::Srgb ? 0u : 1u);
+    g.params->Set("DLSSG.DepthInverted", 1u);
+    g.params->Set("DLSSG.CameraMotionIncluded", 1u);
+    g.params->Set("DLSSG.Reset", reset ? 1u : 0u);
+    g.params->Set("DLSSG.AutomodeOverrideReset", 0u);
+    g.params->Set("DLSSG.NotRenderingGameFrames", 0u);
+    g.params->Set("DLSSG.OrthoProjection", 0u);
+    g.params->Set("DLSSG.MvecInvalidValue", -99999.0f);
+    g.params->Set("DLSSG.MvecDilated", 0u);
+    g.params->Set("DLSSG.MenuDetectionEnabled", 0u);
+    g.params->Set("DLSSG.BackbufferFrameID", frame);
+    for (const char *prefix : {"DLSSG.MVecsSubrect", "DLSSG.DepthSubrect"}) {
+        std::string key = std::string(prefix) + "BaseX"; g.params->Set(key.c_str(), 0u);
+        key = std::string(prefix) + "BaseY"; g.params->Set(key.c_str(), 0u);
+        key = std::string(prefix) + "Width"; g.params->Set(key.c_str(), o.input_w);
+        key = std::string(prefix) + "Height"; g.params->Set(key.c_str(), o.input_h);
+    }
+    for (const char *prefix : {"DLSSG.InputBackbufferSubrect", "DLSSG.HUDLessSubrect",
+        "DLSSG.OutputInterpolatedSubrect"}) {
+        std::string key = std::string(prefix) + "BaseX"; g.params->Set(key.c_str(), 0u);
+        key = std::string(prefix) + "BaseY"; g.params->Set(key.c_str(), 0u);
+        key = std::string(prefix) + "Width"; g.params->Set(key.c_str(), o.output_w);
+        key = std::string(prefix) + "Height"; g.params->Set(key.c_str(), o.output_h);
+    }
+
+    if (!BeginCommands()) return false;
+    Barrier(real_frame, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    DWORD exception_code = 0;
+    const NVSDK_NGX_Result result = SafeEvaluateFgFeature(&exception_code);
+    if (exception_code != 0) {
+        g.list->Close();
+        Log("FAIL frame %u DLSS-G EvaluateFeature raised SEH 0x%08X", frame, exception_code);
+        return false;
+    }
+    Barrier(real_frame, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (!SubmitAndWait()) return false;
+    Log("frame %u DLSS-G EvaluateFeature = 0x%08X (%s)", frame,
+        static_cast<unsigned>(result), ResultName(result));
+    return NVSDK_NGX_SUCCEED(result);
+}
+
 static bool ReadbackTexture(ID3D12Resource *texture, D3D12_RESOURCE_STATES before,
     std::vector<uint8_t> *tight, UINT *out_row_pitch)
 {
@@ -1369,7 +1532,8 @@ static void WriteResultJson(const Options &o, bool created, UINT evaluations, co
         "  \"upscalingValidated\": %s\n"
         "}\n",
         created ? "true" : "false", evaluations, o.input_w, o.input_h, o.output_w, o.output_h,
-        o.model, ProfileName(o.profile), o.nr_only ? "nr-only" : "nr-plus-dlss-sr",
+        o.model, ProfileName(o.profile), o.nr_only ? "nr-only" :
+            (o.framegen ? "nr-plus-dlss-sr-plus-framegen" : "nr-plus-dlss-sr"),
         o.compact_nr ? "true" : "false", g_nr_resolved_scaling_ratio, coverage.total,
         coverage.quadrant[0], coverage.quadrant[1], coverage.quadrant[2], coverage.quadrant[3],
         static_cast<unsigned long long>(coverage.checksum), pass ? "true" : "false");
@@ -1407,7 +1571,9 @@ static int Run(const Options &o)
     ID3D12Resource *motion = MakeTexture(o.input_w, o.input_h, DXGI_FORMAT_R16G16_FLOAT, false);
     ID3D12Resource *nr_output = MakeTexture(nr_width, nr_height, color_format, true);
     ID3D12Resource *output = MakeTexture(o.output_w, o.output_h, color_format, true);
-    if (color == nullptr || depth == nullptr || motion == nullptr || nr_output == nullptr || output == nullptr) {
+    ID3D12Resource *fg_output = MakeTexture(o.output_w, o.output_h, color_format, true);
+    if (color == nullptr || depth == nullptr || motion == nullptr || nr_output == nullptr ||
+        output == nullptr || fg_output == nullptr) {
         Log("FAIL resource allocation");
         return 2;
     }
@@ -1424,7 +1590,8 @@ static int Run(const Options &o)
         !UploadTexture(depth, depth_data, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) ||
         !UploadTexture(motion, motion_data, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) ||
         !UploadTexture(nr_output, nr_sentinel, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) ||
-        !UploadTexture(output, sentinel, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) {
+        !UploadTexture(output, sentinel, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) ||
+        !UploadTexture(fg_output, sentinel, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) {
         Log("FAIL deterministic texture upload");
         return 2;
     }
@@ -1442,16 +1609,24 @@ static int Run(const Options &o)
         Log("VERDICT FAIL: DLSS-NR created, but the DLSS Super Resolution stage did not");
         return 3;
     }
+    if (o.framegen && !CreateFgFeature(o, color_format)) {
+        Coverage empty;
+        WriteResultJson(o, true, 0, empty, false);
+        Log("VERDICT FAIL: NR and SR created, but DLSS Frame Generation did not");
+        return 3;
+    }
 
     UINT good = 0;
     for (UINT frame = 0; frame < o.frames; ++frame) {
         if (!EvaluateFrame(o, color, nr_output, depth, motion, frame == 0, frame)) break;
         if (!o.nr_only && !EvaluateSrFrame(o, nr_output, output, depth, motion, frame == 0, frame)) break;
+        if (o.framegen && !EvaluateFgFrame(o, output, fg_output, depth, motion,
+            frame == 0, frame)) break;
         ++good;
     }
 
     std::vector<uint8_t> result;
-    ID3D12Resource *measured_output = o.nr_only ? nr_output : output;
+    ID3D12Resource *measured_output = o.nr_only ? nr_output : (o.framegen ? fg_output : output);
     if (good == 0 || !ReadbackTexture(measured_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &result, nullptr)) {
         Coverage empty;
         WriteResultJson(o, true, good, empty, false);
@@ -1554,10 +1729,12 @@ int main(int argc, char **argv)
             options.nr_only = true;
         } else if (strcmp(arg, "--compact-nr") == 0) {
             options.compact_nr = true;
+        } else if (strcmp(arg, "--framegen") == 0) {
+            options.framegen = true;
         } else if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
             std::printf("nr-lab [--input 960x540] [--output 1920x1080] [--frames N] [--model 1|2|3]\n"
                         "       [--profile srgb|scrgb|hdr10] [--intensity F] [--local-tone F]\n"
-                        "       [--local-structure F] [--skin-structure F] [--nr-only] [--compact-nr]\n");
+                        "       [--local-structure F] [--skin-structure F] [--nr-only] [--compact-nr] [--framegen]\n");
             return 0;
         } else {
             Log("unknown argument: %s", arg);
@@ -1573,6 +1750,11 @@ int main(int argc, char **argv)
         Log("invalid contract: --compact-nr with an enlarged --output requires the downstream DLSS SR stage");
         return 64;
     }
+    if (options.nr_only && options.framegen) {
+        Log("invalid contract: --framegen requires the DLSS SR stage");
+        return 64;
+    }
+    if (options.framegen) options.frames = std::max(options.frames, 2u);
 
     Log("DLSS-NR standalone laboratory build %s %s", __DATE__, __TIME__);
     int code = 1;
