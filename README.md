@@ -5,15 +5,17 @@ Bring Neural Rendering, DLAA/DLSS Super Resolution, and Frame Generation to supp
 ## Quick install
 
 > [!IMPORTANT]
-> The release contains **two required downloads**. Install both `standalone-dlssnr.addon64` **and** `nvngx.dll`. The addon will not initialize with only the `.addon64` file.
+> Install both required binaries: `standalone-dlssnr.addon64` **and** `nvngx.dll`. The addon will not initialize with only the `.addon64` file. Releases starting with v1.7.16 also include the companion `DLSS5_AIO_Feed.fx` shader.
 
 1. Install a 64-bit ReShade build with addon support into the folder containing the game's real executable. Launchers often use a different folder, so target the executable that renders the game.
 2. Open the [latest release](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/latest) and download:
    - `standalone-dlssnr.addon64`
    - `nvngx.dll` (the required caller bridge)
-3. Put both files beside the game's ReShade DLL and executable. RHI users may instead put them in `%LOCALAPPDATA%\RHI\Custom\Addons`.
-4. Supply `nvngx_dlssnr.dll`, `nvngx_dlss.dll`, and optionally `nvngx_dlssg.dll` from sources whose licenses permit your use. These NVIDIA runtimes cannot be distributed in this repository. The simplest arrangement is to place them beside the addon; see [`runtime/README.md`](runtime/README.md).
-5. Start the game and open ReShade. Confirm that **Standalone DLSS-NR + SR** appears under the Add-ons tab.
+   - `DLSS5_AIO_Feed.fx` (the companion guide shader)
+3. Put both binary files beside the game's ReShade DLL and executable. RHI users may instead put them in `%LOCALAPPDATA%\RHI\Custom\Addons`.
+4. Put `DLSS5_AIO_Feed.fx` in the game's ReShade shader directory, normally `reshade-shaders\Shaders`. It is uniquely named for this addon and will not replace the upstream DLSS5-Feeder project's `DLSS5_Feed.fx`.
+5. Supply `nvngx_dlssnr.dll`, `nvngx_dlss.dll`, and optionally `nvngx_dlssg.dll` from sources whose licenses permit your use. These NVIDIA runtimes cannot be distributed in this repository. The simplest arrangement is to place them beside the addon; see [`runtime/README.md`](runtime/README.md).
+6. Start the game and open ReShade. Confirm that **Standalone DLSS-NR + SR** appears under the Add-ons tab.
 
 ## First-launch setup
 
@@ -37,6 +39,7 @@ Reduced-resolution DLSS SR can provide major performance improvements. Native-re
 | --- | --- |
 | Addon is missing from ReShade | Confirm ReShade has addon support, the game is 64-bit, and `standalone-dlssnr.addon64` is beside the actual game executable/ReShade DLL. |
 | `required private runtime dependency missing` | Install `nvngx.dll` **as well as** the addon. Also place `nvngx_dlssnr.dll` and `nvngx_dlss.dll` beside them. `nvngx_dlssg.dll` is needed for Frame Generation. |
+| Overlay reports fallback or zero-motion guides | Install `DLSS5_AIO_Feed.fx` under `reshade-shaders\Shaders` and install VORT Motion under the same shader search path. The addon remains usable without them, but temporal guidance is reduced. |
 | Lower resolution still says DLAA | Switch between fullscreen, borderless, and windowed. The game must create a genuinely smaller backbuffer before DLSS SR can activate. Restart the game after changing resolution or display mode. |
 | Image is small, smeared, or changes size | Restart the game. Set the resolution and display mode before loading gameplay. Press F10 once to confirm whether the presentation proxy is active. |
 | ReShade menu temporarily makes the image smaller | Close the ReShade menu; the native-size processed output should return. This is a known proxy-input workaround in some games. |
@@ -50,6 +53,14 @@ Reduced-resolution DLSS SR can provide major performance improvements. Native-re
 - Some games temporarily show their lower-resolution image while the ReShade menu is open.
 - No Man's Sky and potentially other Vulkan games may not display the ReShade menu correctly.
 - Additional game-specific and Vulkan issues are expected.
+
+## Companion guide shader
+
+`DLSS5_AIO_Feed.fx` is this project's ReShade companion effect. The addon schedules it at Present after VORT Motion and before NGX evaluation. It converts VORT's optical flow to the pixel-space motion format expected by DLSS, captures ReShade depth, and creates a history-rejection mask around invalid reprojections and depth boundaries.
+
+Install it under the game's configured ReShade shader search path, normally `reshade-shaders\Shaders`. Install the third-party VORT Motion shader alongside it if you want same-frame optical-flow guidance. When either integration is unavailable, the addon falls back to internal zero-motion and constant-depth guides.
+
+The filename, technique, and exported guide resources use the `DLSS5_AIO_*` namespace. This is intentionally separate from the original DLSS5-Feeder project's `DLSS5_Feed.fx`, so both shaders can coexist without one overwriting or binding the other.
 
 ## Technical details
 
@@ -108,7 +119,9 @@ Run `addon\build.bat`. The available runtime set is emitted under `addon\build`:
 - `nvngx_dlssnr.dll` (the exact tested NR runtime)
 - `nvngx_dlss.dll`
 - `nvngx_dlssg.dll`
-- `DLSS5_Feed.fx`
+- `DLSS5_AIO_Feed.fx`
+
+Every GitHub release from v1.7.16 onward must attach `standalone-dlssnr.addon64`, `nvngx.dll`, and `DLSS5_AIO_Feed.fx`. The NVIDIA runtime DLLs remain user-supplied and must not be attached to public releases.
 
 The game may be set to fullscreen or borderless at the desired render resolution. A native-resolution game swapchain selects DLAA automatically; a lower-resolution swapchain selects DLSS Super Resolution. The addon keeps the desktop at native resolution, rejects auxiliary/helper swapchains, and presents the processed native output in its proxy window.
 
@@ -136,6 +149,8 @@ Version 1.7.14 adds a persisted `Enable Neural Rendering` checkbox, enabled by d
 
 Version 1.7.15 adds automatic DLAA selection for native-resolution games. When the game render dimensions exactly match the native output, the addon creates the NGX Super Sampling feature with `NVSDK_NGX_PerfQuality_Value_DLAA` and a 1:1 input/output contract. Lower resolutions continue selecting the existing DLSS Super Resolution quality modes. NR and optional Frame Generation remain available in either path, and the overlay/log now identify the active reconstruction mode explicitly.
 
+Version 1.7.16 renames this addon's companion shader, technique, and guide resources to the `DLSS5_AIO_*` namespace. `DLSS5_AIO_Feed.fx` can coexist with the upstream DLSS5-Feeder project's `DLSS5_Feed.fx` without overwriting or binding it. The namespaced shader is included as a release asset beginning with this version and is part of the required asset checklist for future releases.
+
 Version 1.4 uses `GetCapabilityParameters`, restores the snippet's provider callbacks after each parameter reset, and invokes NVIDIA's scaling-ratio callback during NR creation. Packed color and NR output are now allocated at the game's reduced render resolution; only the DLSS SR output is native-sized. This is the tested low-cost topology and removes the previous native-sized NR intermediates.
 
 Version 1.5 adds an experimental direct-NGX DLSS Frame Generation stage. It evaluates feature 11 after the completed native DLSS SR frame and presents one generated frame followed by the current real frame through the existing proxy. The stage is enabled by default, has a live overlay toggle, warms up for two real frames, and automatically falls back to real-frame presentation if creation or evaluation fails. F10's stretched-original diagnostic deliberately remains single-present and bypasses frame generation. The standalone laboratory exposes the same path with `--framegen`; SDR and HDR probes require full generated-frame coverage and produce a checksum distinct from the real SR frame.
@@ -156,7 +171,7 @@ Version 1.7 adds 64-bit Windows Vulkan transport while retaining the verified pr
 
 Vulkan requires ReShade's 64-bit global implicit layer rather than a per-game `dxgi.dll`. The addon normally hooks `vkCreateDevice` early enough to enable the external-memory, external-semaphore, dedicated-allocation, and timeline-semaphore features itself. If `standalone-dlssnr.log` reports missing Vulkan interop entry points, use `addon\build\VulkanLayer\run-with-standalone-vulkan-layer.bat "path\to\game.exe"`; that per-launch fallback enables the same extensions without registering another global layer. It has no per-frame code. Native Linux/Proton and 32-bit Vulkan are not part of version 1.7.
 
-Version 1.3 renders `vort_MotionEffects` and `DLSS5_Feed` explicitly inside the game `OnPresent` callback, then flushes that current-frame guide work before NGX evaluation. `DLSS5_Feed.fx` reads VORT's pooled `MotVectTexVort`, converts its delta-UV flow to pixel units, and also captures raw game depth. Both techniques remain disabled in ReShade's ordinary effect list because the addon schedules them itself in the required order. The overlay reports `same-frame VORT optical flow` only when those passes and correctly sized `R16G16_FLOAT` motion / `R32_FLOAT` depth resources are present; otherwise it reports and uses the internal zero-motion fallback.
+Version 1.3 renders `vort_MotionEffects` and `DLSS5_AIO_Feed` explicitly inside the game `OnPresent` callback, then flushes that current-frame guide work before NGX evaluation. `DLSS5_AIO_Feed.fx` reads VORT's pooled `MotVectTexVort`, converts its delta-UV flow to pixel units, and also captures raw game depth. Both techniques remain disabled in ReShade's ordinary effect list because the addon schedules them itself in the required order. The overlay reports `same-frame VORT optical flow` only when those passes and correctly sized `R16G16_FLOAT` motion / `R32_FLOAT` depth resources are present; otherwise it reports and uses the internal zero-motion fallback.
 
 Version 1.3.2 keeps that NGX evaluation at `OnPresent`, but defers the native proxy blit until ReShade's post-effects/post-overlay boundary. The stretched-original F10 view therefore contains ReShade's completed frame. In neural mode, the default `Composite ReShade effects/overlay` option compares that completed frame with the untouched pre-overlay input and carries changed pixels, including the FPS counter and ReShade menu, onto the neural output.
 
@@ -164,7 +179,7 @@ Version 1.3.3 makes the native proxy click-through while ReShade reports its men
 
 Version 1.3.4 replaces passive click-through with an explicit low-level button bridge owned by the proxy thread. It activates only while ReShade's menu is open and Conan is the foreground window, routes button/wheel events to Conan's ReShade input window, and suppresses the duplicate proxy-targeted event. The compositor masks ReShade's one-frame-delayed software cursor at both its current and previous positions, leaving the Windows cursor as the single visible pointer.
 
-The VORT shader provider must be installed in the game's ReShade shader search path alongside `DLSS5_Feed.fx`. On this Conan test installation it is deployed under `reshade-shaders\Shaders\VortShaders`, with the standard `ReShade.fxh` headers at the shader root. This fixes the previous event-ordering defect where ReShade rendered guides only after the addon's Present callback, so NGX consumed stale or zero motion even though its evaluate call returned success.
+The VORT shader provider must be installed in the game's ReShade shader search path alongside `DLSS5_AIO_Feed.fx`. On this Conan test installation it is deployed under `reshade-shaders\Shaders\VortShaders`, with the standard `ReShade.fxh` headers at the shader root. This fixes the previous event-ordering defect where ReShade rendered guides only after the addon's Present callback, so NGX consumed stale or zero motion even though its evaluate call returned success.
 
 The persistent game log is `%LOCALAPPDATA%\RHI\Logs\standalone-dlssnr.log`. It reports runtime discovery, core/snippet initialization, both feature creation results, per-stage evaluation failures, the active input/output contract, and initial successful frames.
 

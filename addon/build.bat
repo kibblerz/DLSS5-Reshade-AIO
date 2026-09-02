@@ -4,6 +4,7 @@ cd /d "%~dp0"
 set "FEEDER_ROOT=%~dp0..\external\DLSS5-Feeder"
 call "%FEEDER_ROOT%\tools\vcvars.bat" x64 || exit /b 1
 if not exist build mkdir build
+if exist "build\DLSS5_Feed.fx" del /q "build\DLSS5_Feed.fx"
 
 cl /nologo /std:c++17 /O2 /EHsc /W4 /MD /LD ^
   src\nvngx-bridge.cpp /Fo:build\nvngx-bridge.obj /Fe:build\nvngx.dll ^
@@ -31,7 +32,7 @@ for %%F in (nvngx_dlssnr.dll nvngx_dlss.dll nvngx_dlssg.dll) do (
     echo WARNING: runtime\%%F is absent; it will not be included in the package.
   )
 )
-copy /y "shaders\DLSS5_Feed.fx" "build\DLSS5_Feed.fx" >nul || exit /b 1
+copy /y "shaders\DLSS5_AIO_Feed.fx" "build\DLSS5_AIO_Feed.fx" >nul || exit /b 1
 copy /y "shaders\StandaloneBoundary.fx" "build\StandaloneBoundary.fx" >nul || exit /b 1
 echo Building Vulkan fallback layer from %CD%
 call "%FEEDER_ROOT%\layer\build-layer.bat" || exit /b 1

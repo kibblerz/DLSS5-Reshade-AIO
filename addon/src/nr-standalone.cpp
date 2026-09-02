@@ -28,7 +28,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.15-dlaa"
+#define ADDON_VERSION "1.7.16-aio-feed"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -1765,11 +1765,11 @@ static void SetFgEvaluationContract(ID3D12Resource *depth, ID3D12Resource *motio
 static void ResolveHandles(reshade::api::effect_runtime *runtime)
 {
     g_runtime = runtime;
-    g_feed_technique = runtime->find_technique("DLSS5_Feed.fx", "DLSS5_Feed");
+    g_feed_technique = runtime->find_technique("DLSS5_AIO_Feed.fx", "DLSS5_AIO_Feed");
     g_motion_technique = runtime->find_technique("vort_Motion.fx", "vort_MotionEffects");
-    g_mv_variable = runtime->find_texture_variable("DLSS5_Feed.fx", "DLSS5_MV");
-    g_depth_variable = runtime->find_texture_variable("DLSS5_Feed.fx", "DLSS5_Depth");
-    g_mask_variable = runtime->find_texture_variable("DLSS5_Feed.fx", "DLSS5_Mask");
+    g_mv_variable = runtime->find_texture_variable("DLSS5_AIO_Feed.fx", "DLSS5_AIO_MV");
+    g_depth_variable = runtime->find_texture_variable("DLSS5_AIO_Feed.fx", "DLSS5_AIO_Depth");
+    g_mask_variable = runtime->find_texture_variable("DLSS5_AIO_Feed.fx", "DLSS5_AIO_Mask");
     char reversed[16] = {};
     g_depth_reversed = !runtime->get_preprocessor_definition("RESHADE_DEPTH_INPUT_IS_REVERSED", reversed) || atoi(reversed) != 0;
     // These are rendered explicitly from OnPresent, in this order, so their
@@ -1898,7 +1898,7 @@ static void OnRenderTechnique(reshade::api::effect_runtime *runtime, reshade::ap
     g_captured_depth = depth;
     g_captured_mask = g_mask_available ? mask : nullptr;
     if (first_capture)
-        Log("captured DLSS5_Feed resources for same-frame on-present evaluation: %ux%u; DLSS history rejection mask=%s",
+        Log("captured DLSS5_AIO_Feed resources for same-frame on-present evaluation: %ux%u; DLSS history rejection mask=%s",
             static_cast<unsigned int>(color_desc.Width), color_desc.Height, g_mask_available ? "active" : "missing");
 }
 
@@ -1957,7 +1957,7 @@ static bool RenderCurrentFrameGuides(ID3D12Resource *backbuffer)
 
     const unsigned long long frame = ++g_current_guide_frames;
     if (frame <= 4 || frame % 1800 == 0)
-        Log("same-frame VORT optical flow + DLSS5_Feed submitted before NGX: frame=%llu", frame);
+        Log("same-frame VORT optical flow + DLSS5_AIO_Feed submitted before NGX: frame=%llu", frame);
     return CapturedGuidesMatchInput();
 }
 
