@@ -28,7 +28,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.14-nr-toggle"
+#define ADDON_VERSION "1.7.14-zzz-early-init"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -67,8 +67,15 @@ static HANDLE g_proxy_fence_event;
 static UINT64 g_proxy_fence_value;
 static bool g_proxy_allow_tearing;
 static bool g_proxy_failed;
-static std::atomic<bool> g_proxy_initializing{false};
-static std::atomic<unsigned int> g_proxy_initialization_deferrals{0};
+// PATCH(zzz-deadlock): all proxy window/factory/swapchain initialization runs on a
+// background thread. Creating DXGI objects from inside the game's Present callback
+// deadlocks D3D11On12 titles (Zenless Zone Zero): the present thread stalls inside
+// ReShade-redirected DXGI calls while the game's own ResizeBuffers waits for that
+// Present to return, leaving the process unresponsive.
+static std::atomic<bool> g_proxy_init_requested{false};
+static std::atomic<bool> g_proxy_ready{false};
+static HANDLE g_proxy_init_thread;
+static Microsoft::WRL::ComPtr<ID3D12Resource> g_proxy_init_source;
 static std::atomic<bool> g_proxy_hidden{false};
 static bool g_show_neural_output = true;
 static bool g_pending_proxy_frame;
@@ -1777,6 +1784,8 @@ static void ResolveHandles(reshade::api::effect_runtime *runtime)
         Log("same-frame optical-flow path unavailable; internal zero-motion fallback will be used");
 }
 
+static bool InitProxyPresentation(ID3D12Resource *source, ID3D12CommandQueue *queue);
+
 static void OnInitEffectRuntime(reshade::api::effect_runtime *runtime)
 {
     if (runtime == nullptr) return;
@@ -1812,6 +1821,45 @@ static void OnInitEffectRuntime(reshade::api::effect_runtime *runtime)
     }
     if (g_game_window == nullptr && runtime_window != nullptr)
         g_game_window = runtime_window;
+    // PATCH(zzz-deadlock-2): NVIDIA's DXGI interposer lazily creates a D3D11On12
+    // wrap device the first time a foreign thread creates a DXGI factory. Once
+    // the game's D3D11On12 composition loop is actively presenting, that lazy
+    // init hangs forever and the stuck thread then poisons the process (the
+    // game later hangs inside its own D3D11CreateDevice, e.g. while loading
+    // user data). Initialize the native proxy presentation path right here, on
+    // the game's runtime-init thread, before the first Present, while the
+    // device is still idle. The queue is validated at the first OnPresent; if
+    // the game presents on a different queue the proxy is dropped gracefully.
+    if (!g_proxy_ready.load(std::memory_order_acquire) && !g_proxy_failed &&
+        !g_proxy_init_requested.exchange(true) &&
+        runtime->get_device()->get_api() == reshade::api::device_api::d3d12)
+    {
+        reshade::api::command_queue *api_queue = runtime->get_command_queue();
+        ID3D12CommandQueue *native_queue = api_queue != nullptr ?
+            reinterpret_cast<ID3D12CommandQueue *>(api_queue->get_native()) : nullptr;
+        if (native_queue != nullptr)
+        {
+            g_command_queue = native_queue; // provisional; validated in AdoptPresentQueue
+            g_command_queue->AddRef();
+            g_rs_queue = api_queue;
+            if (InitProxyPresentation(nullptr, native_queue))
+            {
+                Log("native proxy initialized early at effect-runtime init (idle-device safe path)");
+                // Keep the topmost proxy window hidden until the neural pipeline
+                // is ready to present real frames (shown in the neural-ready path).
+                if (g_proxy_window != nullptr) ShowWindow(g_proxy_window, SW_HIDE);
+            }
+            else if (g_command_queue != nullptr)
+            {
+                g_command_queue->Release();
+                g_command_queue = nullptr;
+            }
+        }
+        else
+        {
+            g_proxy_init_requested = false; // allow the background fallback later
+        }
+    }
     ResolveHandles(runtime);
 }
 static void OnReloadedEffects(reshade::api::effect_runtime *runtime) { if (!g_runtime || runtime == g_runtime) ResolveHandles(runtime); }
@@ -2431,58 +2479,48 @@ static DWORD WINAPI ProxyWindowThread(void *)
     return 0;
 }
 
-static bool EnsureProxy(ID3D12Resource *source)
+// PATCH(zzz-deadlock-2): the proxy presentation path can be initialized in two
+// ways. The early path runs inline on the game's effect-runtime-init thread,
+// before the first Present, while the D3D11On12 device is still idle. The
+// background path is only a fallback for exotic setups. Once the game's
+// D3D11On12 composition loop is actively presenting, creating a DXGI factory
+// from any other thread deadlocks NVIDIA's DXGI interposer: it lazily wraps the
+// busy device in an 11on12 layer and never returns, and the stuck thread then
+// poisons the process (the game hangs later inside its own D3D11CreateDevice).
+// source == nullptr selects the early path (no neural output exists yet; the
+// per-frame SRVs are created in PresentProxyAfterReshade anyway).
+static bool InitProxyPresentation(ID3D12Resource *source, ID3D12CommandQueue *queue)
 {
-    if (source == nullptr || g_command_queue == nullptr || g_game_window == nullptr)
-        return false;
-
-    // Creating a proxy swapchain can re-enter ReShade's Present callbacks on
-    // some injectors. Do not let that nested callback (or a concurrent game
-    // Present) start a second UI thread/window while the first swapchain is
-    // still inside CreateSwapChainForHwnd.
-    bool expected = false;
-    if (!g_proxy_initializing.compare_exchange_strong(expected, true,
-        std::memory_order_acquire, std::memory_order_relaxed))
+    if (queue == nullptr || g_game_window == nullptr)
     {
-        const unsigned int deferred = ++g_proxy_initialization_deferrals;
-        if (deferred <= 4)
-            Log("native proxy initialization already in progress; deferring nested Present (%u)", deferred);
+        if (source != nullptr) g_proxy_failed = true;
+        g_proxy_init_source.Reset();
         return false;
     }
-    struct ProxyInitializationGuard
-    {
-        ~ProxyInitializationGuard()
-        {
-            g_proxy_initializing.store(false, std::memory_order_release);
-        }
-    } initialization_guard;
-
-    if (g_proxy_swapchain || g_proxy_failed)
-        return g_proxy_swapchain != nullptr;
-
-    const D3D12_RESOURCE_DESC source_desc = source->GetDesc();
+    const D3D12_RESOURCE_DESC source_desc = source != nullptr ? source->GetDesc() : D3D12_RESOURCE_DESC{};
     const UINT width = g_output_width.load(), height = g_output_height.load();
-    if (source_desc.Width != width || source_desc.Height != height)
+    if (source != nullptr && (source_desc.Width != width || source_desc.Height != height))
     {
-        static bool logged = false;
-        if (!logged) { Log("native presentation waiting: captured NR resource is %llux%u, expected %ux%u",
-            source_desc.Width, source_desc.Height, width, height); logged = true; }
+        Log("native presentation waiting: captured NR resource is %llux%u, expected %ux%u",
+            source_desc.Width, source_desc.Height, width, height);
+        g_proxy_failed = true;
+        g_proxy_init_source.Reset();
         return false;
     }
 
     HMONITOR monitor = MonitorFromWindow(g_game_window, MONITOR_DEFAULTTONEAREST);
     MONITORINFO monitor_info = {sizeof(monitor_info)};
-    if (!GetMonitorInfoW(monitor, &monitor_info)) { g_proxy_failed = true; return false; }
+    if (!GetMonitorInfoW(monitor, &monitor_info)) { g_proxy_failed = true; g_proxy_init_source.Reset(); return false; }
     g_proxy_window_ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_proxy_window_thread = CreateThread(nullptr, 0, ProxyWindowThread, nullptr, 0, nullptr);
     if (g_proxy_window_thread == nullptr || WaitForSingleObject(g_proxy_window_ready, 3000) != WAIT_OBJECT_0 || g_proxy_window == nullptr)
     {
         Log("native presentation failed: proxy UI thread/window error=%lu", GetLastError());
-        g_proxy_failed = true; return false;
+        g_proxy_failed = true; g_proxy_init_source.Reset(); return false;
     }
     SetForegroundWindow(g_game_window);
 
-    DXGI_FORMAT present_format = source_desc.Format;
+    DXGI_FORMAT present_format = source != nullptr ? source_desc.Format : DXGI_FORMAT_R8G8B8A8_UNORM;
     switch (present_format)
     {
     case DXGI_FORMAT_R8G8B8A8_TYPELESS: present_format = DXGI_FORMAT_R8G8B8A8_UNORM; break;
@@ -2503,9 +2541,11 @@ static bool EnsureProxy(ID3D12Resource *source)
         present_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     else
         present_format = DXGI_FORMAT_R10G10B10A2_UNORM;
-    Log("native proxy initialization: source=%llux%u source_format=%u present_format=%u queue=%p window=%p",
-        source_desc.Width, source_desc.Height, static_cast<unsigned int>(source_desc.Format),
-        static_cast<unsigned int>(present_format), g_command_queue, g_proxy_window);
+    Log("native proxy initialization: %s source=%llux%u source_format=%u present_format=%u queue=%p window=%p",
+        source != nullptr ? "deferred" : "early",
+        source != nullptr ? source_desc.Width : 0, source != nullptr ? source_desc.Height : 0,
+        static_cast<unsigned int>(source != nullptr ? source_desc.Format : present_format),
+        static_cast<unsigned int>(present_format), queue, g_proxy_window);
 
     Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
@@ -2524,7 +2564,7 @@ static bool EnsureProxy(ID3D12Resource *source)
     desc.Scaling = DXGI_SCALING_STRETCH; desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
     if (g_proxy_allow_tearing) desc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
     Microsoft::WRL::ComPtr<IDXGISwapChain1> swapchain1;
-    if (SUCCEEDED(hr)) { failed_stage = "CreateSwapChainForHwnd"; hr = factory->CreateSwapChainForHwnd(g_command_queue, g_proxy_window, &desc, nullptr, nullptr, &swapchain1); }
+    if (SUCCEEDED(hr)) { failed_stage = "CreateSwapChainForHwnd"; hr = factory->CreateSwapChainForHwnd(queue, g_proxy_window, &desc, nullptr, nullptr, &swapchain1); }
     if (SUCCEEDED(hr)) { failed_stage = "IDXGISwapChain3"; hr = swapchain1.As(&g_proxy_swapchain); }
     if (SUCCEEDED(hr) && g_active_color_profile == ColorProfile::Srgb)
     {
@@ -2549,7 +2589,7 @@ static bool EnsureProxy(ID3D12Resource *source)
         Log("native proxy HLG/Rec.2020 compatibility color space: hr=0x%08X", static_cast<unsigned int>(color_hr));
     }
     Microsoft::WRL::ComPtr<ID3D12Device> device;
-    if (SUCCEEDED(hr)) { failed_stage = "ID3D12CommandQueue::GetDevice"; hr = g_command_queue->GetDevice(IID_PPV_ARGS(&device)); }
+    if (SUCCEEDED(hr)) { failed_stage = "ID3D12CommandQueue::GetDevice"; hr = queue->GetDevice(IID_PPV_ARGS(&device)); }
     for (UINT index = 0; index < 2 && SUCCEEDED(hr); ++index)
     {
         failed_stage = "CreateCommandAllocator";
@@ -2639,22 +2679,69 @@ static bool EnsureProxy(ID3D12Resource *source)
             device->CreateRenderTargetView(buffer.Get(), nullptr, rtv); rtv.ptr += g_proxy_rtv_stride;
         }
         D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
-        srv.Format = TypedInputFormat(source_desc.Format); srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Format = TypedInputFormat(source != nullptr ? source_desc.Format : DXGI_FORMAT_R8G8B8A8_UNORM); srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; srv.Texture2D.MipLevels = 1;
-        device->CreateShaderResourceView(source, &srv, g_proxy_srv_heap->GetCPUDescriptorHandleForHeapStart());
+        if (source != nullptr) // early mode has no neural output yet; per-frame SRVs are created in PresentProxyAfterReshade
+            device->CreateShaderResourceView(source, &srv, g_proxy_srv_heap->GetCPUDescriptorHandleForHeapStart());
     }
     if (SUCCEEDED(hr)) g_proxy_fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (FAILED(hr) || g_proxy_fence_event == nullptr)
     {
         Log("native presentation initialization failed at %s: hr=0x%08X win32=%lu", failed_stage, static_cast<unsigned int>(hr), GetLastError());
         g_proxy_failed = true; if (g_proxy_window) { DestroyWindow(g_proxy_window); g_proxy_window = nullptr; }
-        g_proxy_swapchain.Reset(); return false;
+        g_proxy_swapchain.Reset(); g_proxy_init_source.Reset(); return false;
     }
     g_proxy_present_format = present_format;
     Log("native proxy ready: %ux%u source_format=%u present_format=%u hwnd=%p tearing=%s", width, height,
-        static_cast<unsigned int>(source_desc.Format), static_cast<unsigned int>(present_format), g_proxy_window,
+        static_cast<unsigned int>(source != nullptr ? source_desc.Format : present_format), static_cast<unsigned int>(present_format), g_proxy_window,
         g_proxy_allow_tearing ? "supported" : "unavailable");
+    g_proxy_init_source.Reset();
+    // Publish only after every proxy resource (swapchain, command lists, PSO,
+    // descriptor heaps, fence event) is fully constructed.
+    g_proxy_ready.store(true, std::memory_order_release);
     return true;
+}
+
+static DWORD WINAPI ProxyInitThread(void *)
+{
+    InitProxyPresentation(g_proxy_init_source.Get(), g_command_queue);
+    return 0;
+}
+
+static bool EnsureProxy(ID3D12Resource *source)
+{
+    if (source == nullptr || g_command_queue == nullptr || g_game_window == nullptr)
+        return false;
+    if (g_proxy_ready.load(std::memory_order_acquire) || g_proxy_failed)
+        return g_proxy_ready.load(std::memory_order_acquire) && !g_proxy_failed;
+
+    // PATCH(zzz-deadlock): request the background initialization exactly once
+    // and return immediately. The present thread never blocks on DXGI work, so
+    // the game's own Present/ResizeBuffers can always complete.
+    if (!g_proxy_init_requested.exchange(true))
+    {
+        const D3D12_RESOURCE_DESC source_desc = source->GetDesc();
+        const UINT width = g_output_width.load(), height = g_output_height.load();
+        if (source_desc.Width != width || source_desc.Height != height)
+        {
+            static bool logged = false;
+            if (!logged) { Log("native presentation waiting: captured NR resource is %llux%u, expected %ux%u",
+                source_desc.Width, source_desc.Height, width, height); logged = true; }
+            g_proxy_init_requested = false; // retry on a later frame with matching dimensions
+            return false;
+        }
+        g_proxy_init_source = source; // ComPtr assignment AddRefs for the init thread
+        g_proxy_init_thread = CreateThread(nullptr, 0, ProxyInitThread, nullptr, 0, nullptr);
+        if (g_proxy_init_thread == nullptr)
+        {
+            Log("native proxy initialization thread creation failed: error=%lu", GetLastError());
+            g_proxy_failed = true;
+            g_proxy_init_source.Reset();
+            return false;
+        }
+        Log("native proxy initialization moved to background thread (present-thread deadlock fix)");
+    }
+    return g_proxy_ready.load(std::memory_order_acquire);
 }
 
 static void OnInitCommandQueue(reshade::api::command_queue *queue)
@@ -2674,10 +2761,20 @@ static bool AdoptPresentQueue(reshade::api::command_queue *queue)
         g_rs_queue = queue;
         return true;
     }
-    if (g_neural_ready || g_proxy_swapchain)
+    if (g_neural_ready)
     {
         Fail("game OnPresent queue changed after initialization");
         return false;
+    }
+    if (g_proxy_ready.load(std::memory_order_acquire))
+    {
+        // PATCH(zzz-deadlock-2): the proxy was early-initialized on the
+        // effect-runtime queue, but the game presents on a different queue.
+        // The proxy swapchain cannot be re-bound to the real present queue
+        // after the fact, so drop it; the neural pipeline still runs normally.
+        Log("native proxy disabled: game present queue differs from early-init queue (%p != %p)",
+            static_cast<void *>(native), static_cast<void *>(g_command_queue));
+        g_proxy_failed = true;
     }
     if (g_command_queue) g_command_queue->Release();
     g_rs_queue = queue;
@@ -2946,10 +3043,28 @@ static bool OnReshadeOpenOverlay(reshade::api::effect_runtime *runtime, bool ope
     return false;
 }
 
+// PATCH(zzz-deadlock): background proxy initialization can re-enter the game's
+// Present callback on the init thread. Never run two OnPresent bodies
+// concurrently; same-thread nesting (the game's own composition re-present)
+// keeps running exactly like before.
+static std::atomic<int> g_on_present_depth{0};
+static std::atomic<DWORD> g_on_present_thread{0};
+
 static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain,
     const reshade::api::rect *, const reshade::api::rect *, uint32_t, const reshade::api::rect *)
 {
     if (!queue || !swapchain) return;
+    {
+        const DWORD current_thread = GetCurrentThreadId();
+        if (g_on_present_depth.load() > 0 && g_on_present_thread.load() != current_thread)
+            return; // another thread is mid-present; skip this re-entered frame
+        if (g_on_present_depth.fetch_add(1) == 0)
+            g_on_present_thread.store(current_thread);
+    }
+    struct OnPresentDepthGuard
+    {
+        ~OnPresentDepthGuard() { g_on_present_depth.fetch_sub(1); }
+    } on_present_depth_guard;
     const HWND present_window = static_cast<HWND>(swapchain->get_hwnd());
     if (g_game_window && present_window && present_window != g_game_window) return;
     if (!g_game_window && present_window) g_game_window = present_window;
@@ -3440,6 +3555,15 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
         reshade::unregister_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
         if (g_proxy_fence_event) CloseHandle(g_proxy_fence_event);
+        // PATCH(zzz-deadlock): make sure the background proxy initialization
+        // thread is finished before releasing the resources it may still use.
+        if (g_proxy_init_thread)
+        {
+            if (WaitForSingleObject(g_proxy_init_thread, 5000) != WAIT_OBJECT_0)
+                Log("native proxy initialization thread did not finish during unload");
+            CloseHandle(g_proxy_init_thread);
+        }
+        g_proxy_init_source.Reset();
         g_proxy_pipeline.Reset(); g_proxy_root_signature.Reset(); g_proxy_srv_heap.Reset(); g_proxy_rtv_heap.Reset();
         for (UINT index = 0; index < 2; ++index)
         {
