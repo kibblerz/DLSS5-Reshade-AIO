@@ -9,6 +9,7 @@ using NgxEvaluateFeature = unsigned long (__cdecl *)(ID3D12GraphicsCommandList *
     const void *, const void *, void *);
 using NgxReleaseFeature = unsigned long (__cdecl *)(void *);
 using NgxShutdownD3D12 = unsigned long (__cdecl *)(ID3D12Device *);
+using NgxPopulateParameters = unsigned long (__cdecl *)(void *);
 
 // NVIDIA's DLSS-NR snippet verifies that Init_Ext was called from a module whose
 // filename contains "nvngx.dll". Keep this as a real, non-tail-called boundary:
@@ -25,6 +26,15 @@ extern "C" __declspec(dllexport) unsigned long __cdecl NVNGXBridge_D3D12_InitExt
     if (init == nullptr) return 0xBAD00005UL;
     volatile unsigned long result = init(application_id, application_data_path,
         device, api_version, feature_common_info);
+    MemoryBarrier();
+    return result;
+}
+
+extern "C" __declspec(dllexport) unsigned long __cdecl NVNGXBridge_D3D12_PopulateParameters(
+    NgxPopulateParameters populate, void *parameters)
+{
+    if (populate == nullptr || parameters == nullptr) return 0xBAD00005UL;
+    volatile unsigned long result = populate(parameters);
     MemoryBarrier();
     return result;
 }

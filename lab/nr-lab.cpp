@@ -45,7 +45,12 @@ struct Options {
     float local_tone = 1.0f;
     float local_structure = 1.0f;
     float skin_structure = -1.0f;
+    bool nr_only = false;
+    bool compact_nr = false;
 };
+
+static UINT NrWidth(const Options &o) { return o.compact_nr ? o.input_w : o.output_w; }
+static UINT NrHeight(const Options &o) { return o.compact_nr ? o.input_h : o.output_h; }
 
 struct Context {
     IDXGIFactory6 *factory = nullptr;
@@ -77,6 +82,9 @@ using NgxBridgeInitD3D12Ext = NVSDK_NGX_Result (NVSDK_CONV *)(NgxSnippetInitD3D1
     unsigned long long, const wchar_t *, ID3D12Device *, NVSDK_NGX_Version,
     const NVSDK_NGX_Parameter *);
 using NgxAllocateParameters = NVSDK_NGX_Result (NVSDK_CONV *)(NVSDK_NGX_Parameter **);
+using NgxGetCapabilityParameters = NVSDK_NGX_Result (NVSDK_CONV *)(NVSDK_NGX_Parameter **);
+using NgxPopulateParameters = NVSDK_NGX_Result (NVSDK_CONV *)(NVSDK_NGX_Parameter *);
+using NgxBridgePopulateParameters = NVSDK_NGX_Result (NVSDK_CONV *)(NgxPopulateParameters, NVSDK_NGX_Parameter *);
 using NgxDestroyParameters = NVSDK_NGX_Result (NVSDK_CONV *)(NVSDK_NGX_Parameter *);
 using NgxCreateFeature = NVSDK_NGX_Result (NVSDK_CONV *)(ID3D12GraphicsCommandList *,
     NVSDK_NGX_Feature, NVSDK_NGX_Parameter *, NVSDK_NGX_Handle **);
@@ -111,6 +119,10 @@ static NgxBridgeCreateFeature g_bridge_create_feature = nullptr;
 static NgxBridgeEvaluateFeature g_bridge_evaluate_feature = nullptr;
 static NgxBridgeReleaseFeature g_bridge_release_feature = nullptr;
 static NgxBridgeShutdownD3D12 g_bridge_shutdown = nullptr;
+static NgxBridgePopulateParameters g_bridge_populate_parameters = nullptr;
+static NgxPopulateParameters g_nr_populate_parameters = nullptr;
+static NgxPopulateParameters g_nr_compute_scaling_ratio = nullptr;
+static float g_nr_resolved_scaling_ratio = 1.0f;
 static NVSDK_NGX_Parameter *g_traced_params = nullptr;
 
 using NvApiQueryInterface = void *(__cdecl *)(unsigned int);
@@ -640,21 +652,24 @@ static bool InitNgx()
             g_bridge_module, "NVNGXBridge_D3D12_ReleaseFeature"));
         g_bridge_shutdown = reinterpret_cast<NgxBridgeShutdownD3D12>(GetProcAddress(
             g_bridge_module, "NVNGXBridge_D3D12_Shutdown1"));
+        g_bridge_populate_parameters = reinterpret_cast<NgxBridgePopulateParameters>(GetProcAddress(
+            g_bridge_module, "NVNGXBridge_D3D12_PopulateParameters"));
     }
     Log("caller-identity bridge module=%p init=%p create=%p evaluate=%p release=%p shutdown=%p",
         g_bridge_module, bridge_init, g_bridge_create_feature, g_bridge_evaluate_feature,
         g_bridge_release_feature, g_bridge_shutdown);
     if (bridge_init == nullptr || g_bridge_create_feature == nullptr ||
         g_bridge_evaluate_feature == nullptr || g_bridge_release_feature == nullptr ||
-        g_bridge_shutdown == nullptr) return false;
+        g_bridge_shutdown == nullptr || g_bridge_populate_parameters == nullptr) return false;
 
     g_core_module = LoadInstalledNgxCore();
     if (g_core_module == nullptr) { Log("FAIL could not locate the driver _nvngx.dll"); return false; }
     auto core_init = reinterpret_cast<NgxCoreInitD3D12>(GetProcAddress(g_core_module, "NVSDK_NGX_D3D12_Init"));
-    auto core_allocate = reinterpret_cast<NgxAllocateParameters>(GetProcAddress(g_core_module, "NVSDK_NGX_D3D12_AllocateParameters"));
+    auto core_get_capabilities = reinterpret_cast<NgxGetCapabilityParameters>(GetProcAddress(
+        g_core_module, "NVSDK_NGX_D3D12_GetCapabilityParameters"));
     g_core_destroy_parameters = reinterpret_cast<NgxDestroyParameters>(GetProcAddress(g_core_module, "NVSDK_NGX_D3D12_DestroyParameters"));
     g_core_shutdown = reinterpret_cast<NgxShutdownD3D12>(GetProcAddress(g_core_module, "NVSDK_NGX_D3D12_Shutdown1"));
-    if (core_init == nullptr || core_allocate == nullptr || g_core_destroy_parameters == nullptr || g_core_shutdown == nullptr) {
+    if (core_init == nullptr || core_get_capabilities == nullptr || g_core_destroy_parameters == nullptr || g_core_shutdown == nullptr) {
         Log("FAIL driver core is missing required D3D12 parameter/lifecycle exports");
         return false;
     }
@@ -706,9 +721,24 @@ static bool InitNgx()
         dlss_path_utf8, static_cast<unsigned>(result), ResultName(result));
     if (NVSDK_NGX_FAILED(result)) return false;
 
-    result = core_allocate(&g.params);
-    Log("driver-core AllocateParameters = 0x%08X (%s), ptr=%p", static_cast<unsigned>(result), ResultName(result), g.params);
+    result = core_get_capabilities(&g.params);
+    Log("driver-core GetCapabilityParameters = 0x%08X (%s), ptr=%p", static_cast<unsigned>(result), ResultName(result), g.params);
     if (NVSDK_NGX_FAILED(result) || g.params == nullptr) return false;
+    g_nr_populate_parameters = reinterpret_cast<NgxPopulateParameters>(GetProcAddress(
+        g_nr_module, "NVSDK_NGX_D3D12_PopulateParameters_Impl"));
+    result = g_bridge_populate_parameters(g_nr_populate_parameters, g.params);
+    Log("NR PopulateParameters_Impl = 0x%08X (%s)", static_cast<unsigned>(result), ResultName(result));
+    for (const char *name : {"DLSSNRComputeScalingRatioCallback", "DLSSNRGetStatsCallback",
+        "ResourceAllocCallback", "ResourceReleaseCallback"})
+    {
+        void *callback = nullptr;
+        const NVSDK_NGX_Result get_result = g.params->Get(name, &callback);
+        Log("populated callback %-36s get=0x%08X ptr=%p", name,
+            static_cast<unsigned>(get_result), callback);
+        if (strcmp(name, "DLSSNRComputeScalingRatioCallback") == 0 && NVSDK_NGX_SUCCEED(get_result))
+            g_nr_compute_scaling_ratio = reinterpret_cast<NgxPopulateParameters>(callback);
+    }
+    if (NVSDK_NGX_FAILED(result)) return false;
     g_traced_params = new TracingParameters(g.params);
     g.ngx_initialized = true;
     return true;
@@ -954,18 +984,34 @@ static NVSDK_NGX_Result SafeEvaluateSrFeature(DWORD *seh_code)
 
 static void SetCreationContract(const Options &o, int flags)
 {
+    const UINT nr_width = NrWidth(o), nr_height = NrHeight(o);
     g.params->Reset();
+    // PopulateParameters installs feature-18's provider callbacks into the
+    // parameter object. Reset removes them, so restore them for every create
+    // contract exactly as an NGX host integration is expected to do.
+    if (g_nr_populate_parameters != nullptr) {
+        const NVSDK_NGX_Result populate_result =
+            g_bridge_populate_parameters(g_nr_populate_parameters, g.params);
+        Log("creation PopulateParameters_Impl = 0x%08X (%s)",
+            static_cast<unsigned>(populate_result), ResultName(populate_result));
+    }
     g.params->Set("CreationNodeMask", 1u);
     g.params->Set("VisibilityNodeMask", 1u);
     g.params->Set("Width", o.input_w);
     g.params->Set("Height", o.input_h);
-    g.params->Set("OutWidth", o.output_w);
-    g.params->Set("OutHeight", o.output_h);
+    g.params->Set("OutWidth", nr_width);
+    g.params->Set("OutHeight", nr_height);
     g.params->Set("ResourceWidth", o.input_w);
     g.params->Set("ResourceHeight", o.input_h);
-    g.params->Set("ResourceOutWidth", o.output_w);
-    g.params->Set("ResourceOutHeight", o.output_h);
-    g.params->Set("PerfQualityValue", static_cast<int>(NVSDK_NGX_PerfQuality_Value_MaxQuality));
+    g.params->Set("ResourceOutWidth", nr_width);
+    g.params->Set("ResourceOutHeight", nr_height);
+    const float requested_ratio = static_cast<float>(o.input_w) / static_cast<float>(nr_width);
+    const int quality = requested_ratio >= 0.72f ? NVSDK_NGX_PerfQuality_Value_UltraQuality
+        : requested_ratio >= 0.62f ? NVSDK_NGX_PerfQuality_Value_MaxQuality
+        : requested_ratio >= 0.54f ? NVSDK_NGX_PerfQuality_Value_Balanced
+        : requested_ratio >= 0.42f ? NVSDK_NGX_PerfQuality_Value_MaxPerf
+        : NVSDK_NGX_PerfQuality_Value_UltraPerformance;
+    g.params->Set("PerfQualityValue", quality);
     g.params->Set("DLSS.Feature.Create.Flags", flags);
     g.params->Set("DLSS.Enable.Output.Subrects", 0);
     g.params->Set("DLSS.Denoise.Mode", 1);
@@ -974,15 +1020,15 @@ static void SetCreationContract(const Options &o, int flags)
     g.params->Set("DLSSNR.Enabled", 1u);
     g.params->Set("DLSSNR.InputWidth", o.input_w);
     g.params->Set("DLSSNR.InputHeight", o.input_h);
-    g.params->Set("DLSSNR.Width", o.output_w);
-    g.params->Set("DLSSNR.Height", o.output_h);
-    g.params->Set("DLSSNR.OutputWidth", o.output_w);
-    g.params->Set("DLSSNR.OutputHeight", o.output_h);
-    g.params->Set("Output.Width", o.output_w);
-    g.params->Set("Output.Height", o.output_h);
+    g.params->Set("DLSSNR.Width", nr_width);
+    g.params->Set("DLSSNR.Height", nr_height);
+    g.params->Set("DLSSNR.OutputWidth", nr_width);
+    g.params->Set("DLSSNR.OutputHeight", nr_height);
+    g.params->Set("Output.Width", nr_width);
+    g.params->Set("Output.Height", nr_height);
     g.params->Set("DLSSNR.Upscaling", 1u);
-    g.params->Set("DLSSNR.ScalingRatio", static_cast<float>(o.input_w) / static_cast<float>(o.output_w));
-    g.params->Set("DLSSNR.Scale", static_cast<float>(o.input_w) / static_cast<float>(o.output_w));
+    g.params->Set("DLSSNR.ScalingRatio", requested_ratio);
+    g.params->Set("DLSSNR.Scale", requested_ratio);
     g.params->Set("DLSSNR.Hint.Render.Preset", o.model);
     g.params->Set("DLSSNR.Intensity", o.intensity);
     g.params->Set("DLSSNR.LocalToneStrength", o.local_tone);
@@ -990,6 +1036,19 @@ static void SetCreationContract(const Options &o, int flags)
     g.params->Set("DLSSNR.SkinStructureStrength", o.skin_structure);
     g.params->Set("DLSSNR.UseAutoMask", 1u);
     g.params->Set("DLSSNR.UICorrection", 0u);
+    if (g_nr_compute_scaling_ratio != nullptr) {
+        const NVSDK_NGX_Result ratio_result = g_nr_compute_scaling_ratio(g.params);
+        float resolved_ratio = requested_ratio;
+        const NVSDK_NGX_Result get_result = g.params->Get("DLSSNR.ScalingRatio", &resolved_ratio);
+        g.params->Set("DLSSNR.Scale", resolved_ratio);
+        g_nr_resolved_scaling_ratio = resolved_ratio;
+        Log("DLSSNRComputeScalingRatioCallback quality=%d result=0x%08X (%s), get=0x%08X requested=%.6f resolved=%.6f",
+            quality, static_cast<unsigned>(ratio_result), ResultName(ratio_result),
+            static_cast<unsigned>(get_result), requested_ratio, resolved_ratio);
+    } else {
+        Log("WARN DLSSNRComputeScalingRatioCallback is unavailable; using requested ratio %.6f",
+            requested_ratio);
+    }
 }
 
 static bool CreateNrFeature(const Options &o, int flags)
@@ -1097,18 +1156,20 @@ static void SetEvaluationContract(const Options &o, ID3D12Resource *color, ID3D1
     g.params->Set("DLSSNR.DepthSubrectHeight", static_cast<int>(o.input_h));
     g.params->Set("DLSSNR.OutputSubrectBaseX", 0);
     g.params->Set("DLSSNR.OutputSubrectBaseY", 0);
-    g.params->Set("DLSSNR.OutputSubrectWidth", static_cast<int>(o.output_w));
-    g.params->Set("DLSSNR.OutputSubrectHeight", static_cast<int>(o.output_h));
+    g.params->Set("DLSSNR.OutputSubrectWidth", static_cast<int>(NrWidth(o)));
+    g.params->Set("DLSSNR.OutputSubrectHeight", static_cast<int>(NrHeight(o)));
     g.params->Set("DLSSNR.DepthInverted", 1u);
     g.params->Set("DLSSNR.InputWidth", o.input_w);
     g.params->Set("DLSSNR.InputHeight", o.input_h);
-    g.params->Set("DLSSNR.Width", o.output_w);
-    g.params->Set("DLSSNR.Height", o.output_h);
-    g.params->Set("DLSSNR.OutputWidth", o.output_w);
-    g.params->Set("DLSSNR.OutputHeight", o.output_h);
+    g.params->Set("DLSSNR.Width", NrWidth(o));
+    g.params->Set("DLSSNR.Height", NrHeight(o));
+    g.params->Set("DLSSNR.OutputWidth", NrWidth(o));
+    g.params->Set("DLSSNR.OutputHeight", NrHeight(o));
     g.params->Set("DLSSNR.Upscaling", 1u);
-    g.params->Set("DLSSNR.ScalingRatio", static_cast<float>(o.input_w) / static_cast<float>(o.output_w));
-    g.params->Set("DLSSNR.Scale", static_cast<float>(o.input_w) / static_cast<float>(o.output_w));
+    // Keep the provider-resolved value during evaluation. Overwriting it with
+    // the requested geometric ratio would defeat the callback we are testing.
+    g.params->Set("DLSSNR.ScalingRatio", g_nr_resolved_scaling_ratio);
+    g.params->Set("DLSSNR.Scale", g_nr_resolved_scaling_ratio);
     g.params->Set("DLSSNR.Hint.Render.Preset", o.model);
     g.params->Set("DLSSNR.Intensity", o.intensity);
     g.params->Set("DLSSNR.LocalToneStrength", o.local_tone);
@@ -1299,13 +1360,16 @@ static void WriteResultJson(const Options &o, bool created, UINT evaluations, co
         "  \"output\": { \"width\": %u, \"height\": %u },\n"
         "  \"model\": %d,\n"
         "  \"profile\": \"%s\",\n"
+        "  \"pipeline\": \"%s\",\n"
+        "  \"compactNrResources\": %s,\n"
         "  \"changedPercent\": %.5f,\n"
         "  \"quadrantChangedPercent\": [%.5f, %.5f, %.5f, %.5f],\n"
         "  \"checksumFnv1a64\": \"%016llX\",\n"
         "  \"upscalingValidated\": %s\n"
         "}\n",
         created ? "true" : "false", evaluations, o.input_w, o.input_h, o.output_w, o.output_h,
-        o.model, ProfileName(o.profile), coverage.total,
+        o.model, ProfileName(o.profile), o.nr_only ? "nr-only" : "nr-plus-dlss-sr",
+        o.compact_nr ? "true" : "false", coverage.total,
         coverage.quadrant[0], coverage.quadrant[1], coverage.quadrant[2], coverage.quadrant[3],
         static_cast<unsigned long long>(coverage.checksum), pass ? "true" : "false");
     std::fclose(file);
@@ -1314,6 +1378,7 @@ static void WriteResultJson(const Options &o, bool created, UINT evaluations, co
 
 static int Run(const Options &o)
 {
+    const UINT nr_width = NrWidth(o), nr_height = NrHeight(o);
     const DXGI_FORMAT input_format = o.profile == ColorProfile::Hdr10
         ? DXGI_FORMAT_R10G10B10A2_UNORM
         : o.profile == ColorProfile::Srgb ? DXGI_FORMAT_R8G8B8A8_UNORM
@@ -1336,10 +1401,10 @@ static int Run(const Options &o)
     // DLSSNR.ColorSubrect*, with the low-resolution pixels packed at (0, 0).
     // A physically low-resolution Color resource is rejected as an invalid
     // Color/Output rect configuration before the neural network is dispatched.
-    ID3D12Resource *color = MakeTexture(o.output_w, o.output_h, input_format, false);
+    ID3D12Resource *color = MakeTexture(nr_width, nr_height, input_format, false);
     ID3D12Resource *depth = MakeTexture(o.input_w, o.input_h, DXGI_FORMAT_R32_FLOAT, false);
     ID3D12Resource *motion = MakeTexture(o.input_w, o.input_h, DXGI_FORMAT_R16G16_FLOAT, false);
-    ID3D12Resource *nr_output = MakeTexture(o.output_w, o.output_h, color_format, true);
+    ID3D12Resource *nr_output = MakeTexture(nr_width, nr_height, color_format, true);
     ID3D12Resource *output = MakeTexture(o.output_w, o.output_h, color_format, true);
     if (color == nullptr || depth == nullptr || motion == nullptr || nr_output == nullptr || output == nullptr) {
         Log("FAIL resource allocation");
@@ -1347,15 +1412,17 @@ static int Run(const Options &o)
     }
 
     const std::vector<uint8_t> color_pattern = MakeColorPattern(o.input_w, o.input_h, input_format, o.profile);
-    const std::vector<uint8_t> color_data = EmbedTopLeft(color_pattern, o.input_w, o.input_h,
-        o.output_w, o.output_h, BytesPerPixel(input_format));
+    const std::vector<uint8_t> color_data = o.compact_nr ? color_pattern :
+        EmbedTopLeft(color_pattern, o.input_w, o.input_h,
+            o.output_w, o.output_h, BytesPerPixel(input_format));
     const std::vector<uint8_t> depth_data = MakeDepth(o.input_w, o.input_h);
     const std::vector<uint8_t> motion_data = MakeMotionVectors(o.input_w, o.input_h);
     const std::vector<uint8_t> sentinel = MakeSentinel(o.output_w, o.output_h, color_format);
+    const std::vector<uint8_t> nr_sentinel = MakeSentinel(nr_width, nr_height, color_format);
     if (!UploadTexture(color, color_data, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) ||
         !UploadTexture(depth, depth_data, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) ||
         !UploadTexture(motion, motion_data, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) ||
-        !UploadTexture(nr_output, sentinel, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) ||
+        !UploadTexture(nr_output, nr_sentinel, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) ||
         !UploadTexture(output, sentinel, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) {
         Log("FAIL deterministic texture upload");
         return 2;
@@ -1368,7 +1435,7 @@ static int Run(const Options &o)
         Log("VERDICT FAIL: the runtime did not create raw feature 18; inspect this log and NVIDIA NGX logs");
         return 3;
     }
-    if (!CreateSrFeature(o, flags)) {
+    if (!o.nr_only && !CreateSrFeature(o, flags)) {
         Coverage empty;
         WriteResultJson(o, true, 0, empty, false);
         Log("VERDICT FAIL: DLSS-NR created, but the DLSS Super Resolution stage did not");
@@ -1378,12 +1445,13 @@ static int Run(const Options &o)
     UINT good = 0;
     for (UINT frame = 0; frame < o.frames; ++frame) {
         if (!EvaluateFrame(o, color, nr_output, depth, motion, frame == 0, frame)) break;
-        if (!EvaluateSrFrame(o, nr_output, output, depth, motion, frame == 0, frame)) break;
+        if (!o.nr_only && !EvaluateSrFrame(o, nr_output, output, depth, motion, frame == 0, frame)) break;
         ++good;
     }
 
     std::vector<uint8_t> result;
-    if (good == 0 || !ReadbackTexture(output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &result, nullptr)) {
+    ID3D12Resource *measured_output = o.nr_only ? nr_output : output;
+    if (good == 0 || !ReadbackTexture(measured_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &result, nullptr)) {
         Coverage empty;
         WriteResultJson(o, true, good, empty, false);
         Log("VERDICT FAIL: feature 18 was created but no readable evaluation completed");
@@ -1400,7 +1468,8 @@ static int Run(const Options &o)
         static_cast<unsigned long long>(coverage.checksum));
     WriteResultJson(o, true, good, coverage, pass);
     if (pass) {
-        Log("VERDICT PASS: DLSS-NR is active and wrote the complete native-resolution target from lower-resolution inputs");
+        Log("VERDICT PASS: %s wrote the complete native-resolution target from lower-resolution inputs",
+            o.nr_only ? "DLSS-NR alone" : "DLSS-NR plus DLSS SR");
         return 0;
     }
     Log("VERDICT FAIL: creation/evaluation ran, but native-target coverage was not proven (this catches upper-left-only output)");
@@ -1480,10 +1549,14 @@ int main(int argc, char **argv)
             if (!ParseFloat(argv[++i], &options.local_structure)) return 64;
         } else if (strcmp(arg, "--skin-structure") == 0 && i + 1 < argc) {
             if (!ParseFloat(argv[++i], &options.skin_structure)) return 64;
+        } else if (strcmp(arg, "--nr-only") == 0) {
+            options.nr_only = true;
+        } else if (strcmp(arg, "--compact-nr") == 0) {
+            options.compact_nr = true;
         } else if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
             std::printf("nr-lab [--input 960x540] [--output 1920x1080] [--frames N] [--model 1|2|3]\n"
                         "       [--profile srgb|scrgb|hdr10] [--intensity F] [--local-tone F]\n"
-                        "       [--local-structure F] [--skin-structure F]\n");
+                        "       [--local-structure F] [--skin-structure F] [--nr-only] [--compact-nr]\n");
             return 0;
         } else {
             Log("unknown argument: %s", arg);
@@ -1492,6 +1565,11 @@ int main(int argc, char **argv)
     }
     if (options.model < 1 || options.model > 3 || options.output_w < options.input_w || options.output_h < options.input_h) {
         Log("invalid contract: model must be 1..3 and output must be at least input size");
+        return 64;
+    }
+    if (options.nr_only && options.compact_nr &&
+        (options.output_w != options.input_w || options.output_h != options.input_h)) {
+        Log("invalid contract: --compact-nr with an enlarged --output requires the downstream DLSS SR stage");
         return 64;
     }
 

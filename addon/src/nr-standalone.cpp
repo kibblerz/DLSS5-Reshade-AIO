@@ -22,7 +22,7 @@
 #include <nvsdk_ngx_params.h>
 #include <nvsdk_ngx_defs_dlssd.h>
 
-#define ADDON_VERSION "1.3.7-stable-sr-history"
+#define ADDON_VERSION "1.4.0-compact-nr-provider"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -139,6 +139,8 @@ static constexpr unsigned long long kGenericCustomCoreId = 0x0876232CULL;
 using NgxCoreInitD3D12 = NVSDK_NGX_Result (NVSDK_CONV *)(unsigned long long, const wchar_t *, ID3D12Device *, NVSDK_NGX_Version);
 using NgxSnippetInitD3D12Ext = NVSDK_NGX_Result (NVSDK_CONV *)(unsigned long long, const wchar_t *, ID3D12Device *, NVSDK_NGX_Version, const NVSDK_NGX_Parameter *);
 using NgxAllocateParameters = NVSDK_NGX_Result (NVSDK_CONV *)(NVSDK_NGX_Parameter **);
+using NgxGetCapabilityParameters = NVSDK_NGX_Result (NVSDK_CONV *)(NVSDK_NGX_Parameter **);
+using NgxPopulateParameters = NVSDK_NGX_Result (NVSDK_CONV *)(NVSDK_NGX_Parameter *);
 using NgxCreateFeature = NVSDK_NGX_Result (NVSDK_CONV *)(ID3D12GraphicsCommandList *, NVSDK_NGX_Feature, NVSDK_NGX_Parameter *, NVSDK_NGX_Handle **);
 using NgxEvaluateFeature = NVSDK_NGX_Result (NVSDK_CONV *)(ID3D12GraphicsCommandList *, const NVSDK_NGX_Handle *, const NVSDK_NGX_Parameter *, PFN_NVSDK_NGX_ProgressCallback_C);
 using NgxReleaseFeature = NVSDK_NGX_Result (NVSDK_CONV *)(NVSDK_NGX_Handle *);
@@ -146,6 +148,7 @@ using NgxBridgeInitD3D12Ext = NVSDK_NGX_Result (NVSDK_CONV *)(NgxSnippetInitD3D1
 using NgxBridgeCreateFeature = NVSDK_NGX_Result (NVSDK_CONV *)(NgxCreateFeature, ID3D12GraphicsCommandList *, NVSDK_NGX_Feature, NVSDK_NGX_Parameter *, NVSDK_NGX_Handle **);
 using NgxBridgeEvaluateFeature = NVSDK_NGX_Result (NVSDK_CONV *)(NgxEvaluateFeature, ID3D12GraphicsCommandList *, const NVSDK_NGX_Handle *, const NVSDK_NGX_Parameter *, PFN_NVSDK_NGX_ProgressCallback_C);
 using NgxBridgeReleaseFeature = NVSDK_NGX_Result (NVSDK_CONV *)(NgxReleaseFeature, NVSDK_NGX_Handle *);
+using NgxBridgePopulateParameters = NVSDK_NGX_Result (NVSDK_CONV *)(NgxPopulateParameters, NVSDK_NGX_Parameter *);
 
 static HMODULE g_core_module;
 static HMODULE g_nr_module;
@@ -163,6 +166,10 @@ static NgxReleaseFeature g_sr_release;
 static NgxBridgeCreateFeature g_bridge_create;
 static NgxBridgeEvaluateFeature g_bridge_evaluate;
 static NgxBridgeReleaseFeature g_bridge_release;
+static NgxBridgePopulateParameters g_bridge_populate;
+static NgxPopulateParameters g_nr_populate;
+static NgxPopulateParameters g_nr_compute_scaling_ratio;
+static float g_nr_scaling_ratio = 1.0f;
 
 static void Log(const char *format, ...)
 {
@@ -382,13 +389,15 @@ static bool InitializeNgx()
     g_nr_create = g_nr_module ? reinterpret_cast<NgxCreateFeature>(GetProcAddress(g_nr_module, "NVSDK_NGX_D3D12_CreateFeature")) : nullptr;
     g_nr_evaluate = g_nr_module ? reinterpret_cast<NgxEvaluateFeature>(GetProcAddress(g_nr_module, "NVSDK_NGX_D3D12_EvaluateFeature")) : nullptr;
     g_nr_release = g_nr_module ? reinterpret_cast<NgxReleaseFeature>(GetProcAddress(g_nr_module, "NVSDK_NGX_D3D12_ReleaseFeature")) : nullptr;
+    g_nr_populate = g_nr_module ? reinterpret_cast<NgxPopulateParameters>(GetProcAddress(g_nr_module, "NVSDK_NGX_D3D12_PopulateParameters_Impl")) : nullptr;
     g_bridge_module = LoadLibraryExW(bridge_path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     auto bridge_init = g_bridge_module ? reinterpret_cast<NgxBridgeInitD3D12Ext>(GetProcAddress(g_bridge_module, "NVNGXBridge_D3D12_InitExt")) : nullptr;
     g_bridge_create = g_bridge_module ? reinterpret_cast<NgxBridgeCreateFeature>(GetProcAddress(g_bridge_module, "NVNGXBridge_D3D12_CreateFeature")) : nullptr;
     g_bridge_evaluate = g_bridge_module ? reinterpret_cast<NgxBridgeEvaluateFeature>(GetProcAddress(g_bridge_module, "NVNGXBridge_D3D12_EvaluateFeature")) : nullptr;
     g_bridge_release = g_bridge_module ? reinterpret_cast<NgxBridgeReleaseFeature>(GetProcAddress(g_bridge_module, "NVNGXBridge_D3D12_ReleaseFeature")) : nullptr;
+    g_bridge_populate = g_bridge_module ? reinterpret_cast<NgxBridgePopulateParameters>(GetProcAddress(g_bridge_module, "NVNGXBridge_D3D12_PopulateParameters")) : nullptr;
     if (!nr_init || !g_nr_create || !g_nr_evaluate || !g_nr_release || !bridge_init ||
-        !g_bridge_create || !g_bridge_evaluate || !g_bridge_release)
+        !g_nr_populate || !g_bridge_create || !g_bridge_evaluate || !g_bridge_release || !g_bridge_populate)
     {
         Fail("NR snippet/caller bridge exports", static_cast<unsigned int>(GetLastError()));
         return false;
@@ -396,8 +405,8 @@ static bool InitializeNgx()
 
     g_core_module = LoadInstalledNgxCore();
     auto core_init = g_core_module ? reinterpret_cast<NgxCoreInitD3D12>(GetProcAddress(g_core_module, "NVSDK_NGX_D3D12_Init")) : nullptr;
-    auto allocate = g_core_module ? reinterpret_cast<NgxAllocateParameters>(GetProcAddress(g_core_module, "NVSDK_NGX_D3D12_AllocateParameters")) : nullptr;
-    if (!core_init || !allocate) { Fail("driver NGX core exports", static_cast<unsigned int>(GetLastError())); return false; }
+    auto get_capabilities = g_core_module ? reinterpret_cast<NgxGetCapabilityParameters>(GetProcAddress(g_core_module, "NVSDK_NGX_D3D12_GetCapabilityParameters")) : nullptr;
+    if (!core_init || !get_capabilities) { Fail("driver NGX core exports", static_cast<unsigned int>(GetLastError())); return false; }
 
     wchar_t temp[MAX_PATH] = {}, parent[MAX_PATH] = {}, data_path[MAX_PATH] = {};
     if (GetTempPathW(MAX_PATH, temp) == 0) { Fail("NGX data path", GetLastError()); return false; }
@@ -421,9 +430,16 @@ static bool InitializeNgx()
     result = bridge_init(dlss_init, kGenericCustomCoreId, dlss_path, g_neural_device.Get(), NVSDK_NGX_Version_API, nullptr);
     Log("DLSS SR snippet Init_Ext = 0x%08X (%s)", static_cast<unsigned int>(result), ResultName(result));
     if (NVSDK_NGX_FAILED(result)) { Fail("DLSS SR snippet Init_Ext", static_cast<unsigned int>(result)); return false; }
-    result = allocate(&g_ngx_params);
-    Log("driver-core AllocateParameters = 0x%08X (%s), ptr=%p", static_cast<unsigned int>(result), ResultName(result), g_ngx_params);
-    if (NVSDK_NGX_FAILED(result) || !g_ngx_params) { Fail("AllocateParameters", static_cast<unsigned int>(result)); return false; }
+    result = get_capabilities(&g_ngx_params);
+    Log("driver-core GetCapabilityParameters = 0x%08X (%s), ptr=%p", static_cast<unsigned int>(result), ResultName(result), g_ngx_params);
+    if (NVSDK_NGX_FAILED(result) || !g_ngx_params) { Fail("GetCapabilityParameters", static_cast<unsigned int>(result)); return false; }
+    result = g_bridge_populate(g_nr_populate, g_ngx_params);
+    Log("NR PopulateParameters_Impl = 0x%08X (%s)", static_cast<unsigned int>(result), ResultName(result));
+    if (NVSDK_NGX_FAILED(result)) { Fail("NR PopulateParameters_Impl", static_cast<unsigned int>(result)); return false; }
+    void *scaling_callback = nullptr;
+    result = g_ngx_params->Get("DLSSNRComputeScalingRatioCallback", &scaling_callback);
+    g_nr_compute_scaling_ratio = reinterpret_cast<NgxPopulateParameters>(scaling_callback);
+    Log("NR scaling callback get=0x%08X ptr=%p", static_cast<unsigned int>(result), scaling_callback);
     return true;
 }
 
@@ -438,16 +454,17 @@ static int FeatureFlags()
 static void SetNrCreationContract()
 {
     const UINT iw = g_resource_input_width, ih = g_resource_input_height;
-    const UINT ow = g_resource_output_width, oh = g_resource_output_height;
-    const float ratio = static_cast<float>(iw) / static_cast<float>(ow);
     g_ngx_params->Reset();
+    const NVSDK_NGX_Result populate_result = g_bridge_populate(g_nr_populate, g_ngx_params);
+    Log("NR creation PopulateParameters_Impl = 0x%08X (%s)",
+        static_cast<unsigned int>(populate_result), ResultName(populate_result));
     g_ngx_params->Set("CreationNodeMask", 1u);
     g_ngx_params->Set("VisibilityNodeMask", 1u);
     g_ngx_params->Set("Width", iw); g_ngx_params->Set("Height", ih);
-    g_ngx_params->Set("OutWidth", ow); g_ngx_params->Set("OutHeight", oh);
+    g_ngx_params->Set("OutWidth", iw); g_ngx_params->Set("OutHeight", ih);
     g_ngx_params->Set("ResourceWidth", iw); g_ngx_params->Set("ResourceHeight", ih);
-    g_ngx_params->Set("ResourceOutWidth", ow); g_ngx_params->Set("ResourceOutHeight", oh);
-    g_ngx_params->Set("PerfQualityValue", static_cast<int>(NVSDK_NGX_PerfQuality_Value_MaxQuality));
+    g_ngx_params->Set("ResourceOutWidth", iw); g_ngx_params->Set("ResourceOutHeight", ih);
+    g_ngx_params->Set("PerfQualityValue", static_cast<int>(NVSDK_NGX_PerfQuality_Value_UltraQuality));
     g_ngx_params->Set("DLSS.Feature.Create.Flags", FeatureFlags());
     g_ngx_params->Set("DLSS.Enable.Output.Subrects", 0);
     g_ngx_params->Set("DLSS.Denoise.Mode", 1);
@@ -455,11 +472,11 @@ static void SetNrCreationContract()
     g_ngx_params->Set("DLSS.Use.HW.Depth", 1u);
     g_ngx_params->Set("DLSSNR.Enabled", 1u);
     g_ngx_params->Set("DLSSNR.InputWidth", iw); g_ngx_params->Set("DLSSNR.InputHeight", ih);
-    g_ngx_params->Set("DLSSNR.Width", ow); g_ngx_params->Set("DLSSNR.Height", oh);
-    g_ngx_params->Set("DLSSNR.OutputWidth", ow); g_ngx_params->Set("DLSSNR.OutputHeight", oh);
-    g_ngx_params->Set("Output.Width", ow); g_ngx_params->Set("Output.Height", oh);
+    g_ngx_params->Set("DLSSNR.Width", iw); g_ngx_params->Set("DLSSNR.Height", ih);
+    g_ngx_params->Set("DLSSNR.OutputWidth", iw); g_ngx_params->Set("DLSSNR.OutputHeight", ih);
+    g_ngx_params->Set("Output.Width", iw); g_ngx_params->Set("Output.Height", ih);
     g_ngx_params->Set("DLSSNR.Upscaling", 1u);
-    g_ngx_params->Set("DLSSNR.ScalingRatio", ratio); g_ngx_params->Set("DLSSNR.Scale", ratio);
+    g_ngx_params->Set("DLSSNR.ScalingRatio", 1.0f); g_ngx_params->Set("DLSSNR.Scale", 1.0f);
     g_ngx_params->Set("DLSSNR.Hint.Render.Preset", g_nr_model);
     g_ngx_params->Set("DLSSNR.Intensity", g_nr_intensity);
     g_ngx_params->Set("DLSSNR.LocalToneStrength", g_nr_local_tone);
@@ -467,6 +484,16 @@ static void SetNrCreationContract()
     g_ngx_params->Set("DLSSNR.SkinStructureStrength", g_nr_skin_structure);
     g_ngx_params->Set("DLSSNR.UseAutoMask", 1u);
     g_ngx_params->Set("DLSSNR.UICorrection", 0u);
+    if (g_nr_compute_scaling_ratio)
+    {
+        const NVSDK_NGX_Result ratio_result = g_nr_compute_scaling_ratio(g_ngx_params);
+        float resolved = 1.0f;
+        g_ngx_params->Get("DLSSNR.ScalingRatio", &resolved);
+        g_nr_scaling_ratio = resolved;
+        g_ngx_params->Set("DLSSNR.Scale", resolved);
+        Log("NR provider scaling ratio result=0x%08X (%s), resolved=%.6f",
+            static_cast<unsigned int>(ratio_result), ResultName(ratio_result), resolved);
+    }
 }
 
 static NVSDK_NGX_Result SafeCreate(bool nr, DWORD *exception)
@@ -763,9 +790,9 @@ static bool EnsureStandaloneResources(ID3D12Resource *backbuffer)
     g_resource_input_format = input_format;
     const DXGI_FORMAT result_format = g_color_profile == ColorProfile::Srgb ?
         DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
-    if (!CreateTexture(ow, oh, input_format, false,
+    if (!CreateTexture(iw, ih, input_format, false,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g_packed_color) ||
-        !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g_nr_stage) ||
+        !CreateTexture(iw, ih, result_format, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g_nr_stage) ||
         !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, g_sr_stage)) return false;
     const float motion_clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     const float depth_clear[4] = {g_depth_reversed ? 0.0f : 1.0f, 0.0f, 0.0f, 0.0f};
@@ -780,8 +807,8 @@ static bool EnsureStandaloneResources(ID3D12Resource *backbuffer)
         ShowWindow(g_proxy_window, SW_SHOWNOACTIVATE);
     }
     SetStatus("active on present: NR + DLSS SR (fallback guides)");
-    Log("resources ready on present: packed=%ux%u fmt=%u, NR/SR=%ux%u fmt=%u; fallback guides=%ux%u",
-        ow, oh, static_cast<unsigned int>(input_format), ow, oh, static_cast<unsigned int>(result_format), iw, ih);
+    Log("resources ready on present: compact packed/NR=%ux%u, SR=%ux%u, input fmt=%u result fmt=%u; fallback guides=%ux%u",
+        iw, ih, ow, oh, static_cast<unsigned int>(input_format), static_cast<unsigned int>(result_format), iw, ih);
     Log("resolution configuration active without restart: input=%ux%u output=%ux%u", iw, ih, ow, oh);
     return true;
 }
@@ -789,8 +816,6 @@ static bool EnsureStandaloneResources(ID3D12Resource *backbuffer)
 static void SetNrEvaluationContract(ID3D12Resource *depth, ID3D12Resource *motion, bool reset)
 {
     const UINT iw = g_resource_input_width, ih = g_resource_input_height;
-    const UINT ow = g_resource_output_width, oh = g_resource_output_height;
-    const float ratio = static_cast<float>(iw) / static_cast<float>(ow);
     for (const char *name : {"Color", "DLSSNR.Color"}) g_ngx_params->Set(name, g_packed_color.Get());
     for (const char *name : {"Output", "DLSSNR.Output"}) g_ngx_params->Set(name, g_nr_stage.Get());
     for (const char *name : {"Depth", "DLSSNR.Depth"}) g_ngx_params->Set(name, depth);
@@ -813,13 +838,13 @@ static void SetNrEvaluationContract(ID3D12Resource *depth, ID3D12Resource *motio
     g_ngx_params->Set("DLSSNR.DepthSubrectBaseX", 0); g_ngx_params->Set("DLSSNR.DepthSubrectBaseY", 0);
     g_ngx_params->Set("DLSSNR.DepthSubrectWidth", static_cast<int>(iw)); g_ngx_params->Set("DLSSNR.DepthSubrectHeight", static_cast<int>(ih));
     g_ngx_params->Set("DLSSNR.OutputSubrectBaseX", 0); g_ngx_params->Set("DLSSNR.OutputSubrectBaseY", 0);
-    g_ngx_params->Set("DLSSNR.OutputSubrectWidth", static_cast<int>(ow)); g_ngx_params->Set("DLSSNR.OutputSubrectHeight", static_cast<int>(oh));
+    g_ngx_params->Set("DLSSNR.OutputSubrectWidth", static_cast<int>(iw)); g_ngx_params->Set("DLSSNR.OutputSubrectHeight", static_cast<int>(ih));
     g_ngx_params->Set("DLSSNR.DepthInverted", g_depth_reversed ? 1u : 0u);
     g_ngx_params->Set("DLSSNR.InputWidth", iw); g_ngx_params->Set("DLSSNR.InputHeight", ih);
-    g_ngx_params->Set("DLSSNR.Width", ow); g_ngx_params->Set("DLSSNR.Height", oh);
-    g_ngx_params->Set("DLSSNR.OutputWidth", ow); g_ngx_params->Set("DLSSNR.OutputHeight", oh);
+    g_ngx_params->Set("DLSSNR.Width", iw); g_ngx_params->Set("DLSSNR.Height", ih);
+    g_ngx_params->Set("DLSSNR.OutputWidth", iw); g_ngx_params->Set("DLSSNR.OutputHeight", ih);
     g_ngx_params->Set("DLSSNR.Upscaling", 1u);
-    g_ngx_params->Set("DLSSNR.ScalingRatio", ratio); g_ngx_params->Set("DLSSNR.Scale", ratio);
+    g_ngx_params->Set("DLSSNR.ScalingRatio", g_nr_scaling_ratio); g_ngx_params->Set("DLSSNR.Scale", g_nr_scaling_ratio);
     g_ngx_params->Set("DLSSNR.Hint.Render.Preset", g_nr_model);
     g_ngx_params->Set("DLSSNR.Intensity", g_nr_intensity);
     g_ngx_params->Set("DLSSNR.LocalToneStrength", g_nr_local_tone);
