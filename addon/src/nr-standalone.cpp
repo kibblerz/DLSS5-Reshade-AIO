@@ -22,7 +22,7 @@
 #include <nvsdk_ngx_params.h>
 #include <nvsdk_ngx_defs_dlssd.h>
 
-#define ADDON_VERSION "1.4.0-direct-nr-upscale-test"
+#define ADDON_VERSION "1.4.1-direct-nr-native-allocation-test"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR Direct Upscale " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -650,7 +650,9 @@ static bool EnsureStandaloneResources(ID3D12Resource *backbuffer)
     g_resource_input_format = input_format;
     const DXGI_FORMAT result_format = g_color_profile == ColorProfile::Srgb ?
         DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
-    if (!CreateTexture(iw, ih, input_format, false,
+    // Feature 18 validates the physical Color allocation at the creation output
+    // extent. The actual reduced input remains the top-left iw x ih subrect.
+    if (!CreateTexture(ow, oh, input_format, false,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g_packed_color) ||
         !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, g_nr_stage)) return false;
     const float motion_clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -661,8 +663,9 @@ static bool EnsureStandaloneResources(ID3D12Resource *backbuffer)
     PublishOutput(g_nr_stage.Get());
     g_neural_ready = true;
     SetStatus("direct NR upscale ready: feature 18 only");
-    Log("DIRECT NR resource proof: Color=%ux%u fmt=%u, Output=%ux%u fmt=%u, Guides=%ux%u; published=NR output",
-        iw, ih, static_cast<unsigned int>(input_format), ow, oh, static_cast<unsigned int>(result_format), iw, ih);
+    Log("DIRECT NR resource proof: Color allocation=%ux%u active-subrect=%ux%u fmt=%u, Output=%ux%u fmt=%u, Guides=%ux%u; published=NR output",
+        ow, oh, iw, ih, static_cast<unsigned int>(input_format), ow, oh,
+        static_cast<unsigned int>(result_format), iw, ih);
     return true;
 }
 
