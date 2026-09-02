@@ -28,7 +28,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.18-vort-reprojection-prototype"
+#define ADDON_VERSION "1.7.18-vort-controls-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -134,6 +134,7 @@ static float g_nr_local_structure = 1.0f;
 static float g_nr_skin_structure = -1.0f;
 static bool g_reset_every_frame = false;
 static bool g_stable_sr_history = false;
+static bool g_vort_motion_enabled = true;
 static bool g_adaptive_smear_reduction = true;
 static bool g_nr_enabled = true;
 static bool g_framegen_enabled = true;
@@ -1989,7 +1990,7 @@ static bool CapturedGuidesMatchInput();
 
 static bool RenderCurrentFrameGuides(ID3D12Resource *backbuffer)
 {
-    if (!g_runtime || !g_motion_technique.handle || !g_feed_technique.handle ||
+    if (!g_vort_motion_enabled || !g_runtime || !g_motion_technique.handle || !g_feed_technique.handle ||
         !g_mv_variable.handle || !g_depth_variable.handle) return false;
     reshade::api::command_queue *queue = g_runtime->get_command_queue();
     if (!queue) return false;
@@ -3437,6 +3438,22 @@ static void DrawOverlay(reshade::api::effect_runtime *)
             g_stable_sr_history ? "per-frame reset with zero motion" : "experimental temporal VORT motion");
     }
     ImGui::TextDisabled("Off by default; enable only as a per-frame SR-history diagnostic.");
+    if (ImGui::Checkbox("Enable VORT Motion guides", &g_vort_motion_enabled))
+    {
+        reshade::set_config_value(nullptr, section, "VortMotionGuides",
+            g_vort_motion_enabled ? "1" : "0");
+        g_need_history_reset = true;
+        g_last_current_guide_tick = 0;
+        if (g_runtime && g_motion_technique.handle && g_runtime->get_technique_state(g_motion_technique))
+            g_runtime->set_technique_state(g_motion_technique, false);
+        Log("manual VORT Motion guides changed to %s; temporal history reset",
+            g_vort_motion_enabled ? "enabled" : "disabled / zero-motion fallback");
+    }
+    ImGui::TextDisabled(!g_vort_motion_enabled ?
+        "Off: skips manual VORT and the adaptive validator; internal zero-motion guides are used." :
+        g_motion_technique.handle ?
+        "On: the addon runs VORT manually at Present; leave its normal ReShade technique unchecked." :
+        "On, but vort_MotionEffects was not found; internal zero-motion guides are used.");
     if (ImGui::Checkbox("Adaptive VORT smear reduction", &g_adaptive_smear_reduction))
     {
         reshade::set_config_value(nullptr, section, "AdaptiveVortSmearReduction",
@@ -3480,7 +3497,8 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g_active_nr_model);
     ImGui::Text("Contract: %ux%u -> %ux%u", g_input_width.load(), g_input_height.load(), g_output_width.load(), g_output_height.load());
     ImGui::Text("NR guides: %s; DLSS SR history: %s; validation mask=%s; adaptive VORT=%s",
-        g_using_external_guides ? "same-frame VORT optical flow" : "internal zero-motion fallback",
+        g_using_external_guides ? "same-frame VORT optical flow" :
+            (!g_vort_motion_enabled ? "internal zero-motion (VORT disabled)" : "internal zero-motion fallback"),
         g_stable_sr_history ? "per-frame reset / zero motion" : "experimental temporal VORT",
         g_mask_available ? "valid" : "automatic mask",
         g_using_external_guides && g_adaptive_smear_reduction && g_adaptive_rejection_variable.handle &&
@@ -3592,14 +3610,16 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("SkinStructure", "-1.0", value, sizeof(value)); g_nr_skin_structure = std::clamp(static_cast<float>(atof(value)), -1.0f, 1.0f);
         read_setting("ResetEveryFrame", "0", value, sizeof(value)); g_reset_every_frame = strcmp(value, "0") != 0;
         read_setting("StableSrHistory", "0", value, sizeof(value)); g_stable_sr_history = strcmp(value, "0") != 0;
+        read_setting("VortMotionGuides", "1", value, sizeof(value)); g_vort_motion_enabled = strcmp(value, "0") != 0;
         read_setting("AdaptiveVortSmearReduction", "1", value, sizeof(value)); g_adaptive_smear_reduction = strcmp(value, "0") != 0;
         read_setting("NeuralRendering", "1", value, sizeof(value)); g_nr_enabled = strcmp(value, "0") != 0;
         read_setting("FrameGeneration", "1", value, sizeof(value)); g_framegen_enabled = strcmp(value, "0") != 0;
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
         read_setting("EarlyProxyInitialization", "0", value, sizeof(value)); g_early_proxy_initialization = strcmp(value, "0") != 0;
-        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d NR=%s adaptive_vort=%s early_proxy=%s",
+        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d NR=%s VORT=%s adaptive_vort=%s early_proxy=%s",
             ADDON_VERSION, ProfileName(g_color_profile), g_nr_model, g_nr_enabled ? "enabled" : "disabled",
+            g_vort_motion_enabled ? "enabled" : "disabled",
             g_adaptive_smear_reduction ? "enabled" : "disabled",
             g_early_proxy_initialization ? "enabled" : "disabled");
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
