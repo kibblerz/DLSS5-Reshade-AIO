@@ -113,6 +113,11 @@ build-lab.bat
 run-matrix.bat
 ```
 
+The reverse-engineered runtime callback, stats callback, Style/preset/quality
+matrix, and direct runtime-scaling results are documented in
+[`lab/PRIVATE-CONTRACT-FINDINGS.md`](lab/PRIVATE-CONTRACT-FINDINGS.md). These
+private-contract tests remain laboratory-only and are not enabled in the addon.
+
 Expected summary:
 
 ```text

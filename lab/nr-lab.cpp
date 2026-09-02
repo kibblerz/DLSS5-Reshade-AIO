@@ -46,6 +46,9 @@ struct Options {
     float local_tone = 1.0f;
     float local_structure = 1.0f;
     float skin_structure = -1.0f;
+    float runtime_scale = -1.0f;
+    int style = -1;
+    int perf_quality = -1;
     bool nr_only = false;
     bool compact_nr = false;
     bool framegen = false;
@@ -102,6 +105,8 @@ using NgxBridgeEvaluateFeature = NVSDK_NGX_Result (NVSDK_CONV *)(NgxEvaluateFeat
     PFN_NVSDK_NGX_ProgressCallback_C);
 using NgxBridgeReleaseFeature = NVSDK_NGX_Result (NVSDK_CONV *)(NgxReleaseFeature, NVSDK_NGX_Handle *);
 using NgxBridgeShutdownD3D12 = NVSDK_NGX_Result (NVSDK_CONV *)(NgxShutdownD3D12, ID3D12Device *);
+using NgxRuntimeParamsCallback = bool (NVSDK_CONV *)(unsigned int, unsigned int, void *);
+using NgxSetRuntimeParamsCallback = NVSDK_NGX_Result (NVSDK_CONV *)(NgxRuntimeParamsCallback);
 
 static HMODULE g_core_module = nullptr;
 static HMODULE g_nr_module = nullptr;
@@ -130,7 +135,15 @@ static NgxBridgeShutdownD3D12 g_bridge_shutdown = nullptr;
 static NgxBridgePopulateParameters g_bridge_populate_parameters = nullptr;
 static NgxPopulateParameters g_nr_populate_parameters = nullptr;
 static NgxPopulateParameters g_nr_compute_scaling_ratio = nullptr;
+static NgxPopulateParameters g_nr_get_stats = nullptr;
 static float g_nr_resolved_scaling_ratio = 1.0f;
+static NVSDK_NGX_Result g_nr_scaling_callback_result = static_cast<NVSDK_NGX_Result>(0xBAD00004);
+static bool g_nr_scaling_callback_succeeded = false;
+static unsigned long long g_nr_stats_vram_bytes = 0;
+static unsigned int g_nr_stats_opt_level = 0;
+static unsigned int g_nr_stats_dev_branch = 0;
+static unsigned int g_runtime_params_calls = 0;
+static float g_runtime_scale_override = -1.0f;
 static NVSDK_NGX_Parameter *g_traced_params = nullptr;
 
 using NvApiQueryInterface = void *(__cdecl *)(unsigned int);
@@ -543,6 +556,51 @@ static void NVSDK_CONV NgxLogCallback(const char *message, NVSDK_NGX_Logging_Lev
     Log("NGX[%d feature=%u] %s", static_cast<int>(level), static_cast<unsigned>(source), clean);
 }
 
+// Recovered from the feature-18 PollRuntimeParams call site. The private DLL
+// passes an array of eight 24-byte records to the host callback. Keep the
+// payload opaque and report every field before returning false, which preserves
+// the DLL's built-in defaults while exposing the otherwise undocumented ABI.
+struct RuntimeParamRecord {
+    uint32_t version;
+    uint32_t type;
+    uint32_t id;
+    uint32_t present;
+    uint64_t value;
+};
+static_assert(sizeof(RuntimeParamRecord) == 24, "unexpected runtime parameter record layout");
+
+static bool NVSDK_CONV TraceRuntimeParams(unsigned int feature, unsigned int count, void *opaque)
+{
+    ++g_runtime_params_calls;
+    Log("RUNTIME PARAMS call=%u feature=%u count=%u records=%p requestedScale=%.6f",
+        g_runtime_params_calls, feature, count, opaque, g_runtime_scale_override);
+    if (opaque == nullptr || count > 64) return false;
+    auto *records = static_cast<RuntimeParamRecord *>(opaque);
+    if (g_runtime_params_calls <= 2) {
+        for (unsigned int i = 0; i < count; ++i) {
+            double as_double = 0.0;
+            std::memcpy(&as_double, &records[i].value, sizeof(as_double));
+            Log("RUNTIME PARAM[%u] version=%u type=%u id=%u present=%u raw=0x%016llX double=%.17g",
+                i, records[i].version, records[i].type, records[i].id, records[i].present,
+                static_cast<unsigned long long>(records[i].value), as_double);
+        }
+    }
+    bool applied = false;
+    if (g_runtime_scale_override > 0.0f) {
+        for (unsigned int i = 0; i < count; ++i) {
+            if (records[i].id != 7) continue;
+            records[i].present = 1;
+            records[i].value = static_cast<uint64_t>(g_runtime_scale_override * 1000.0f + 0.5f);
+            Log("RUNTIME PARAM override id=7 ScalingRatio raw=%llu resolved=%.6f",
+                static_cast<unsigned long long>(records[i].value),
+                static_cast<double>(records[i].value) / 1000.0);
+            applied = true;
+        }
+    }
+    Log("RUNTIME PARAMS returning=%s", applied ? "true" : "false");
+    return applied;
+}
+
 // Parameter providers are an undocumented part of the feature-18 contract. A
 // transparent provider lets the lab report exactly which name/type each runtime
 // asks for and whether the underlying NVIDIA provider contained it.
@@ -637,6 +695,15 @@ static bool InitNgx()
     Log("NR snippet LoadLibraryEx = %p (error=%lu)", g_nr_module, g_nr_module ? 0 : GetLastError());
     if (g_nr_module == nullptr) return false;
     InstallNgxDebugCapture(g_nr_module);
+    auto set_runtime_params = reinterpret_cast<NgxSetRuntimeParamsCallback>(GetProcAddress(
+        g_nr_module, "NVSDK_NGX_SetRuntimeParamsCallback"));
+    if (set_runtime_params != nullptr) {
+        const NVSDK_NGX_Result callback_result = set_runtime_params(&TraceRuntimeParams);
+        Log("NR SetRuntimeParamsCallback = 0x%08X (%s)",
+            static_cast<unsigned>(callback_result), ResultName(callback_result));
+    } else {
+        Log("WARN NR SetRuntimeParamsCallback export is unavailable");
+    }
     auto snippet_init = reinterpret_cast<NgxSnippetInitD3D12Ext>(GetProcAddress(g_nr_module, "NVSDK_NGX_D3D12_Init_Ext"));
     g_nr_create_feature = reinterpret_cast<NgxCreateFeature>(GetProcAddress(g_nr_module, "NVSDK_NGX_D3D12_CreateFeature"));
     g_nr_evaluate_feature = reinterpret_cast<NgxEvaluateFeature>(GetProcAddress(g_nr_module, "NVSDK_NGX_D3D12_EvaluateFeature"));
@@ -774,6 +841,8 @@ static bool InitNgx()
             static_cast<unsigned>(get_result), callback);
         if (strcmp(name, "DLSSNRComputeScalingRatioCallback") == 0 && NVSDK_NGX_SUCCEED(get_result))
             g_nr_compute_scaling_ratio = reinterpret_cast<NgxPopulateParameters>(callback);
+        if (strcmp(name, "DLSSNRGetStatsCallback") == 0 && NVSDK_NGX_SUCCEED(get_result))
+            g_nr_get_stats = reinterpret_cast<NgxPopulateParameters>(callback);
     }
     if (NVSDK_NGX_FAILED(result)) return false;
     g_traced_params = new TracingParameters(g.params);
@@ -998,6 +1067,42 @@ static NVSDK_NGX_Result SafeEvaluateFeature(DWORD *seh_code)
     __except (EXCEPTION_EXECUTE_HANDLER) { *seh_code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7fffffff); }
 }
 
+static NVSDK_NGX_Result SafeGetNrStats(DWORD *seh_code)
+{
+    *seh_code = 0;
+    if (g_nr_get_stats == nullptr) return static_cast<NVSDK_NGX_Result>(0xBAD00004);
+    __try {
+        return g_nr_get_stats(g_traced_params != nullptr ? g_traced_params : g.params);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *seh_code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7fffffff); }
+}
+
+static void ProbeNrStats()
+{
+    if (g_nr_get_stats == nullptr) {
+        Log("WARN DLSSNRGetStatsCallback is unavailable");
+        return;
+    }
+    DWORD exception_code = 0;
+    const NVSDK_NGX_Result result = SafeGetNrStats(&exception_code);
+    if (exception_code != 0) {
+        Log("FAIL DLSSNRGetStatsCallback raised SEH 0x%08X", exception_code);
+        return;
+    }
+    unsigned long long bytes = 0;
+    unsigned int opt_level = 0, dev_branch = 0;
+    const NVSDK_NGX_Result bytes_result = g.params->Get(NVSDK_NGX_Parameter_SizeInBytes, &bytes);
+    const NVSDK_NGX_Result opt_result = g.params->Get(NVSDK_NGX_EParameter_OptLevel, &opt_level);
+    const NVSDK_NGX_Result dev_result = g.params->Get(NVSDK_NGX_EParameter_IsDevSnippetBranch, &dev_branch);
+    g_nr_stats_vram_bytes = NVSDK_NGX_SUCCEED(bytes_result) ? bytes : 0;
+    g_nr_stats_opt_level = NVSDK_NGX_SUCCEED(opt_result) ? opt_level : 0;
+    g_nr_stats_dev_branch = NVSDK_NGX_SUCCEED(dev_result) ? dev_branch : 0;
+    Log("DLSSNRGetStatsCallback result=0x%08X (%s) VRAM=%llu bytes (get=0x%08X) opt=%u (get=0x%08X) dev=%u (get=0x%08X)",
+        static_cast<unsigned>(result), ResultName(result), g_nr_stats_vram_bytes,
+        static_cast<unsigned>(bytes_result), g_nr_stats_opt_level, static_cast<unsigned>(opt_result),
+        g_nr_stats_dev_branch, static_cast<unsigned>(dev_result));
+}
+
 static NVSDK_NGX_Result SafeCreateSrFeature(DWORD *seh_code)
 {
     *seh_code = 0;
@@ -1064,11 +1169,12 @@ static void SetCreationContract(const Options &o, int flags)
     g.params->Set("ResourceOutWidth", nr_width);
     g.params->Set("ResourceOutHeight", nr_height);
     const float requested_ratio = static_cast<float>(o.input_w) / static_cast<float>(nr_width);
-    const int quality = requested_ratio >= 0.72f ? NVSDK_NGX_PerfQuality_Value_UltraQuality
+    const int automatic_quality = requested_ratio >= 0.72f ? NVSDK_NGX_PerfQuality_Value_UltraQuality
         : requested_ratio >= 0.62f ? NVSDK_NGX_PerfQuality_Value_MaxQuality
         : requested_ratio >= 0.54f ? NVSDK_NGX_PerfQuality_Value_Balanced
         : requested_ratio >= 0.42f ? NVSDK_NGX_PerfQuality_Value_MaxPerf
         : NVSDK_NGX_PerfQuality_Value_UltraPerformance;
+    const int quality = o.perf_quality >= 0 ? o.perf_quality : automatic_quality;
     g.params->Set("PerfQualityValue", quality);
     g.params->Set("DLSS.Feature.Create.Flags", flags);
     g.params->Set("DLSS.Enable.Output.Subrects", 0);
@@ -1088,6 +1194,7 @@ static void SetCreationContract(const Options &o, int flags)
     g.params->Set("DLSSNR.ScalingRatio", requested_ratio);
     g.params->Set("DLSSNR.Scale", requested_ratio);
     g.params->Set("DLSSNR.Hint.Render.Preset", o.model);
+    if (o.style >= 0) g.params->Set("DLSSNR.Style", static_cast<unsigned int>(o.style));
     g.params->Set("DLSSNR.Intensity", o.intensity);
     g.params->Set("DLSSNR.LocalToneStrength", o.local_tone);
     g.params->Set("DLSSNR.LocalStructureStrength", o.local_structure);
@@ -1098,6 +1205,10 @@ static void SetCreationContract(const Options &o, int flags)
         const NVSDK_NGX_Result ratio_result = g_nr_compute_scaling_ratio(g.params);
         float resolved_ratio = requested_ratio;
         const NVSDK_NGX_Result get_result = g.params->Get("DLSSNR.ScalingRatio", &resolved_ratio);
+        g_nr_scaling_callback_result = ratio_result;
+        g_nr_scaling_callback_succeeded = NVSDK_NGX_SUCCEED(ratio_result) && NVSDK_NGX_SUCCEED(get_result);
+        if (!g_nr_scaling_callback_succeeded) resolved_ratio = 1.0f;
+        g.params->Set("DLSSNR.ScalingRatio", resolved_ratio);
         g.params->Set("DLSSNR.Scale", resolved_ratio);
         g_nr_resolved_scaling_ratio = resolved_ratio;
         Log("DLSSNRComputeScalingRatioCallback quality=%d result=0x%08X (%s), get=0x%08X requested=%.6f resolved=%.6f",
@@ -1107,6 +1218,7 @@ static void SetCreationContract(const Options &o, int flags)
         Log("WARN DLSSNRComputeScalingRatioCallback is unavailable; using requested ratio %.6f",
             requested_ratio);
     }
+    ProbeNrStats();
 }
 
 static bool CreateNrFeature(const Options &o, int flags)
@@ -1261,6 +1373,7 @@ static void SetEvaluationContract(const Options &o, ID3D12Resource *color, ID3D1
     g.params->Set("DLSSNR.ScalingRatio", g_nr_resolved_scaling_ratio);
     g.params->Set("DLSSNR.Scale", g_nr_resolved_scaling_ratio);
     g.params->Set("DLSSNR.Hint.Render.Preset", o.model);
+    if (o.style >= 0) g.params->Set("DLSSNR.Style", static_cast<unsigned int>(o.style));
     g.params->Set("DLSSNR.Intensity", o.intensity);
     g.params->Set("DLSSNR.LocalToneStrength", o.local_tone);
     g.params->Set("DLSSNR.LocalStructureStrength", o.local_structure);
@@ -1525,19 +1638,32 @@ static void WriteResultJson(const Options &o, bool created, UINT evaluations, co
         "  \"input\": { \"width\": %u, \"height\": %u },\n"
         "  \"output\": { \"width\": %u, \"height\": %u },\n"
         "  \"model\": %d,\n"
+        "  \"style\": %d,\n"
+        "  \"requestedPerfQuality\": %d,\n"
+        "  \"runtimeScaleOverride\": %.6f,\n"
         "  \"profile\": \"%s\",\n"
         "  \"pipeline\": \"%s\",\n"
         "  \"compactNrResources\": %s,\n"
         "  \"nrResolvedScalingRatio\": %.6f,\n"
+        "  \"nrScalingCallbackResult\": \"0x%08X\",\n"
+        "  \"nrScalingCallbackSucceeded\": %s,\n"
+        "  \"nrStatsVramBytes\": %llu,\n"
+        "  \"nrStatsOptLevel\": %u,\n"
+        "  \"nrStatsDevBranch\": %u,\n"
+        "  \"runtimeParamsCalls\": %u,\n"
         "  \"changedPercent\": %.5f,\n"
         "  \"quadrantChangedPercent\": [%.5f, %.5f, %.5f, %.5f],\n"
         "  \"checksumFnv1a64\": \"%016llX\",\n"
         "  \"upscalingValidated\": %s\n"
         "}\n",
         created ? "true" : "false", evaluations, o.input_w, o.input_h, o.output_w, o.output_h,
-        o.model, ProfileName(o.profile), o.nr_only ? "nr-only" :
+        o.model, o.style, o.perf_quality, o.runtime_scale, ProfileName(o.profile), o.nr_only ? "nr-only" :
             (o.framegen ? "nr-plus-dlss-sr-plus-framegen" : "nr-plus-dlss-sr"),
-        o.compact_nr ? "true" : "false", g_nr_resolved_scaling_ratio, coverage.total,
+        o.compact_nr ? "true" : "false", g_nr_resolved_scaling_ratio,
+        static_cast<unsigned>(g_nr_scaling_callback_result),
+        g_nr_scaling_callback_succeeded ? "true" : "false",
+        g_nr_stats_vram_bytes, g_nr_stats_opt_level, g_nr_stats_dev_branch, g_runtime_params_calls,
+        coverage.total,
         coverage.quadrant[0], coverage.quadrant[1], coverage.quadrant[2], coverage.quadrant[3],
         static_cast<unsigned long long>(coverage.checksum), pass ? "true" : "false");
     std::fclose(file);
@@ -1558,9 +1684,10 @@ static int Run(const Options &o)
         NVSDK_NGX_DLSS_Feature_Flags_DepthInverted |
         (o.profile == ColorProfile::Srgb ? 0 : NVSDK_NGX_DLSS_Feature_Flags_IsHDR);
 
-    Log("contract: feature=18 input=%ux%u output=%ux%u scale=%.6f model=%d profile=%s flags=0x%X",
+    Log("contract: feature=18 input=%ux%u output=%ux%u scale=%.6f model=%d style=%d perfQuality=%d profile=%s flags=0x%X",
         o.input_w, o.input_h, o.output_w, o.output_h,
-        static_cast<double>(o.input_w) / o.output_w, o.model, ProfileName(o.profile), flags);
+        static_cast<double>(o.input_w) / o.output_w, o.model, o.style, o.perf_quality,
+        ProfileName(o.profile), flags);
     Log("tuning: intensity=%.3f localTone=%.3f localStructure=%.3f skinStructure=%.3f",
         o.intensity, o.local_tone, o.local_structure, o.skin_structure);
 
@@ -1716,6 +1843,12 @@ int main(int argc, char **argv)
             options.frames = std::max(1u, static_cast<UINT>(strtoul(argv[++i], nullptr, 10)));
         } else if (strcmp(arg, "--model") == 0 && i + 1 < argc) {
             options.model = atoi(argv[++i]);
+        } else if (strcmp(arg, "--style") == 0 && i + 1 < argc) {
+            options.style = atoi(argv[++i]);
+        } else if (strcmp(arg, "--perf-quality") == 0 && i + 1 < argc) {
+            options.perf_quality = atoi(argv[++i]);
+        } else if (strcmp(arg, "--runtime-scale") == 0 && i + 1 < argc) {
+            if (!ParseFloat(argv[++i], &options.runtime_scale)) return 64;
         } else if (strcmp(arg, "--profile") == 0 && i + 1 < argc) {
             const char *profile = argv[++i];
             if (_stricmp(profile, "srgb") == 0) options.profile = ColorProfile::Srgb;
@@ -1738,6 +1871,7 @@ int main(int argc, char **argv)
             options.framegen = true;
         } else if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
             std::printf("nr-lab [--input 960x540] [--output 1920x1080] [--frames N] [--model 1|2|3]\n"
+                        "       [--style N] [--perf-quality 0..5] [--runtime-scale F]\n"
                         "       [--profile srgb|scrgb|hdr10] [--intensity F] [--local-tone F]\n"
                         "       [--local-structure F] [--skin-structure F] [--nr-only] [--compact-nr] [--framegen]\n");
             return 0;
@@ -1746,8 +1880,11 @@ int main(int argc, char **argv)
             return 64;
         }
     }
-    if (options.model < 1 || options.model > 3 || options.output_w < options.input_w || options.output_h < options.input_h) {
-        Log("invalid contract: model must be 1..3 and output must be at least input size");
+    if (options.model < 1 || options.model > 3 || options.style < -1 ||
+        options.perf_quality < -1 || options.perf_quality > 5 ||
+        (options.runtime_scale != -1.0f && options.runtime_scale <= 0.0f) ||
+        options.output_w < options.input_w || options.output_h < options.input_h) {
+        Log("invalid contract: model must be 1..3, style must be >= -1, perf quality must be -1..5, runtime scale must be positive or -1, and output must be at least input size");
         return 64;
     }
     if (options.nr_only && options.compact_nr &&
@@ -1760,6 +1897,7 @@ int main(int argc, char **argv)
         return 64;
     }
     if (options.framegen) options.frames = std::max(options.frames, 2u);
+    g_runtime_scale_override = options.runtime_scale;
 
     Log("DLSS-NR standalone laboratory build %s %s", __DATE__, __TIME__);
     int code = 1;
