@@ -33,6 +33,7 @@ static constexpr NVSDK_NGX_Feature kFeatureDlssNr = static_cast<NVSDK_NGX_Featur
 static constexpr unsigned long long kGenericCustomCoreId = 0x0876232CULL;
 
 enum class ColorProfile { Srgb, ScRgb, Hdr10 };
+enum class OptionalProbe { None, ControlMask, UI, UIAlpha, Backbuffer, Distortion, UIBundle };
 
 struct Options {
     UINT input_w = 960;
@@ -52,6 +53,23 @@ struct Options {
     bool nr_only = false;
     bool compact_nr = false;
     bool framegen = false;
+    OptionalProbe optional_probe = OptionalProbe::None;
+    DXGI_FORMAT optional_format = DXGI_FORMAT_UNKNOWN;
+    int optional_variant = 1;
+    int optional_channel = -1;
+    int use_auto_mask = 1;
+    int ui_correction = 0;
+    int temporal_shift = 0;
+    float motion_x = 0.0f;
+    float motion_y = 0.0f;
+};
+
+struct OptionalResources {
+    ID3D12Resource *control_mask = nullptr;
+    ID3D12Resource *ui = nullptr;
+    ID3D12Resource *ui_alpha = nullptr;
+    ID3D12Resource *backbuffer = nullptr;
+    ID3D12Resource *distortion = nullptr;
 };
 
 static UINT NrWidth(const Options &o) { return o.compact_nr ? o.input_w : o.output_w; }
@@ -918,13 +936,126 @@ static float HalfToFloat(uint16_t half)
 static UINT BytesPerPixel(DXGI_FORMAT format)
 {
     switch (format) {
+    case DXGI_FORMAT_R8_UNORM: return 1;
+    case DXGI_FORMAT_R16_FLOAT: return 2;
     case DXGI_FORMAT_R8G8B8A8_UNORM: return 4;
     case DXGI_FORMAT_R10G10B10A2_UNORM: return 4;
     case DXGI_FORMAT_R16G16_FLOAT: return 4;
     case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8;
+    case DXGI_FORMAT_R32G32_FLOAT: return 8;
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: return 16;
     case DXGI_FORMAT_R32_FLOAT: return 4;
     default: return 0;
     }
+}
+
+static const char *OptionalProbeName(OptionalProbe probe)
+{
+    switch (probe) {
+    case OptionalProbe::ControlMask: return "control-mask";
+    case OptionalProbe::UI: return "ui";
+    case OptionalProbe::UIAlpha: return "ui-alpha";
+    case OptionalProbe::Backbuffer: return "backbuffer";
+    case OptionalProbe::Distortion: return "distortion";
+    case OptionalProbe::UIBundle: return "ui-bundle";
+    default: return "none";
+    }
+}
+
+static const char *FormatName(DXGI_FORMAT format)
+{
+    switch (format) {
+    case DXGI_FORMAT_R8_UNORM: return "r8";
+    case DXGI_FORMAT_R16_FLOAT: return "r16f";
+    case DXGI_FORMAT_R8G8B8A8_UNORM: return "rgba8";
+    case DXGI_FORMAT_R10G10B10A2_UNORM: return "rgb10a2";
+    case DXGI_FORMAT_R16G16_FLOAT: return "rg16f";
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return "rgba16f";
+    case DXGI_FORMAT_R32_FLOAT: return "r32f";
+    case DXGI_FORMAT_R32G32_FLOAT: return "rg32f";
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: return "rgba32f";
+    default: return "unknown";
+    }
+}
+
+static DXGI_FORMAT DefaultOptionalFormat(const Options &o)
+{
+    if (o.optional_format != DXGI_FORMAT_UNKNOWN) return o.optional_format;
+    switch (o.optional_probe) {
+    case OptionalProbe::ControlMask:
+    case OptionalProbe::UIAlpha: return DXGI_FORMAT_R8_UNORM;
+    case OptionalProbe::Distortion: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case OptionalProbe::UI:
+    case OptionalProbe::Backbuffer:
+    case OptionalProbe::UIBundle:
+        return o.profile == ColorProfile::Srgb ? DXGI_FORMAT_R8G8B8A8_UNORM
+            : DXGI_FORMAT_R16G16B16A16_FLOAT;
+    default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+static std::vector<uint8_t> MakeOptionalPattern(UINT width, UINT height,
+    DXGI_FORMAT format, int variant, int selected_channel)
+{
+    const UINT bpp = BytesPerPixel(format);
+    std::vector<uint8_t> data(static_cast<size_t>(width) * height * bpp, 0);
+    for (UINT y = 0; y < height; ++y) {
+        for (UINT x = 0; x < width; ++x) {
+            const bool center = x >= width / 4 && x < 3 * width / 4 &&
+                y >= height / 4 && y < 3 * height / 4;
+            const float value = variant == 0 ? 0.0f : variant == 1 ? 1.0f :
+                (center ? 1.0f : 0.0f);
+            const auto channel_value = [&](int channel) {
+                return selected_channel < 0 || selected_channel == channel ? value : 0.0f;
+            };
+            uint8_t *pixel = data.data() + (static_cast<size_t>(y) * width + x) * bpp;
+            switch (format) {
+            case DXGI_FORMAT_R8_UNORM:
+                pixel[0] = static_cast<uint8_t>(channel_value(0) * 255.0f);
+                break;
+            case DXGI_FORMAT_R16_FLOAT:
+                reinterpret_cast<uint16_t *>(pixel)[0] = FloatToHalf(channel_value(0));
+                break;
+            case DXGI_FORMAT_R8G8B8A8_UNORM:
+                for (int c = 0; c < 4; ++c)
+                    pixel[c] = static_cast<uint8_t>(channel_value(c) * 255.0f);
+                break;
+            case DXGI_FORMAT_R10G10B10A2_UNORM: {
+                const uint32_t r = static_cast<uint32_t>(channel_value(0) * 1023.0f);
+                const uint32_t green = static_cast<uint32_t>(channel_value(1) * 1023.0f);
+                const uint32_t b = static_cast<uint32_t>(channel_value(2) * 1023.0f);
+                const uint32_t a = static_cast<uint32_t>(channel_value(3) * 3.0f);
+                *reinterpret_cast<uint32_t *>(pixel) = r | (green << 10) | (b << 20) | (a << 30);
+                break;
+            }
+            case DXGI_FORMAT_R16G16_FLOAT: {
+                uint16_t *half = reinterpret_cast<uint16_t *>(pixel);
+                half[0] = FloatToHalf(channel_value(0)); half[1] = FloatToHalf(channel_value(1));
+                break;
+            }
+            case DXGI_FORMAT_R16G16B16A16_FLOAT: {
+                uint16_t *half = reinterpret_cast<uint16_t *>(pixel);
+                for (int c = 0; c < 4; ++c) half[c] = FloatToHalf(channel_value(c));
+                break;
+            }
+            case DXGI_FORMAT_R32_FLOAT:
+                reinterpret_cast<float *>(pixel)[0] = channel_value(0);
+                break;
+            case DXGI_FORMAT_R32G32_FLOAT: {
+                float *f = reinterpret_cast<float *>(pixel);
+                f[0] = channel_value(0); f[1] = channel_value(1);
+                break;
+            }
+            case DXGI_FORMAT_R32G32B32A32_FLOAT: {
+                float *f = reinterpret_cast<float *>(pixel);
+                for (int c = 0; c < 4; ++c) f[c] = channel_value(c);
+                break;
+            }
+            default: break;
+            }
+        }
+    }
+    return data;
 }
 
 static bool UploadTexture(ID3D12Resource *texture, const std::vector<uint8_t> &source,
@@ -970,14 +1101,17 @@ static bool UploadTexture(ID3D12Resource *texture, const std::vector<uint8_t> &s
     return ok;
 }
 
-static std::vector<uint8_t> MakeColorPattern(UINT width, UINT height, DXGI_FORMAT format, ColorProfile profile)
+static std::vector<uint8_t> MakeColorPattern(UINT width, UINT height, DXGI_FORMAT format,
+    ColorProfile profile, int offset_x = 0)
 {
     const UINT bpp = BytesPerPixel(format);
     std::vector<uint8_t> data(static_cast<size_t>(width) * height * bpp);
     for (UINT y = 0; y < height; ++y) {
         for (UINT x = 0; x < width; ++x) {
-            const bool checker = ((x / 12) ^ (y / 12)) & 1;
-            const bool line = (x % 61 < 2) || (y % 47 < 2) || ((x + y) % 79 < 2);
+            const UINT sample_x = static_cast<UINT>((static_cast<int>(x) - offset_x % static_cast<int>(width) +
+                static_cast<int>(width)) % static_cast<int>(width));
+            const bool checker = ((sample_x / 12) ^ (y / 12)) & 1;
+            const bool line = (sample_x % 61 < 2) || (y % 47 < 2) || ((sample_x + y) % 79 < 2);
             float r = line ? 1.0f : (checker ? 0.82f : 0.06f);
             float gg = line ? 0.18f : (checker ? 0.11f : 0.68f);
             float b = line ? 0.04f : (checker ? 0.55f : 0.09f);
@@ -1025,9 +1159,14 @@ static std::vector<uint8_t> MakeDepth(UINT width, UINT height)
     return data;
 }
 
-static std::vector<uint8_t> MakeMotionVectors(UINT width, UINT height)
+static std::vector<uint8_t> MakeMotionVectors(UINT width, UINT height, float x, float y)
 {
     std::vector<uint8_t> data(static_cast<size_t>(width) * height * 4, 0);
+    uint16_t *pixels = reinterpret_cast<uint16_t *>(data.data());
+    for (size_t i = 0; i < static_cast<size_t>(width) * height; ++i) {
+        pixels[i * 2 + 0] = FloatToHalf(x);
+        pixels[i * 2 + 1] = FloatToHalf(y);
+    }
     return data;
 }
 
@@ -1199,8 +1338,8 @@ static void SetCreationContract(const Options &o, int flags)
     g.params->Set("DLSSNR.LocalToneStrength", o.local_tone);
     g.params->Set("DLSSNR.LocalStructureStrength", o.local_structure);
     g.params->Set("DLSSNR.SkinStructureStrength", o.skin_structure);
-    g.params->Set("DLSSNR.UseAutoMask", 1u);
-    g.params->Set("DLSSNR.UICorrection", 0u);
+    g.params->Set("DLSSNR.UseAutoMask", static_cast<unsigned int>(o.use_auto_mask));
+    g.params->Set("DLSSNR.UICorrection", static_cast<unsigned int>(o.ui_correction));
     if (g_nr_compute_scaling_ratio != nullptr) {
         const NVSDK_NGX_Result ratio_result = g_nr_compute_scaling_ratio(g.params);
         float resolved_ratio = requested_ratio;
@@ -1305,8 +1444,20 @@ static bool CreateFgFeature(const Options &o, DXGI_FORMAT format)
     return NVSDK_NGX_SUCCEED(result) && g.fg_feature != nullptr;
 }
 
+static void SetOptionalSubrect(const char *resource_name, const char *subrect_prefix,
+    ID3D12Resource *resource, UINT width, UINT height)
+{
+    if (resource == nullptr) return;
+    g.params->Set(resource_name, resource);
+    char key[128];
+    sprintf_s(key, "%sSubrectBaseX", subrect_prefix); g.params->Set(key, 0);
+    sprintf_s(key, "%sSubrectBaseY", subrect_prefix); g.params->Set(key, 0);
+    sprintf_s(key, "%sSubrectWidth", subrect_prefix); g.params->Set(key, static_cast<int>(width));
+    sprintf_s(key, "%sSubrectHeight", subrect_prefix); g.params->Set(key, static_cast<int>(height));
+}
+
 static void SetEvaluationContract(const Options &o, ID3D12Resource *color, ID3D12Resource *output,
-    ID3D12Resource *depth, ID3D12Resource *motion, bool reset)
+    ID3D12Resource *depth, ID3D12Resource *motion, const OptionalResources &optional, bool reset)
 {
     // Keep both the public DLSS/RR names and the feature-18 names. ShortFuse's
     // working evaluator does the same; this lets the lab identify which family
@@ -1360,6 +1511,15 @@ static void SetEvaluationContract(const Options &o, ID3D12Resource *color, ID3D1
     g.params->Set("DLSSNR.OutputSubrectBaseY", 0);
     g.params->Set("DLSSNR.OutputSubrectWidth", static_cast<int>(NrWidth(o)));
     g.params->Set("DLSSNR.OutputSubrectHeight", static_cast<int>(NrHeight(o)));
+    SetOptionalSubrect("DLSSNR.ControlMask", "DLSSNR.ControlMask", optional.control_mask,
+        o.input_w, o.input_h);
+    SetOptionalSubrect("DLSSNR.UI", "DLSSNR.UI", optional.ui, o.input_w, o.input_h);
+    SetOptionalSubrect("DLSSNR.UIAlpha", "DLSSNR.UIAlpha", optional.ui_alpha,
+        o.input_w, o.input_h);
+    SetOptionalSubrect("DLSSNR.Backbuffer", "DLSSNR.Backbuffer", optional.backbuffer,
+        o.input_w, o.input_h);
+    SetOptionalSubrect("DLSSNR.BidirectionalDistortionField",
+        "DLSSNR.BidirectionalDistortionField", optional.distortion, o.input_w, o.input_h);
     g.params->Set("DLSSNR.DepthInverted", 1u);
     g.params->Set("DLSSNR.InputWidth", o.input_w);
     g.params->Set("DLSSNR.InputHeight", o.input_h);
@@ -1382,14 +1542,15 @@ static void SetEvaluationContract(const Options &o, ID3D12Resource *color, ID3D1
     // so evaluation must republish every NR runtime switch rather than relying
     // on values left behind by feature creation.
     g.params->Set("DLSSNR.Enabled", 1u);
-    g.params->Set("DLSSNR.UseAutoMask", 1u);
-    g.params->Set("DLSSNR.UICorrection", 0u);
+    g.params->Set("DLSSNR.UseAutoMask", static_cast<unsigned int>(o.use_auto_mask));
+    g.params->Set("DLSSNR.UICorrection", static_cast<unsigned int>(o.ui_correction));
 }
 
 static bool EvaluateFrame(const Options &o, ID3D12Resource *color, ID3D12Resource *output,
-    ID3D12Resource *depth, ID3D12Resource *motion, bool reset, UINT frame)
+    ID3D12Resource *depth, ID3D12Resource *motion, const OptionalResources &optional,
+    bool reset, UINT frame)
 {
-    SetEvaluationContract(o, color, output, depth, motion, reset);
+    SetEvaluationContract(o, color, output, depth, motion, optional, reset);
     if (!BeginCommands()) return false;
     DWORD exception_code = 0;
     const NVSDK_NGX_Result result = SafeEvaluateFeature(&exception_code);
@@ -1644,6 +1805,14 @@ static void WriteResultJson(const Options &o, bool created, UINT evaluations, co
         "  \"profile\": \"%s\",\n"
         "  \"pipeline\": \"%s\",\n"
         "  \"compactNrResources\": %s,\n"
+        "  \"optionalProbe\": \"%s\",\n"
+        "  \"optionalFormat\": \"%s\",\n"
+        "  \"optionalVariant\": %d,\n"
+        "  \"optionalChannel\": %d,\n"
+        "  \"useAutoMask\": %d,\n"
+        "  \"uiCorrection\": %d,\n"
+        "  \"temporalShiftPixels\": %d,\n"
+        "  \"motionVector\": [%.6f, %.6f],\n"
         "  \"nrResolvedScalingRatio\": %.6f,\n"
         "  \"nrScalingCallbackResult\": \"0x%08X\",\n"
         "  \"nrScalingCallbackSucceeded\": %s,\n"
@@ -1659,7 +1828,10 @@ static void WriteResultJson(const Options &o, bool created, UINT evaluations, co
         created ? "true" : "false", evaluations, o.input_w, o.input_h, o.output_w, o.output_h,
         o.model, o.style, o.perf_quality, o.runtime_scale, ProfileName(o.profile), o.nr_only ? "nr-only" :
             (o.framegen ? "nr-plus-dlss-sr-plus-framegen" : "nr-plus-dlss-sr"),
-        o.compact_nr ? "true" : "false", g_nr_resolved_scaling_ratio,
+        o.compact_nr ? "true" : "false", OptionalProbeName(o.optional_probe),
+        FormatName(DefaultOptionalFormat(o)), o.optional_variant, o.optional_channel,
+        o.use_auto_mask, o.ui_correction, o.temporal_shift, o.motion_x, o.motion_y,
+        g_nr_resolved_scaling_ratio,
         static_cast<unsigned>(g_nr_scaling_callback_result),
         g_nr_scaling_callback_succeeded ? "true" : "false",
         g_nr_stats_vram_bytes, g_nr_stats_opt_level, g_nr_stats_dev_branch, g_runtime_params_calls,
@@ -1690,6 +1862,9 @@ static int Run(const Options &o)
         ProfileName(o.profile), flags);
     Log("tuning: intensity=%.3f localTone=%.3f localStructure=%.3f skinStructure=%.3f",
         o.intensity, o.local_tone, o.local_structure, o.skin_structure);
+    Log("optional contract: probe=%s format=%s variant=%d channel=%d autoMask=%d uiCorrection=%d",
+        OptionalProbeName(o.optional_probe), FormatName(DefaultOptionalFormat(o)),
+        o.optional_variant, o.optional_channel, o.use_auto_mask, o.ui_correction);
 
     // Private feature 18 requires Color and Output to have matching physical
     // allocation dimensions. The lower render resolution is expressed only by
@@ -1697,31 +1872,77 @@ static int Run(const Options &o)
     // A physically low-resolution Color resource is rejected as an invalid
     // Color/Output rect configuration before the neural network is dispatched.
     ID3D12Resource *color = MakeTexture(nr_width, nr_height, input_format, false);
+    std::vector<ID3D12Resource *> frame_colors(o.frames, color);
+    if (o.temporal_shift != 0) {
+        for (UINT frame = 1; frame < o.frames; ++frame)
+            frame_colors[frame] = MakeTexture(nr_width, nr_height, input_format, false);
+    }
     ID3D12Resource *depth = MakeTexture(o.input_w, o.input_h, DXGI_FORMAT_R32_FLOAT, false);
     ID3D12Resource *motion = MakeTexture(o.input_w, o.input_h, DXGI_FORMAT_R16G16_FLOAT, false);
     ID3D12Resource *nr_output = MakeTexture(nr_width, nr_height, color_format, true);
     ID3D12Resource *output = MakeTexture(o.output_w, o.output_h, color_format, true);
     ID3D12Resource *fg_output = MakeTexture(o.output_w, o.output_h, color_format, true);
-    if (color == nullptr || depth == nullptr || motion == nullptr || nr_output == nullptr ||
-        output == nullptr || fg_output == nullptr) {
+    OptionalResources optional;
+    const DXGI_FORMAT optional_format = DefaultOptionalFormat(o);
+    if (o.optional_probe == OptionalProbe::ControlMask)
+        optional.control_mask = MakeTexture(o.input_w, o.input_h, optional_format, false);
+    else if (o.optional_probe == OptionalProbe::UI)
+        optional.ui = MakeTexture(o.input_w, o.input_h, optional_format, false);
+    else if (o.optional_probe == OptionalProbe::UIAlpha)
+        optional.ui_alpha = MakeTexture(o.input_w, o.input_h, optional_format, false);
+    else if (o.optional_probe == OptionalProbe::Backbuffer)
+        optional.backbuffer = MakeTexture(o.input_w, o.input_h, optional_format, false);
+    else if (o.optional_probe == OptionalProbe::Distortion)
+        optional.distortion = MakeTexture(o.input_w, o.input_h, optional_format, false);
+    else if (o.optional_probe == OptionalProbe::UIBundle) {
+        optional.ui = MakeTexture(o.input_w, o.input_h, optional_format, false);
+        optional.ui_alpha = MakeTexture(o.input_w, o.input_h, DXGI_FORMAT_R8_UNORM, false);
+        optional.backbuffer = MakeTexture(o.input_w, o.input_h, optional_format, false);
+    }
+    if (color == nullptr || std::any_of(frame_colors.begin(), frame_colors.end(),
+            [](ID3D12Resource *resource) { return resource == nullptr; }) ||
+        depth == nullptr || motion == nullptr || nr_output == nullptr ||
+        output == nullptr || fg_output == nullptr ||
+        (o.optional_probe != OptionalProbe::None &&
+            optional.control_mask == nullptr && optional.ui == nullptr && optional.ui_alpha == nullptr &&
+            optional.backbuffer == nullptr && optional.distortion == nullptr)) {
         Log("FAIL resource allocation");
         return 2;
     }
 
-    const std::vector<uint8_t> color_pattern = MakeColorPattern(o.input_w, o.input_h, input_format, o.profile);
-    const std::vector<uint8_t> color_data = o.compact_nr ? color_pattern :
-        EmbedTopLeft(color_pattern, o.input_w, o.input_h,
-            o.output_w, o.output_h, BytesPerPixel(input_format));
     const std::vector<uint8_t> depth_data = MakeDepth(o.input_w, o.input_h);
-    const std::vector<uint8_t> motion_data = MakeMotionVectors(o.input_w, o.input_h);
+    const std::vector<uint8_t> motion_data = MakeMotionVectors(o.input_w, o.input_h, o.motion_x, o.motion_y);
     const std::vector<uint8_t> sentinel = MakeSentinel(o.output_w, o.output_h, color_format);
     const std::vector<uint8_t> nr_sentinel = MakeSentinel(nr_width, nr_height, color_format);
-    if (!UploadTexture(color, color_data, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) ||
-        !UploadTexture(depth, depth_data, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) ||
+    const auto upload_optional = [&](ID3D12Resource *resource) {
+        if (resource == nullptr) return true;
+        const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+        if (o.optional_probe == OptionalProbe::UIBundle && resource == optional.backbuffer) {
+            return UploadTexture(resource, MakeColorPattern(static_cast<UINT>(desc.Width), desc.Height,
+                desc.Format, o.profile), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+        return UploadTexture(resource, MakeOptionalPattern(static_cast<UINT>(desc.Width), desc.Height,
+            desc.Format, o.optional_variant, o.optional_channel), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    };
+    bool color_uploads_ok = true;
+    for (UINT frame = 0; frame < o.frames; ++frame) {
+        if (frame > 0 && o.temporal_shift == 0) break;
+        const auto frame_pattern = MakeColorPattern(o.input_w, o.input_h, input_format, o.profile,
+            static_cast<int>(frame) * o.temporal_shift);
+        const auto frame_data = o.compact_nr ? frame_pattern :
+            EmbedTopLeft(frame_pattern, o.input_w, o.input_h, o.output_w, o.output_h,
+                BytesPerPixel(input_format));
+        color_uploads_ok = color_uploads_ok && UploadTexture(frame_colors[frame], frame_data,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    if (!color_uploads_ok || !UploadTexture(depth, depth_data, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) ||
         !UploadTexture(motion, motion_data, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) ||
         !UploadTexture(nr_output, nr_sentinel, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) ||
         !UploadTexture(output, sentinel, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) ||
-        !UploadTexture(fg_output, sentinel, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) {
+        !UploadTexture(fg_output, sentinel, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) ||
+        !upload_optional(optional.control_mask) || !upload_optional(optional.ui) ||
+        !upload_optional(optional.ui_alpha) || !upload_optional(optional.backbuffer) ||
+        !upload_optional(optional.distortion)) {
         Log("FAIL deterministic texture upload");
         return 2;
     }
@@ -1748,7 +1969,7 @@ static int Run(const Options &o)
 
     UINT good = 0;
     for (UINT frame = 0; frame < o.frames; ++frame) {
-        if (!EvaluateFrame(o, color, nr_output, depth, motion, frame == 0, frame)) break;
+        if (!EvaluateFrame(o, frame_colors[frame], nr_output, depth, motion, optional, frame == 0, frame)) break;
         if (!o.nr_only && !EvaluateSrFrame(o, nr_output, output, depth, motion, frame == 0, frame)) break;
         if (o.framegen && !EvaluateFgFrame(o, output, fg_output, depth, motion,
             frame == 0, frame)) break;
@@ -1825,6 +2046,35 @@ static bool ParseFloat(const char *text, float *value)
     return true;
 }
 
+static bool ParseOptionalProbe(const char *text, OptionalProbe *probe)
+{
+    if (_stricmp(text, "none") == 0) *probe = OptionalProbe::None;
+    else if (_stricmp(text, "control-mask") == 0 || _stricmp(text, "mask") == 0)
+        *probe = OptionalProbe::ControlMask;
+    else if (_stricmp(text, "ui") == 0) *probe = OptionalProbe::UI;
+    else if (_stricmp(text, "ui-alpha") == 0) *probe = OptionalProbe::UIAlpha;
+    else if (_stricmp(text, "backbuffer") == 0) *probe = OptionalProbe::Backbuffer;
+    else if (_stricmp(text, "distortion") == 0) *probe = OptionalProbe::Distortion;
+    else if (_stricmp(text, "ui-bundle") == 0) *probe = OptionalProbe::UIBundle;
+    else return false;
+    return true;
+}
+
+static bool ParseFormat(const char *text, DXGI_FORMAT *format)
+{
+    if (_stricmp(text, "r8") == 0) *format = DXGI_FORMAT_R8_UNORM;
+    else if (_stricmp(text, "r16f") == 0) *format = DXGI_FORMAT_R16_FLOAT;
+    else if (_stricmp(text, "rgba8") == 0) *format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    else if (_stricmp(text, "rgb10a2") == 0) *format = DXGI_FORMAT_R10G10B10A2_UNORM;
+    else if (_stricmp(text, "rg16f") == 0) *format = DXGI_FORMAT_R16G16_FLOAT;
+    else if (_stricmp(text, "rgba16f") == 0) *format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    else if (_stricmp(text, "r32f") == 0) *format = DXGI_FORMAT_R32_FLOAT;
+    else if (_stricmp(text, "rg32f") == 0) *format = DXGI_FORMAT_R32G32_FLOAT;
+    else if (_stricmp(text, "rgba32f") == 0) *format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    else return false;
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     GetModuleFileNameA(nullptr, g_dir, MAX_PATH);
@@ -1863,6 +2113,36 @@ int main(int argc, char **argv)
             if (!ParseFloat(argv[++i], &options.local_structure)) return 64;
         } else if (strcmp(arg, "--skin-structure") == 0 && i + 1 < argc) {
             if (!ParseFloat(argv[++i], &options.skin_structure)) return 64;
+        } else if (strcmp(arg, "--optional") == 0 && i + 1 < argc) {
+            if (!ParseOptionalProbe(argv[++i], &options.optional_probe)) {
+                Log("invalid --optional (use none, control-mask, ui, ui-alpha, backbuffer, distortion, or ui-bundle)");
+                return 64;
+            }
+        } else if (strcmp(arg, "--optional-format") == 0 && i + 1 < argc) {
+            if (!ParseFormat(argv[++i], &options.optional_format)) {
+                Log("invalid --optional-format (use r8, r16f, rgba8, rgb10a2, rg16f, rgba16f, r32f, rg32f, or rgba32f)");
+                return 64;
+            }
+        } else if (strcmp(arg, "--optional-variant") == 0 && i + 1 < argc) {
+            options.optional_variant = atoi(argv[++i]);
+        } else if (strcmp(arg, "--optional-channel") == 0 && i + 1 < argc) {
+            const char *channel = argv[++i];
+            if (_stricmp(channel, "all") == 0) options.optional_channel = -1;
+            else if (_stricmp(channel, "r") == 0) options.optional_channel = 0;
+            else if (_stricmp(channel, "g") == 0) options.optional_channel = 1;
+            else if (_stricmp(channel, "b") == 0) options.optional_channel = 2;
+            else if (_stricmp(channel, "a") == 0) options.optional_channel = 3;
+            else { Log("invalid --optional-channel (use all, r, g, b, or a)"); return 64; }
+        } else if (strcmp(arg, "--auto-mask") == 0 && i + 1 < argc) {
+            options.use_auto_mask = atoi(argv[++i]);
+        } else if (strcmp(arg, "--ui-correction") == 0 && i + 1 < argc) {
+            options.ui_correction = atoi(argv[++i]);
+        } else if (strcmp(arg, "--temporal-shift") == 0 && i + 1 < argc) {
+            options.temporal_shift = atoi(argv[++i]);
+        } else if (strcmp(arg, "--motion-x") == 0 && i + 1 < argc) {
+            if (!ParseFloat(argv[++i], &options.motion_x)) return 64;
+        } else if (strcmp(arg, "--motion-y") == 0 && i + 1 < argc) {
+            if (!ParseFloat(argv[++i], &options.motion_y)) return 64;
         } else if (strcmp(arg, "--nr-only") == 0) {
             options.nr_only = true;
         } else if (strcmp(arg, "--compact-nr") == 0) {
@@ -1873,7 +2153,12 @@ int main(int argc, char **argv)
             std::printf("nr-lab [--input 960x540] [--output 1920x1080] [--frames N] [--model 1|2|3]\n"
                         "       [--style N] [--perf-quality 0..5] [--runtime-scale F]\n"
                         "       [--profile srgb|scrgb|hdr10] [--intensity F] [--local-tone F]\n"
-                        "       [--local-structure F] [--skin-structure F] [--nr-only] [--compact-nr] [--framegen]\n");
+                        "       [--local-structure F] [--skin-structure F] [--nr-only] [--compact-nr] [--framegen]\n"
+                        "       [--optional none|control-mask|ui|ui-alpha|backbuffer|distortion|ui-bundle]\n"
+                        "       [--optional-format r8|r16f|rgba8|rgb10a2|rg16f|rgba16f|r32f|rg32f|rgba32f]\n"
+                        "       [--optional-variant 0|1|2] [--optional-channel all|r|g|b|a]\n"
+                        "       [--auto-mask 0|1] [--ui-correction 0|1]\n"
+                        "       [--temporal-shift pixels-per-frame] [--motion-x F] [--motion-y F]\n");
             return 0;
         } else {
             Log("unknown argument: %s", arg);
@@ -1882,9 +2167,13 @@ int main(int argc, char **argv)
     }
     if (options.model < 1 || options.model > 3 || options.style < -1 ||
         options.perf_quality < -1 || options.perf_quality > 5 ||
+        options.optional_variant < 0 || options.optional_variant > 2 ||
+        options.optional_channel < -1 || options.optional_channel > 3 ||
+        options.use_auto_mask < 0 || options.use_auto_mask > 1 ||
+        options.ui_correction < 0 || options.ui_correction > 1 ||
         (options.runtime_scale != -1.0f && options.runtime_scale <= 0.0f) ||
         options.output_w < options.input_w || options.output_h < options.input_h) {
-        Log("invalid contract: model must be 1..3, style must be >= -1, perf quality must be -1..5, runtime scale must be positive or -1, and output must be at least input size");
+        Log("invalid contract: model 1..3, style >= -1, quality -1..5, optional variant 0..2, switches 0..1, positive runtime scale or -1, and output >= input are required");
         return 64;
     }
     if (options.nr_only && options.compact_nr &&

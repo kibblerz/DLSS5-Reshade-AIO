@@ -77,3 +77,74 @@ a larger image. Within every discovered creation, evaluation, callback, style,
 preset, and quality path, NR remains an input-resolution image transformation.
 Native-resolution reconstruction still requires the separate DLSS Super
 Resolution feature.
+
+## Optional resource contract
+
+`run-optional-contract-probe.ps1` exercises the five optional resources with
+synthetic zero, full, and center-rectangle patterns. The harness exposes these
+tests through `--optional`, `--optional-format`, `--optional-variant`,
+`--optional-channel`, `--auto-mask`, and `--ui-correction`.
+
+All 63 static format/pattern cases created feature 18 and evaluated without an
+NGX error. Successful evaluation does not by itself mean that the resource was
+used, so the matrix also compares the output bytes with a no-resource baseline.
+
+### ControlMask
+
+`DLSSNR.ControlMask` is an effective spatial NR application mask:
+
+- zero produces the unprocessed input;
+- one produces the normal full-frame NR result;
+- a center-rectangle pattern applies NR inside that rectangle and bypasses it
+  outside;
+- the R channel is the independently effective scalar channel. G, B, or A alone
+  do not enable NR. R8 UNORM therefore expresses the useful scalar contract
+  without ambiguous extra channels;
+- a supplied control mask overrides the automatic-mask result even when
+  `DLSSNR.UseAutoMask` remains enabled.
+
+With no explicit resource, toggling `UseAutoMask` changes the output, confirming
+that the package has its own generated mask. An application-supplied mask is a
+separate, stronger control path.
+
+### UI, UIAlpha, and Backbuffer
+
+The UI resources form a gated compositing/protection contract:
+
+- `DLSSNR.UICorrection=0` makes UI, UIAlpha, and Backbuffer output-inert;
+- with correction enabled, the alpha channel of `DLSSNR.UI` acts as a protected
+  pixel mask. Its RGB channels were independently output-inert;
+- `DLSSNR.UIAlpha` supplies the same protection mask as a separate texture;
+- alpha zero leaves NR active, alpha one bypasses NR, and a spatial alpha mask
+  bypasses NR only in the marked region;
+- RGB channels of `DLSSNR.Backbuffer` supply the pixels restored in protected
+  regions. Its alpha channel was independently output-inert;
+- a coherent test using the original input as Backbuffer and a rectangular
+  UIAlpha restored the original pixels in that rectangle while retaining NR
+  outside it.
+
+This is designed to keep HUD/UI pixels out of neural processing. A generic
+Present-time addon does not automatically possess a clean UI mask, but a game
+or shader-provided alpha mask can use this path without changing the NR model.
+
+### BidirectionalDistortionField
+
+The provider fetches `DLSSNR.BidirectionalDistortionField` and all four subrect
+values when supplied, and evaluation accepts R8, R16F, RG16F, RGBA16F, R32F,
+RG32F, and RGBA32F resources. No tested pattern changed output bytes.
+
+The negative result also held for animated four-frame input, nonzero motion,
+all three Style values, and both automatic-mask states. For this production
+package the field is either unused by the shipped models, requires an
+unrecovered gate/encoding, or only affects a type of scene distortion absent
+from the synthetic sequence. It should not be integrated into the addon until
+a material output response is demonstrated.
+
+### Practical integration consequence
+
+The existing `DLSS5_AIO_Mask` guide is an R8 texture that marks unreliable
+motion, depth discontinuities, and outside-screen reprojections with one. NR's
+ControlMask has the opposite polarity: one applies NR and zero bypasses it.
+An experimental anti-smear path can therefore invert that reliability mask and
+pass it as `DLSSNR.ControlMask`, while continuing to pass the original mask to
+DLSS SR's current-frame/history-bias inputs.

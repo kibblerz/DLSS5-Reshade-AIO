@@ -11,6 +11,8 @@ lab/*.lib
 lab/*.log
 lab/*.ppm
 lab/*.json
+lab/*.png
+lab/optional-*.txt
 lab/matrix-results.txt
 lab/log-*.txt
 
