@@ -22,11 +22,11 @@
 #include <nvsdk_ngx_params.h>
 #include <nvsdk_ngx_defs_dlssd.h>
 
-#define ADDON_VERSION "1.3.4-overlay-click-bridge"
+#define ADDON_VERSION "1.4.0-direct-nr-upscale-test"
 
-extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
+extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR Direct Upscale " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
-    "Standalone D3D12 DLSS Neural Rendering followed by DLSS Super Resolution.";
+    "Experimental standalone D3D12 direct upscaling through DLSS Neural Rendering feature 18.";
 
 static HMODULE g_self;
 static wchar_t g_addon_directory[MAX_PATH];
@@ -314,7 +314,7 @@ static void BuildRuntimePath(wchar_t (&path)[MAX_PATH], const wchar_t *directory
 
 static bool HasStandaloneRuntime(const wchar_t *directory)
 {
-    for (const wchar_t *name : {L"nvngx_dlssnr.dll", L"nvngx_dlss.dll", L"nvngx.dll"})
+    for (const wchar_t *name : {L"nvngx_dlssnr.dll", L"nvngx.dll"})
     {
         wchar_t path[MAX_PATH] = {};
         BuildRuntimePath(path, directory, name);
@@ -357,12 +357,11 @@ static bool InitializeNgx()
         Fail("private runtime dependency set missing", ERROR_FILE_NOT_FOUND);
         return false;
     }
-    wchar_t nr_path[MAX_PATH] = {}, dlss_path[MAX_PATH] = {}, bridge_path[MAX_PATH] = {};
+    wchar_t nr_path[MAX_PATH] = {}, bridge_path[MAX_PATH] = {};
     BuildRuntimePath(nr_path, runtime_directory, L"nvngx_dlssnr.dll");
-    BuildRuntimePath(dlss_path, runtime_directory, L"nvngx_dlss.dll");
     BuildRuntimePath(bridge_path, runtime_directory, L"nvngx.dll");
     Log("standalone private runtime directory: %ls", runtime_directory);
-    for (const wchar_t *path : {nr_path, dlss_path, bridge_path})
+    for (const wchar_t *path : {nr_path, bridge_path})
     {
         WIN32_FILE_ATTRIBUTE_DATA data = {};
         if (!GetFileAttributesExW(path, GetFileExInfoStandard, &data))
@@ -410,15 +409,7 @@ static bool InitializeNgx()
     Log("NR snippet Init_Ext = 0x%08X (%s)", static_cast<unsigned int>(result), ResultName(result));
     if (NVSDK_NGX_FAILED(result)) { Fail("NR snippet Init_Ext", static_cast<unsigned int>(result)); return false; }
 
-    g_dlss_module = LoadLibraryExW(dlss_path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-    auto dlss_init = g_dlss_module ? reinterpret_cast<NgxSnippetInitD3D12Ext>(GetProcAddress(g_dlss_module, "NVSDK_NGX_D3D12_Init_Ext")) : nullptr;
-    g_sr_create = g_dlss_module ? reinterpret_cast<NgxCreateFeature>(GetProcAddress(g_dlss_module, "NVSDK_NGX_D3D12_CreateFeature")) : nullptr;
-    g_sr_evaluate = g_dlss_module ? reinterpret_cast<NgxEvaluateFeature>(GetProcAddress(g_dlss_module, "NVSDK_NGX_D3D12_EvaluateFeature")) : nullptr;
-    g_sr_release = g_dlss_module ? reinterpret_cast<NgxReleaseFeature>(GetProcAddress(g_dlss_module, "NVSDK_NGX_D3D12_ReleaseFeature")) : nullptr;
-    if (!dlss_init || !g_sr_create || !g_sr_evaluate || !g_sr_release) { Fail("DLSS SR snippet exports", static_cast<unsigned int>(GetLastError())); return false; }
-    result = bridge_init(dlss_init, kGenericCustomCoreId, dlss_path, g_neural_device.Get(), NVSDK_NGX_Version_API, nullptr);
-    Log("DLSS SR snippet Init_Ext = 0x%08X (%s)", static_cast<unsigned int>(result), ResultName(result));
-    if (NVSDK_NGX_FAILED(result)) { Fail("DLSS SR snippet Init_Ext", static_cast<unsigned int>(result)); return false; }
+    Log("direct NR test: nvngx_dlss.dll will not be loaded or initialized");
     result = allocate(&g_ngx_params);
     Log("driver-core AllocateParameters = 0x%08X (%s), ptr=%p", static_cast<unsigned int>(result), ResultName(result), g_ngx_params);
     if (NVSDK_NGX_FAILED(result) || !g_ngx_params) { Fail("AllocateParameters", static_cast<unsigned int>(result)); return false; }
@@ -523,27 +514,9 @@ static bool CreateFeatures()
     Log("CreateFeature(feature=18) = 0x%08X (%s), handle=%p", static_cast<unsigned int>(result), ResultName(result), g_nr_feature);
     if (NVSDK_NGX_FAILED(result) || !g_nr_feature) { Fail("NR feature creation", static_cast<unsigned int>(result)); return false; }
 
-    const float ratio = static_cast<float>(g_resource_input_width) / static_cast<float>(g_resource_output_width);
-    const int quality = ratio >= 0.72f ? NVSDK_NGX_PerfQuality_Value_UltraQuality :
-        ratio >= 0.62f ? NVSDK_NGX_PerfQuality_Value_MaxQuality :
-        ratio >= 0.54f ? NVSDK_NGX_PerfQuality_Value_Balanced :
-        ratio >= 0.42f ? NVSDK_NGX_PerfQuality_Value_MaxPerf : NVSDK_NGX_PerfQuality_Value_UltraPerformance;
-    g_ngx_params->Reset();
-    g_ngx_params->Set("CreationNodeMask", 1u); g_ngx_params->Set("VisibilityNodeMask", 1u);
-    g_ngx_params->Set("Width", g_resource_input_width); g_ngx_params->Set("Height", g_resource_input_height);
-    g_ngx_params->Set("OutWidth", g_resource_output_width); g_ngx_params->Set("OutHeight", g_resource_output_height);
-    g_ngx_params->Set("PerfQualityValue", quality);
-    g_ngx_params->Set("DLSS.Feature.Create.Flags", FeatureFlags());
-    g_ngx_params->Set("DLSS.Enable.Output.Subrects", 0);
-    if (!BeginNeuralCommands()) return false;
-    exception = 0;
-    result = SafeCreate(false, &exception);
-    if (exception) { g_neural_list->Close(); Fail("DLSS SR feature creation exception", exception); return false; }
-    if (!SubmitNeuralCommands(true)) return false;
-    Log("CreateFeature(feature=SuperSampling) = 0x%08X (%s), handle=%p quality=%d", static_cast<unsigned int>(result), ResultName(result), g_sr_feature, quality);
-    if (NVSDK_NGX_FAILED(result) || !g_sr_feature) { Fail("DLSS SR feature creation", static_cast<unsigned int>(result)); return false; }
-    Log("standalone contract ready: NR feature 18 %ux%u active rect, DLSS SR -> %ux%u, model=%d, profile=%s",
+    Log("DIRECT NR UPSCALE TEST ready: feature 18 input=%ux%u output=%ux%u ratio=%.4f model=%d profile=%s; DLSS SR NOT CREATED",
         g_resource_input_width, g_resource_input_height, g_resource_output_width, g_resource_output_height,
+        static_cast<float>(g_resource_input_width) / static_cast<float>(g_resource_output_width),
         g_nr_model, ProfileName(g_color_profile));
     g_active_nr_model = g_nr_model;
     return true;
@@ -551,17 +524,9 @@ static bool CreateFeatures()
 
 static bool RecreateFeatures()
 {
-    if (!g_neural_ready || !g_nr_feature || !g_sr_feature) return false;
+    if (!g_neural_ready || !g_nr_feature) return false;
     if (!WaitForNeuralGpu()) return false;
     DWORD exception = 0;
-    NVSDK_NGX_Result sr_result = SafeRelease(g_sr_release, g_sr_feature, &exception);
-    if (exception || NVSDK_NGX_FAILED(sr_result))
-    {
-        Fail(exception ? "DLSS SR release exception" : "DLSS SR release",
-            exception ? exception : static_cast<unsigned int>(sr_result));
-        return false;
-    }
-    g_sr_feature = nullptr;
     NVSDK_NGX_Result nr_result = SafeRelease(g_nr_release, g_nr_feature, &exception);
     if (exception || NVSDK_NGX_FAILED(nr_result))
     {
@@ -685,20 +650,19 @@ static bool EnsureStandaloneResources(ID3D12Resource *backbuffer)
     g_resource_input_format = input_format;
     const DXGI_FORMAT result_format = g_color_profile == ColorProfile::Srgb ?
         DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
-    if (!CreateTexture(ow, oh, input_format, false,
+    if (!CreateTexture(iw, ih, input_format, false,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g_packed_color) ||
-        !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g_nr_stage) ||
-        !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, g_sr_stage)) return false;
+        !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, g_nr_stage)) return false;
     const float motion_clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     const float depth_clear[4] = {g_depth_reversed ? 0.0f : 1.0f, 0.0f, 0.0f, 0.0f};
     if (!CreateGuideTexture(iw, ih, DXGI_FORMAT_R16G16_FLOAT, motion_clear, 0, g_fallback_motion) ||
         !CreateGuideTexture(iw, ih, DXGI_FORMAT_R32_FLOAT, depth_clear, 1, g_fallback_depth)) return false;
     if (!InitializeNgx() || !CreateFeatures()) return false;
-    PublishOutput(g_sr_stage.Get());
+    PublishOutput(g_nr_stage.Get());
     g_neural_ready = true;
-    SetStatus("active on present: NR + DLSS SR (fallback guides)");
-    Log("resources ready on present: packed=%ux%u fmt=%u, NR/SR=%ux%u fmt=%u; fallback guides=%ux%u",
-        ow, oh, static_cast<unsigned int>(input_format), ow, oh, static_cast<unsigned int>(result_format), iw, ih);
+    SetStatus("direct NR upscale ready: feature 18 only");
+    Log("DIRECT NR resource proof: Color=%ux%u fmt=%u, Output=%ux%u fmt=%u, Guides=%ux%u; published=NR output",
+        iw, ih, static_cast<unsigned int>(input_format), ow, oh, static_cast<unsigned int>(result_format), iw, ih);
     return true;
 }
 
@@ -991,72 +955,37 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
 
     const bool reset = g_need_history_reset || g_reset_every_frame;
     g_need_history_reset = false;
-    D3D12_RESOURCE_BARRIER sr_to_uav = Transition(
-        g_sr_stage.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    g_neural_list->ResourceBarrier(1, &sr_to_uav);
+    D3D12_RESOURCE_BARRIER nr_to_uav = Transition(
+        g_nr_stage.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g_neural_list->ResourceBarrier(1, &nr_to_uav);
     DWORD exception = 0;
-    NVSDK_NGX_Result nr_result = NVSDK_NGX_Result_Success;
-    if (!g_bypass_nr_for_ab)
-    {
-        SetNrEvaluationContract(depth, motion, reset);
-        nr_result = SafeEvaluate(true, &exception);
-        if (exception)
-        {
-            g_neural_list->Close();
-            Fail("on-present NR evaluation exception", exception);
-            return false;
-        }
-    }
-    D3D12_RESOURCE_BARRIER nr_to_srv = {};
-    ID3D12Resource *sr_color = g_packed_color.Get();
-    if (!g_bypass_nr_for_ab)
-    {
-        nr_to_srv = Transition(g_nr_stage.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        g_neural_list->ResourceBarrier(1, &nr_to_srv);
-        sr_color = g_nr_stage.Get();
-    }
-    SetSrEvaluationContract(sr_color, depth, motion, reset);
-    NVSDK_NGX_Result sr_result = static_cast<NVSDK_NGX_Result>(0xBAD00004);
-    if (NVSDK_NGX_SUCCEED(nr_result)) sr_result = SafeEvaluate(false, &exception);
+    SetNrEvaluationContract(depth, motion, reset);
+    NVSDK_NGX_Result nr_result = SafeEvaluate(true, &exception);
     if (exception)
     {
         g_neural_list->Close();
-        Fail("on-present DLSS SR evaluation exception", exception);
+        Fail("direct NR upscale evaluation exception", exception);
         return false;
     }
-    D3D12_RESOURCE_BARRIER sr_restore = Transition(
-        g_sr_stage.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-    if (!g_bypass_nr_for_ab)
-    {
-        D3D12_RESOURCE_BARRIER restore[2] = {
-            Transition(g_nr_stage.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-            sr_restore
-        };
-        g_neural_list->ResourceBarrier(2, restore);
-    }
-    else
-    {
-        g_neural_list->ResourceBarrier(1, &sr_restore);
-    }
+    D3D12_RESOURCE_BARRIER nr_to_common = Transition(
+        g_nr_stage.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    g_neural_list->ResourceBarrier(1, &nr_to_common);
     if (!SubmitNeuralCommands(false)) return false;
-    if (NVSDK_NGX_FAILED(nr_result) || NVSDK_NGX_FAILED(sr_result))
+    if (NVSDK_NGX_FAILED(nr_result))
     {
-        Log("on-present evaluation failure: NR=0x%08X (%s), SR=0x%08X (%s)",
-            static_cast<unsigned int>(nr_result), ResultName(nr_result),
-            static_cast<unsigned int>(sr_result), ResultName(sr_result));
-        Fail(NVSDK_NGX_FAILED(nr_result) ? "on-present NR evaluation" : "on-present DLSS SR evaluation",
-            static_cast<unsigned int>(NVSDK_NGX_FAILED(nr_result) ? nr_result : sr_result));
+        Log("DIRECT NR UPSCALE FAILED: result=0x%08X (%s), contract=%ux%u -> %ux%u",
+            static_cast<unsigned int>(nr_result), ResultName(nr_result), g_resource_input_width,
+            g_resource_input_height, g_resource_output_width, g_resource_output_height);
+        Fail("direct NR upscale evaluation", static_cast<unsigned int>(nr_result));
         return false;
     }
 
-    const unsigned long long frame = g_bypass_nr_for_ab ? g_sr_frames.load() + 1 : ++g_nr_frames;
-    ++g_sr_frames;
-    SetStatus(g_bypass_nr_for_ab ? "diagnostic: NR BYPASSED; DLSS SR only" :
-        "active on present: NR model %d + DLSS SR (%s guides)",
+    const unsigned long long frame = ++g_nr_frames;
+    SetStatus("DIRECT NR UPSCALE ACTIVE: model %d (%s guides)",
         g_active_nr_model, use_external_guides ? "same-frame motion" : "fallback");
     if (frame <= 8 || frame % 1800 == 0)
-        Log("on-present frame %llu: NR=%s, SR=Success, model=%d, reset=%d, guides=%s %ux%u, output=%ux%u",
-            frame, g_bypass_nr_for_ab ? "BYPASSED" : "Success", g_active_nr_model,
+        Log("DIRECT NR UPSCALE frame=%llu result=Success model=%d reset=%d guides=%s input=%ux%u output=%ux%u; SR evaluations=0",
+            frame, g_active_nr_model,
             reset ? 1 : 0, use_external_guides ? "same-frame-motion" : "fallback",
             g_resource_input_width, g_resource_input_height, g_resource_output_width, g_resource_output_height);
     return true;
@@ -1389,7 +1318,7 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
 {
     ID3D12Resource *neural_source = g_nr_output;
     ID3D12Resource *original_source = g_packed_color.Get();
-    if (g_proxy_hidden || g_sr_frames.load() == 0 || neural_source == nullptr ||
+    if (g_proxy_hidden || g_nr_frames.load() == 0 || neural_source == nullptr ||
         original_source == nullptr || backbuffer == nullptr || !EnsureProxy(neural_source)) return false;
 
     if (g_proxy_fence_value != 0 && g_proxy_fence->GetCompletedValue() < g_proxy_fence_value)
@@ -1675,12 +1604,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         reshade::set_config_value(nullptr, section, "ResetEveryFrame", g_reset_every_frame ? "1" : "0");
     ImGui::SameLine();
     if (ImGui::Button("Reset history now")) g_need_history_reset = true;
-    if (ImGui::Checkbox("Diagnostic A/B: bypass feature 18 (DLSS SR only)", &g_bypass_nr_for_ab))
-    {
-        g_need_history_reset = true;
-        Log("user A/B diagnostic changed: NR feature 18 is now %s", g_bypass_nr_for_ab ? "BYPASSED" : "ENABLED");
-    }
-    ImGui::TextDisabled("Toggle this while viewing a detailed static scene to isolate NR's contribution from upscaling.");
+    ImGui::TextDisabled("Direct feature-18 upscaling test: the DLSS Super Resolution feature is not created or evaluated.");
     if (ImGui::Checkbox("Present neural output (F10)", &g_show_neural_output))
     {
         g_need_history_reset = true;
@@ -1696,8 +1620,8 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::Separator();
     ImGui::Text("Status: %s", g_neural_status);
     ImGui::TextUnformatted("Activation boundary: game OnPresent (standalone private NGX runtime)");
-    ImGui::Text("Pipeline: feature 18 NR frames=%llu; DLSS SR frames=%llu; active model=%d%s",
-        g_nr_frames.load(), g_sr_frames.load(), g_active_nr_model, g_bypass_nr_for_ab ? " (NR BYPASSED)" : "");
+    ImGui::Text("Pipeline: direct feature 18 frames=%llu; DLSS SR frames=0; active model=%d",
+        g_nr_frames.load(), g_active_nr_model);
     ImGui::Text("Contract: %ux%u -> %ux%u", g_input_width.load(), g_input_height.load(), g_output_width.load(), g_output_height.load());
     ImGui::Text("Guides: %s; validation mask=%s",
         g_using_external_guides ? "same-frame VORT optical flow" : "internal zero-motion fallback",
@@ -1709,7 +1633,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g_reshade_overlay_open.load() ? "click-through" : "game forwarding");
     ImGui::Text("Routed ReShade mouse events: %llu", g_overlay_mouse_events.load());
     ImGui::Text("Presented image: %s", g_show_neural_output ? "neural native output" : "stretched original backbuffer");
-    ImGui::TextWrapped("Set the reduced render resolution in Conan's fullscreen menu. The addon keeps the desktop at native resolution and performs NR followed by DLSS Super Resolution.");
+    ImGui::TextWrapped("Set the reduced render resolution in Conan's fullscreen menu. Feature 18 receives that exact-sized image and writes directly into a native-resolution output; no DLSS SR pass is used.");
     ImGui::TextUnformatted("Press F10 for neural/stretched-original A/B. Home is composited into the proxy; Alt+X hides it for NVIDIA.");
     ImGui::Text("Log: %s", g_log_path);
 }
@@ -1769,7 +1693,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("ResetEveryFrame", "0", value, sizeof(value)); g_reset_every_frame = strcmp(value, "0") != 0;
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
-        Log("Standalone DLSS-NR + SR %s attached; profile=%s model=%d", ADDON_VERSION, ProfileName(g_color_profile), g_nr_model);
+        Log("Standalone DLSS-NR direct upscale test %s attached; profile=%s model=%d", ADDON_VERSION, ProfileName(g_color_profile), g_nr_model);
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
