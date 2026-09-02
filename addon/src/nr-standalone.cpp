@@ -28,7 +28,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.6-vulkan-overlay"
+#define ADDON_VERSION "1.7.7-runtime-discovery"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -467,68 +467,100 @@ static void BuildRuntimePath(wchar_t (&path)[MAX_PATH], const wchar_t *directory
     swprintf_s(path, L"%ls%ls%ls", directory, has_separator ? L"" : L"\\", name);
 }
 
-static bool HasStandaloneRuntime(const wchar_t *directory)
+static std::vector<std::wstring> RuntimeSearchDirectories()
 {
-    for (const wchar_t *name : {L"nvngx_dlssnr.dll", L"nvngx_dlss.dll", L"nvngx.dll"})
+    std::vector<std::wstring> candidates;
+    auto add_candidate = [&candidates](const wchar_t *candidate)
     {
-        wchar_t path[MAX_PATH] = {};
-        BuildRuntimePath(path, directory, name);
-        const DWORD attributes = GetFileAttributesW(path);
-        if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
-            return false;
-    }
-    return true;
-}
+        if (candidate == nullptr || candidate[0] == L'\0') return;
+        for (const std::wstring &existing : candidates)
+            if (_wcsicmp(existing.c_str(), candidate) == 0) return;
+        candidates.emplace_back(candidate);
+    };
 
-static bool FindStandaloneRuntime(wchar_t (&directory)[MAX_PATH])
-{
-    if (HasStandaloneRuntime(g_addon_directory))
+    // ReShade may load an addon from a dedicated addon search directory, while
+    // users conventionally put NGX runtime DLLs beside the game executable.
+    // Probe both locations explicitly instead of assuming they are identical.
+    add_candidate(g_addon_directory);
+
+    wchar_t game_directory[MAX_PATH] = {};
+    if (GetModuleFileNameW(nullptr, game_directory, MAX_PATH) != 0)
     {
-        wcscpy_s(directory, g_addon_directory);
-        return true;
+        wchar_t *slash = wcsrchr(game_directory, L'\\');
+        if (slash != nullptr)
+        {
+            slash[1] = L'\0';
+            add_candidate(game_directory);
+        }
     }
+
+    wchar_t working_directory[MAX_PATH] = {};
+    const DWORD working_length = GetCurrentDirectoryW(MAX_PATH, working_directory);
+    if (working_length != 0 && working_length < MAX_PATH)
+        add_candidate(working_directory);
 
     wchar_t local_app_data[MAX_PATH] = {};
     if (GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH) != 0)
     {
         wchar_t custom_addons[MAX_PATH] = {};
         swprintf_s(custom_addons, L"%ls\\RHI\\Custom\\Addons", local_app_data);
-        if (HasStandaloneRuntime(custom_addons))
+        add_candidate(custom_addons);
+    }
+
+    return candidates;
+}
+
+static bool FindStandaloneRuntimeFile(const wchar_t *name, wchar_t (&path)[MAX_PATH], bool required)
+{
+    for (const std::wstring &directory : RuntimeSearchDirectories())
+    {
+        wchar_t candidate[MAX_PATH] = {};
+        BuildRuntimePath(candidate, directory.c_str(), name);
+        Log("runtime search candidate: %ls", candidate);
+        const DWORD attributes = GetFileAttributesW(candidate);
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
         {
-            wcscpy_s(directory, custom_addons);
+            wcscpy_s(path, candidate);
             return true;
         }
     }
+    Log("%s runtime not found: %ls", required ? "required" : "optional", name);
     return false;
 }
 
 static bool InitializeNgx()
 {
     if (g_ngx_params != nullptr) return true;
-    wchar_t runtime_directory[MAX_PATH] = {};
-    if (!FindStandaloneRuntime(runtime_directory))
+    wchar_t nr_path[MAX_PATH] = {}, dlss_path[MAX_PATH] = {}, dlssg_path[MAX_PATH] = {}, bridge_path[MAX_PATH] = {};
+    const bool have_nr = FindStandaloneRuntimeFile(L"nvngx_dlssnr.dll", nr_path, true);
+    const bool have_dlss = FindStandaloneRuntimeFile(L"nvngx_dlss.dll", dlss_path, true);
+    const bool have_dlssg = FindStandaloneRuntimeFile(L"nvngx_dlssg.dll", dlssg_path, false);
+    const bool have_bridge = FindStandaloneRuntimeFile(L"nvngx.dll", bridge_path, true);
+    if (!have_nr || !have_dlss || !have_bridge)
     {
-        Log("standalone runtime set not found beside addon or in %%LOCALAPPDATA%%\\RHI\\Custom\\Addons");
-        Fail("private runtime dependency set missing", ERROR_FILE_NOT_FOUND);
+        Fail("required private runtime dependency missing", ERROR_FILE_NOT_FOUND);
         return false;
     }
-    wchar_t nr_path[MAX_PATH] = {}, dlss_path[MAX_PATH] = {}, dlssg_path[MAX_PATH] = {}, bridge_path[MAX_PATH] = {};
-    BuildRuntimePath(nr_path, runtime_directory, L"nvngx_dlssnr.dll");
-    BuildRuntimePath(dlss_path, runtime_directory, L"nvngx_dlss.dll");
-    BuildRuntimePath(dlssg_path, runtime_directory, L"nvngx_dlssg.dll");
-    BuildRuntimePath(bridge_path, runtime_directory, L"nvngx.dll");
-    Log("standalone private runtime directory: %ls", runtime_directory);
-    for (const wchar_t *path : {nr_path, dlss_path, dlssg_path, bridge_path})
+    for (const wchar_t *runtime_path : {nr_path, dlss_path, bridge_path})
     {
         WIN32_FILE_ATTRIBUTE_DATA data = {};
-        if (!GetFileAttributesExW(path, GetFileExInfoStandard, &data))
-        {
-            Log("required runtime missing: %ls", path);
-            Fail("runtime dependency missing", ERROR_FILE_NOT_FOUND);
-            return false;
-        }
+        if (!GetFileAttributesExW(runtime_path, GetFileExInfoStandard, &data)) return false;
         const unsigned long long size = (static_cast<unsigned long long>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
-        Log("runtime dependency: %ls (%llu bytes)", path, size);
+        Log("runtime dependency: %ls (%llu bytes)", runtime_path, size);
+    }
+    if (have_dlssg)
+    {
+        WIN32_FILE_ATTRIBUTE_DATA data = {};
+        if (GetFileAttributesExW(dlssg_path, GetFileExInfoStandard, &data))
+        {
+            const unsigned long long size = (static_cast<unsigned long long>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+            Log("runtime dependency: %ls (%llu bytes)", dlssg_path, size);
+        }
+    }
+    else
+    {
+        Log("DLSS-G runtime unavailable; NR and DLSS SR will continue with frame generation disabled");
+        g_framegen_failed = true;
     }
 
     g_nr_module = LoadLibraryExW(nr_path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
@@ -578,7 +610,7 @@ static bool InitializeNgx()
     Log("DLSS SR snippet Init_Ext = 0x%08X (%s)", static_cast<unsigned int>(result), ResultName(result));
     if (NVSDK_NGX_FAILED(result)) { Fail("DLSS SR snippet Init_Ext", static_cast<unsigned int>(result)); return false; }
 
-    g_dlssg_module = LoadLibraryExW(dlssg_path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    g_dlssg_module = have_dlssg ? LoadLibraryExW(dlssg_path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH) : nullptr;
     auto dlssg_init = g_dlssg_module ? reinterpret_cast<NgxSnippetInitD3D12Ext>(GetProcAddress(g_dlssg_module, "NVSDK_NGX_D3D12_Init_Ext")) : nullptr;
     g_fg_create = g_dlssg_module ? reinterpret_cast<NgxCreateFeature>(GetProcAddress(g_dlssg_module, "NVSDK_NGX_D3D12_CreateFeature")) : nullptr;
     g_fg_evaluate = g_dlssg_module ? reinterpret_cast<NgxEvaluateFeature>(GetProcAddress(g_dlssg_module, "NVSDK_NGX_D3D12_EvaluateFeature")) : nullptr;
