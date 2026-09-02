@@ -44,8 +44,20 @@ Reduced-resolution DLSS SR can provide major performance improvements. Native-re
 | Image is small, smeared, or changes size | Restart the game. Set the resolution and display mode before loading gameplay. Press F10 once to confirm whether the presentation proxy is active. |
 | ReShade menu temporarily makes the image smaller | Close the ReShade menu; the native-size processed output should return. This is a known proxy-input workaround in some games. |
 | Black screen | Close the game, restore native resolution, and try another display mode. Do not repeatedly change resolution while the pipeline is active. Check the persistent log before trying again. |
-| D3D12/D3D11On12 game hangs while starting | Enable **Early proxy initialization (D3D11On12 compatibility)** in the addon settings, then restart the game. It is disabled by default and must not be toggled without restarting. |
+| D3D12/D3D11On12 game hangs, freezes, or remains waiting for Present while starting | Try **Early proxy initialization (D3D11On12 compatibility)** using the instructions below. Leave it off for games that already start normally. |
 | Vulkan says it is waiting for a shared frame | Make sure ReShade's Vulkan layer is active. Install `StandaloneBoundary.fx` when no other ReShade effect is loaded; Vulkan needs an effects boundary for the frame handoff. |
+
+### Early proxy initialization
+
+This is a compatibility workaround for certain **D3D12 games that use D3D11On12**. It creates the addon's native-size output window before the game's first Present call, avoiding a startup deadlock seen in some titles. It does not improve image quality or performance and is not intended for D3D9, ordinary D3D11, or Vulkan games.
+
+1. Leave the option **off** unless a D3D12 game hangs, freezes, or never gets past waiting for Present/native proxy initialization.
+2. In ReShade, open **Add-ons > Standalone DLSS-NR + Super Resolution** and enable **Early proxy initialization (D3D11On12 compatibility)**.
+3. Completely close the game and start it again. The setting only takes effect during the next process launch; do not switch it on or off while testing the same game session.
+4. If the game now starts, leave the option enabled for that game only. ReShade saves addon settings per installation.
+5. If it causes a black screen, crash, or a new startup problem, turn it back off and restart. If the menu is inaccessible, close the game and set `EarlyProxyInitialization=0` under `[Standalone.DLSSNR]` in the game's `ReShade.ini`.
+
+The persistent log records `early_proxy=enabled` at startup when the saved setting was applied. A queue mismatch is rejected rather than used; the log will say that the early proxy was quarantined and the normal authoritative queue was adopted.
 
 ## Known limitations
 
