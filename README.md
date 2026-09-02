@@ -3,7 +3,7 @@
 This project contains two independently useful pieces:
 
 - `lab/`: a deterministic D3D12 test program that reverse-engineers and validates the private DLSS-NR feature-18 contract without launching a game.
-- `addon/`: a standalone ReShade addon for the D3D12 game path. It does not hook or depend on the ShortFuse addon.
+- `addon/`: a standalone ReShade addon for D3D9, D3D11, and D3D12 games. It does not hook or depend on the ShortFuse addon.
 
 ## Proven pipeline
 
@@ -62,6 +62,10 @@ Version 1.5 adds an experimental direct-NGX DLSS Frame Generation stage. It eval
 Version 1.5.1 supports reduced-resolution borderless presentation explicitly. It keeps the first full-size game HWND/runtime authoritative and ignores small secondary swapchains such as GTA V Enhanced's 176x44 D3D12 helper window, which previously displaced the real game runtime after a mode change. The proxy follows the primary monitor and uses a foreground/present watchdog: it hides when the game loses focus or stops presenting and restores only after the primary game window resumes, preventing a stale topmost black proxy from trapping the desktop.
 
 Version 1.5.2 removes the prototype's serial double-VSync throttle. Generated and real frames now use separate D3D12 command allocators and are submitted through an uncapped flip-discard swapchain with tearing enabled when DXGI supports it. The game thread waits once for the preceding pair's GPU work rather than once between each image, so enabling FG no longer forces the source game toward a monitor-refresh divisor. The on-image counter reports proxy presents per second; the ReShade panel separately reports source FPS and proxy presents per second.
+
+Version 1.6 adds native legacy-API transport. D3D11 games copy their backbuffer into a texture shared with the private D3D12 NGX device and synchronize it with a shared `ID3D11Fence`/`ID3D12Fence`. D3D9 games first copy into a D3D9 render target shared with the private D3D11 device, then enter the same fenced D3D11-to-D3D12 path. A second shared surface carries the post-ReShade frame to the D3D12 proxy compositor. Both routes preserve the existing compact NR -> native DLSS SR -> optional DLSS-G pipeline. The initial legacy implementation deliberately uses deterministic zero-motion/depth guides; D3D12 retains the same-frame VORT guide path.
+
+Run `lab\build-legacy-smoke.bat` to validate both transports without a game. It selects the NVIDIA adapter and checks D3D11 shared texture/fence access followed by D3D9 -> D3D11 -> D3D12 sharing. On drivers that reject D3D12-created BGRA textures in D3D11, both the smoke test and addon automatically use the proven reverse D3D11-created NT-handle path.
 
 Version 1.3 renders `vort_MotionEffects` and `DLSS5_Feed` explicitly inside the game `OnPresent` callback, then flushes that current-frame guide work before NGX evaluation. `DLSS5_Feed.fx` reads VORT's pooled `MotVectTexVort`, converts its delta-UV flow to pixel units, and also captures raw game depth. Both techniques remain disabled in ReShade's ordinary effect list because the addon schedules them itself in the required order. The overlay reports `same-frame VORT optical flow` only when those passes and correctly sized `R16G16_FLOAT` motion / `R32_FLOAT` depth resources are present; otherwise it reports and uses the internal zero-motion fallback.
 

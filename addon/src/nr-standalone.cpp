@@ -1,6 +1,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <d3d9.h>
+#include <d3d11_4.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
@@ -23,11 +25,11 @@
 #include <nvsdk_ngx_defs_dlssd.h>
 #include <nvsdk_ngx_defs_dlssg.h>
 
-#define ADDON_VERSION "1.5.2-uncapped-framegen"
+#define ADDON_VERSION "1.6.0-legacy-interop"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
-    "Standalone D3D12 DLSS Neural Rendering followed by DLSS Super Resolution.";
+    "Standalone D3D9/D3D11/D3D12 DLSS Neural Rendering, Super Resolution, and Frame Generation.";
 
 static HMODULE g_self;
 static wchar_t g_addon_directory[MAX_PATH];
@@ -138,6 +140,26 @@ static Microsoft::WRL::ComPtr<ID3D12Resource> g_fallback_depth;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_captured_motion;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_captured_depth;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_captured_mask;
+static reshade::api::device_api g_present_api = static_cast<reshade::api::device_api>(0);
+static Microsoft::WRL::ComPtr<ID3D11Device> g_legacy_device11;
+static Microsoft::WRL::ComPtr<ID3D11DeviceContext> g_legacy_context11;
+static Microsoft::WRL::ComPtr<ID3D11DeviceContext4> g_legacy_context4;
+static Microsoft::WRL::ComPtr<ID3D11Fence> g_legacy_fence11;
+static Microsoft::WRL::ComPtr<ID3D12Fence> g_legacy_fence12;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> g_legacy_input11;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> g_legacy_post11;
+static Microsoft::WRL::ComPtr<ID3D12Resource> g_legacy_post12;
+static Microsoft::WRL::ComPtr<IDirect3DDevice9> g_legacy_device9;
+static Microsoft::WRL::ComPtr<IDirect3DTexture9> g_legacy_input9;
+static Microsoft::WRL::ComPtr<IDirect3DTexture9> g_legacy_post9;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> g_legacy_input9_11;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> g_legacy_post9_11;
+static Microsoft::WRL::ComPtr<IDirect3DQuery9> g_legacy_query9;
+static UINT64 g_legacy_fence_value;
+static UINT64 g_legacy_d3d12_done_value;
+static UINT g_legacy_width;
+static UINT g_legacy_height;
+static DXGI_FORMAT g_legacy_format = DXGI_FORMAT_UNKNOWN;
 static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> g_guide_rtv_heap;
 static UINT g_guide_rtv_stride;
 static UINT g_resource_input_width;
@@ -185,6 +207,9 @@ static NgxBridgeCreateFeature g_bridge_create;
 static NgxBridgeEvaluateFeature g_bridge_evaluate;
 static NgxBridgeReleaseFeature g_bridge_release;
 static NgxBridgePopulateParameters g_bridge_populate;
+
+static void ReleaseLegacyFrameResources();
+static bool EnsureStandaloneResources(ID3D12Resource *backbuffer);
 static NgxPopulateParameters g_nr_populate;
 static NgxPopulateParameters g_nr_compute_scaling_ratio;
 static float g_nr_scaling_ratio = 1.0f;
@@ -852,6 +877,7 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
     g_pending_proxy_frame = false;
     g_captured_motion.Reset(); g_captured_depth.Reset(); g_captured_mask.Reset();
     g_fallback_motion.Reset(); g_fallback_depth.Reset();
+    ReleaseLegacyFrameResources();
     g_fg_stage.Reset(); g_sr_stage.Reset(); g_nr_stage.Reset(); g_packed_color.Reset();
 
     if (g_runtime)
@@ -865,13 +891,290 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
     return true;
 }
 
-static bool EnsureStandaloneResources(ID3D12Resource *backbuffer)
+static void ReleaseLegacyFrameResources()
 {
-    if (g_neural_failed || !backbuffer || !g_command_queue) return false;
-    const D3D12_RESOURCE_DESC backbuffer_desc = backbuffer->GetDesc();
-    const UINT iw = static_cast<UINT>(backbuffer_desc.Width), ih = backbuffer_desc.Height;
+    g_legacy_input9.Reset(); g_legacy_post9.Reset();
+    g_legacy_input9_11.Reset(); g_legacy_post9_11.Reset();
+    g_legacy_input11.Reset(); g_legacy_post11.Reset(); g_legacy_post12.Reset();
+    g_legacy_width = g_legacy_height = 0;
+    g_legacy_format = DXGI_FORMAT_UNKNOWN;
+}
+
+static bool CreateSharedPair11(UINT width, UINT height, DXGI_FORMAT format,
+    Microsoft::WRL::ComPtr<ID3D12Resource> &resource12,
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> &resource11)
+{
+    if (!g_neural_device || !g_legacy_device11) return false;
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width; desc.Height = height; desc.DepthOrArraySize = 1; desc.MipLevels = 1;
+    desc.Format = format; desc.SampleDesc.Count = 1; desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+    HRESULT hr = g_neural_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc,
+        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&resource12));
+    HANDLE shared = nullptr;
+    if (SUCCEEDED(hr)) hr = g_neural_device->CreateSharedHandle(resource12.Get(), nullptr, GENERIC_ALL, nullptr, &shared);
+    Microsoft::WRL::ComPtr<ID3D11Device1> device1;
+    if (SUCCEEDED(hr)) hr = g_legacy_device11.As(&device1);
+    if (SUCCEEDED(hr)) hr = device1->OpenSharedResource1(shared, IID_PPV_ARGS(&resource11));
+    if (shared) CloseHandle(shared);
+    if (SUCCEEDED(hr)) return true;
+
+    Log("legacy D3D12->D3D11 texture failed: 0x%08X; trying D3D11->D3D12",
+        static_cast<unsigned int>(hr));
+    resource11.Reset(); resource12.Reset();
+    D3D11_TEXTURE2D_DESC desc11 = {};
+    desc11.Width = width; desc11.Height = height; desc11.MipLevels = 1; desc11.ArraySize = 1;
+    desc11.Format = format; desc11.SampleDesc.Count = 1; desc11.Usage = D3D11_USAGE_DEFAULT;
+    desc11.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    desc11.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+    hr = g_legacy_device11->CreateTexture2D(&desc11, nullptr, &resource11);
+    shared = nullptr;
+    Microsoft::WRL::ComPtr<IDXGIResource1> dxgi_resource;
+    if (SUCCEEDED(hr)) hr = resource11.As(&dxgi_resource);
+    if (SUCCEEDED(hr)) hr = dxgi_resource->CreateSharedHandle(nullptr,
+        DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &shared);
+    if (SUCCEEDED(hr)) hr = g_neural_device->OpenSharedHandle(shared, IID_PPV_ARGS(&resource12));
+    if (shared) CloseHandle(shared);
+    if (FAILED(hr))
+    {
+        Log("legacy shared texture failed in both directions: %ux%u fmt=%u hr=0x%08X",
+            width, height, static_cast<unsigned int>(format), static_cast<unsigned int>(hr));
+        resource11.Reset(); resource12.Reset();
+        return false;
+    }
+    Log("legacy shared texture using D3D11->D3D12 fallback: %ux%u fmt=%u",
+        width, height, static_cast<unsigned int>(format));
+    return true;
+}
+
+static Microsoft::WRL::ComPtr<IDXGIAdapter1> FindD3D9Adapter(IDirect3DDevice9 *device9)
+{
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> match;
+    if (!device9) return match;
+    D3DDEVICE_CREATION_PARAMETERS creation = {};
+    if (FAILED(device9->GetCreationParameters(&creation))) return match;
+    Microsoft::WRL::ComPtr<IDirect3D9> d3d9;
+    if (FAILED(device9->GetDirect3D(&d3d9))) return match;
+    LUID wanted = {};
+    bool have_luid = false;
+    Microsoft::WRL::ComPtr<IDirect3D9Ex> d3d9ex;
+    if (SUCCEEDED(d3d9.As(&d3d9ex)) && SUCCEEDED(d3d9ex->GetAdapterLUID(creation.AdapterOrdinal, &wanted)))
+        have_luid = true;
+    const HMONITOR wanted_monitor = d3d9->GetAdapterMonitor(creation.AdapterOrdinal);
+    Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return match;
+    for (UINT index = 0; ; ++index)
+    {
+        Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+        if (factory->EnumAdapters1(index, &adapter) == DXGI_ERROR_NOT_FOUND) break;
+        DXGI_ADAPTER_DESC1 adapter_desc = {};
+        adapter->GetDesc1(&adapter_desc);
+        if (have_luid && adapter_desc.AdapterLuid.HighPart == wanted.HighPart &&
+            adapter_desc.AdapterLuid.LowPart == wanted.LowPart) return adapter;
+        for (UINT output_index = 0; wanted_monitor != nullptr; ++output_index)
+        {
+            Microsoft::WRL::ComPtr<IDXGIOutput> output;
+            if (adapter->EnumOutputs(output_index, &output) == DXGI_ERROR_NOT_FOUND) break;
+            DXGI_OUTPUT_DESC output_desc = {};
+            if (SUCCEEDED(output->GetDesc(&output_desc)) && output_desc.Monitor == wanted_monitor)
+                return adapter;
+        }
+    }
+    return match;
+}
+
+static bool InitializeLegacyTransport(reshade::api::device *reshade_device)
+{
+    if (!reshade_device) return false;
+    const reshade::api::device_api api = reshade_device->get_api();
+    if (api != reshade::api::device_api::d3d11 && api != reshade::api::device_api::d3d9) return false;
+    if (g_command_queue && g_present_api == api && g_legacy_context4 && g_legacy_fence11 && g_legacy_fence12)
+        return true;
+
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+    if (api == reshade::api::device_api::d3d11)
+    {
+        auto *native = reinterpret_cast<ID3D11Device *>(reshade_device->get_native());
+        if (!native) return false;
+        g_legacy_device11 = native;
+        native->GetImmediateContext(&g_legacy_context11);
+        Microsoft::WRL::ComPtr<IDXGIDevice> dxgi_device;
+        Microsoft::WRL::ComPtr<IDXGIAdapter> adapter0;
+        if (FAILED(native->QueryInterface(IID_PPV_ARGS(&dxgi_device))) ||
+            FAILED(dxgi_device->GetAdapter(&adapter0)) || FAILED(adapter0.As(&adapter))) return false;
+    }
+    else
+    {
+        auto *native9 = reinterpret_cast<IDirect3DDevice9 *>(reshade_device->get_native());
+        if (!native9) return false;
+        g_legacy_device9 = native9;
+        adapter = FindD3D9Adapter(native9);
+        if (!adapter) { Log("D3D9 interop could not match the game adapter to DXGI"); return false; }
+        D3D_FEATURE_LEVEL feature_level = D3D_FEATURE_LEVEL_11_0;
+        const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+        HRESULT hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags,
+            &feature_level, 1, D3D11_SDK_VERSION, &g_legacy_device11, nullptr, &g_legacy_context11);
+        if (FAILED(hr)) { Log("D3D9 interop D3D11CreateDevice failed: 0x%08X", static_cast<unsigned int>(hr)); return false; }
+        native9->CreateQuery(D3DQUERYTYPE_EVENT, &g_legacy_query9);
+    }
+
+    Microsoft::WRL::ComPtr<ID3D12Device> device12;
+    HRESULT hr = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device12));
+    D3D12_COMMAND_QUEUE_DESC queue_desc = {};
+    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (SUCCEEDED(hr)) hr = device12->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&g_command_queue));
+    if (SUCCEEDED(hr)) hr = g_legacy_context11.As(&g_legacy_context4);
+    Microsoft::WRL::ComPtr<ID3D11Device5> device5;
+    if (SUCCEEDED(hr)) hr = g_legacy_device11.As(&device5);
+    HANDLE shared_fence = nullptr;
+    if (SUCCEEDED(hr)) hr = device12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&g_legacy_fence12));
+    if (SUCCEEDED(hr)) hr = device12->CreateSharedHandle(g_legacy_fence12.Get(), nullptr, GENERIC_ALL, nullptr, &shared_fence);
+    if (SUCCEEDED(hr)) hr = device5->OpenSharedFence(shared_fence, IID_PPV_ARGS(&g_legacy_fence11));
+    if (shared_fence) CloseHandle(shared_fence);
+    if (FAILED(hr))
+    {
+        Log("legacy D3D11/D3D12 session initialization failed: 0x%08X", static_cast<unsigned int>(hr));
+        return false;
+    }
+    g_present_api = api;
+    Log("legacy interop session ready: api=%s D3D11=%p D3D12 queue=%p shared fence=%p",
+        api == reshade::api::device_api::d3d11 ? "D3D11" : "D3D9",
+        g_legacy_device11.Get(), g_command_queue, g_legacy_fence12.Get());
+    return true;
+}
+
+static D3DFORMAT ToD3D9Format(DXGI_FORMAT format)
+{
+    switch (format)
+    {
+    case DXGI_FORMAT_B8G8R8A8_UNORM: return D3DFMT_A8R8G8B8;
+    case DXGI_FORMAT_B8G8R8X8_UNORM: return D3DFMT_X8R8G8B8;
+    case DXGI_FORMAT_R8G8B8A8_UNORM: return D3DFMT_A8B8G8R8;
+    case DXGI_FORMAT_R10G10B10A2_UNORM: return D3DFMT_A2B10G10R10;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return D3DFMT_A16B16G16R16F;
+    default: return D3DFMT_UNKNOWN;
+    }
+}
+
+static bool CreateD3D9SharedStage(UINT width, UINT height, DXGI_FORMAT format,
+    Microsoft::WRL::ComPtr<IDirect3DTexture9> &texture9,
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> &texture11)
+{
+    if (!g_legacy_device9 || !g_legacy_device11) return false;
+    const D3DFORMAT format9 = ToD3D9Format(format);
+    if (format9 == D3DFMT_UNKNOWN)
+    {
+        Log("D3D9 interop does not support backbuffer format %u", static_cast<unsigned int>(format));
+        return false;
+    }
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = width; desc.Height = height; desc.MipLevels = 1; desc.ArraySize = 1;
+    desc.Format = format; desc.SampleDesc.Count = 1; desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+    HRESULT hr = g_legacy_device11->CreateTexture2D(&desc, nullptr, &texture11);
+    HANDLE shared = nullptr;
+    Microsoft::WRL::ComPtr<IDXGIResource> dxgi_resource;
+    if (SUCCEEDED(hr)) hr = texture11.As(&dxgi_resource);
+    if (SUCCEEDED(hr)) hr = dxgi_resource->GetSharedHandle(&shared);
+    if (SUCCEEDED(hr))
+        hr = g_legacy_device9->CreateTexture(width, height, 1, D3DUSAGE_RENDERTARGET,
+            format9, D3DPOOL_DEFAULT, &texture9, &shared);
+    if (FAILED(hr))
+    {
+        texture9.Reset(); texture11.Reset();
+        shared = nullptr;
+        hr = g_legacy_device9->CreateTexture(width, height, 1, D3DUSAGE_RENDERTARGET,
+            format9, D3DPOOL_DEFAULT, &texture9, &shared);
+        if (SUCCEEDED(hr)) hr = g_legacy_device11->OpenSharedResource(shared, IID_PPV_ARGS(&texture11));
+    }
+    if (FAILED(hr))
+    {
+        Log("D3D9/D3D11 shared stage creation failed: %ux%u fmt9=%u dxgi=%u hr=0x%08X",
+            width, height, static_cast<unsigned int>(format9), static_cast<unsigned int>(format),
+            static_cast<unsigned int>(hr));
+        texture9.Reset(); texture11.Reset();
+        return false;
+    }
+    return true;
+}
+
+static bool BuildLegacyFrameResources(UINT width, UINT height, DXGI_FORMAT format)
+{
+    ReleaseLegacyFrameResources();
+    g_packed_color.Reset();
+    if (!CreateSharedPair11(width, height, format, g_packed_color, g_legacy_input11) ||
+        !CreateSharedPair11(width, height, format, g_legacy_post12, g_legacy_post11))
+        return false;
+    if (g_present_api == reshade::api::device_api::d3d9)
+    {
+        if (!CreateD3D9SharedStage(width, height, format, g_legacy_input9, g_legacy_input9_11) ||
+            !CreateD3D9SharedStage(width, height, format, g_legacy_post9, g_legacy_post9_11))
+            return false;
+    }
+    g_legacy_width = width; g_legacy_height = height; g_legacy_format = format;
+    Log("legacy shared frame resources ready: api=%s %ux%u fmt=%u",
+        g_present_api == reshade::api::device_api::d3d11 ? "D3D11" : "D3D9",
+        width, height, static_cast<unsigned int>(format));
+    return true;
+}
+
+static bool WaitForD3D9Copy()
+{
+    if (!g_legacy_query9 && g_legacy_device9)
+        g_legacy_device9->CreateQuery(D3DQUERYTYPE_EVENT, &g_legacy_query9);
+    if (!g_legacy_query9 || FAILED(g_legacy_query9->Issue(D3DISSUE_END))) return false;
+    const ULONGLONG deadline = GetTickCount64() + 3000;
+    HRESULT hr = S_FALSE;
+    while ((hr = g_legacy_query9->GetData(nullptr, 0, D3DGETDATA_FLUSH)) == S_FALSE && GetTickCount64() < deadline)
+        SwitchToThread();
+    return hr == S_OK;
+}
+
+static bool CopyLegacyFrameToD3D12(void *native_resource, bool post_effects)
+{
+    if (!native_resource || !g_legacy_context11 || !g_legacy_context4 || !g_legacy_fence11 ||
+        !g_legacy_fence12 || !g_command_queue) return false;
+    ID3D11Texture2D *destination11 = post_effects ? g_legacy_post11.Get() : g_legacy_input11.Get();
+    if (!destination11) return false;
+    if (g_legacy_d3d12_done_value != 0 &&
+        FAILED(g_legacy_context4->Wait(g_legacy_fence11.Get(), g_legacy_d3d12_done_value)))
+        return false;
+    if (g_present_api == reshade::api::device_api::d3d11)
+    {
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> source11;
+        if (FAILED(reinterpret_cast<IUnknown *>(native_resource)->QueryInterface(IID_PPV_ARGS(&source11)))) return false;
+        g_legacy_context11->CopyResource(destination11, source11.Get());
+    }
+    else if (g_present_api == reshade::api::device_api::d3d9)
+    {
+        auto *source9 = reinterpret_cast<IDirect3DSurface9 *>(native_resource);
+        IDirect3DTexture9 *stage9 = post_effects ? g_legacy_post9.Get() : g_legacy_input9.Get();
+        ID3D11Texture2D *stage11 = post_effects ? g_legacy_post9_11.Get() : g_legacy_input9_11.Get();
+        if (!source9 || !stage9 || !stage11) return false;
+        Microsoft::WRL::ComPtr<IDirect3DSurface9> destination9;
+        if (FAILED(stage9->GetSurfaceLevel(0, &destination9)) ||
+            FAILED(g_legacy_device9->StretchRect(source9, nullptr, destination9.Get(), nullptr, D3DTEXF_NONE)) ||
+            !WaitForD3D9Copy()) return false;
+        g_legacy_context11->CopyResource(destination11, stage11);
+    }
+    else return false;
+
+    const UINT64 value = ++g_legacy_fence_value;
+    if (FAILED(g_legacy_context4->Signal(g_legacy_fence11.Get(), value))) return false;
+    g_legacy_context11->Flush();
+    if (FAILED(g_command_queue->Wait(g_legacy_fence12.Get(), value))) return false;
+    return true;
+}
+
+static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format)
+{
+    if (g_neural_failed || !g_command_queue) return false;
     const UINT ow = g_output_width.load(), oh = g_output_height.load();
-    const DXGI_FORMAT input_format = TypedInputFormat(backbuffer_desc.Format);
+    input_format = TypedInputFormat(input_format);
     if (iw == 0 || ih == 0 || ow == 0 || oh == 0) return false;
     if (g_neural_ready && (iw != g_resource_input_width || ih != g_resource_input_height ||
         ow != g_resource_output_width || oh != g_resource_output_height || input_format != g_resource_input_format))
@@ -915,8 +1218,11 @@ static bool EnsureStandaloneResources(ID3D12Resource *backbuffer)
     g_resource_input_format = input_format;
     const DXGI_FORMAT result_format = g_color_profile == ColorProfile::Srgb ?
         DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
-    if (!CreateTexture(iw, ih, input_format, false,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g_packed_color) ||
+    const bool legacy = g_present_api == reshade::api::device_api::d3d11 ||
+        g_present_api == reshade::api::device_api::d3d9;
+    if ((legacy ? !BuildLegacyFrameResources(iw, ih, input_format) :
+            !CreateTexture(iw, ih, input_format, false,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g_packed_color)) ||
         !CreateTexture(iw, ih, result_format, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g_nr_stage) ||
         !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, g_sr_stage) ||
         !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, g_fg_stage)) return false;
@@ -1129,7 +1435,8 @@ static void OnRenderTechnique(reshade::api::effect_runtime *runtime, reshade::ap
 {
     using namespace reshade::api;
     if (!g_enabled || g_neural_failed || runtime != g_runtime || !g_feed_technique.handle ||
-        technique.handle != g_feed_technique.handle) return;
+        technique.handle != g_feed_technique.handle ||
+        runtime->get_device()->get_api() != device_api::d3d12) return;
     resource_view mv_srv = {}, mv_srgb = {}, depth_srv = {}, depth_srgb = {}, mask_srv = {}, mask_srgb = {};
     runtime->get_texture_binding(g_mv_variable, &mv_srv, &mv_srgb);
     runtime->get_texture_binding(g_depth_variable, &depth_srv, &depth_srgb);
@@ -1253,10 +1560,11 @@ static D3D12_RESOURCE_BARRIER Transition(ID3D12Resource *resource,
 
 static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
 {
-    if (!EnsureStandaloneResources(backbuffer)) return false;
+    const bool legacy_input = backbuffer == nullptr;
+    if ((!legacy_input && !EnsureStandaloneResources(backbuffer)) || (legacy_input && !g_neural_ready)) return false;
     if (g_feature_recreate_requested.exchange(false) && !RecreateFeatures()) return false;
 
-    const bool use_external_guides = RenderCurrentFrameGuides(backbuffer);
+    const bool use_external_guides = !legacy_input && RenderCurrentFrameGuides(backbuffer);
     if (use_external_guides != g_using_external_guides)
     {
         g_using_external_guides = use_external_guides;
@@ -1267,26 +1575,35 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     ID3D12Resource *depth = use_external_guides ? g_captured_depth.Get() : g_fallback_depth.Get();
 
     if (!BeginNeuralCommands()) return false;
-    D3D12_RESOURCE_BARRIER copy_begin[2] = {
-        Transition(backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
-        Transition(g_packed_color.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)
-    };
-    g_neural_list->ResourceBarrier(2, copy_begin);
-    D3D12_TEXTURE_COPY_LOCATION source = {};
-    source.pResource = backbuffer;
-    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    source.SubresourceIndex = 0;
-    D3D12_TEXTURE_COPY_LOCATION destination = {};
-    destination.pResource = g_packed_color.Get();
-    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    destination.SubresourceIndex = 0;
-    const D3D12_BOX source_box = {0, 0, 0, g_resource_input_width, g_resource_input_height, 1};
-    g_neural_list->CopyTextureRegion(&destination, 0, 0, 0, &source, &source_box);
-    D3D12_RESOURCE_BARRIER copy_end[2] = {
-        Transition(backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT),
-        Transition(g_packed_color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
-    };
-    g_neural_list->ResourceBarrier(2, copy_end);
+    if (!legacy_input)
+    {
+        D3D12_RESOURCE_BARRIER copy_begin[2] = {
+            Transition(backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            Transition(g_packed_color.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)
+        };
+        g_neural_list->ResourceBarrier(2, copy_begin);
+        D3D12_TEXTURE_COPY_LOCATION source = {};
+        source.pResource = backbuffer;
+        source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        source.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION destination = {};
+        destination.pResource = g_packed_color.Get();
+        destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        destination.SubresourceIndex = 0;
+        const D3D12_BOX source_box = {0, 0, 0, g_resource_input_width, g_resource_input_height, 1};
+        g_neural_list->CopyTextureRegion(&destination, 0, 0, 0, &source, &source_box);
+        D3D12_RESOURCE_BARRIER copy_end[2] = {
+            Transition(backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT),
+            Transition(g_packed_color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+        };
+        g_neural_list->ResourceBarrier(2, copy_end);
+    }
+    else
+    {
+        D3D12_RESOURCE_BARRIER input_to_srv = Transition(g_packed_color.Get(),
+            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        g_neural_list->ResourceBarrier(1, &input_to_srv);
+    }
 
     if (!use_external_guides)
     {
@@ -1388,7 +1705,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         }
     }
 
-    D3D12_RESOURCE_BARRIER restore[3] = {};
+    D3D12_RESOURCE_BARRIER restore[4] = {};
     UINT restore_count = 0;
     if (!g_bypass_nr_for_ab)
         restore[restore_count++] = Transition(g_nr_stage.Get(),
@@ -1403,8 +1720,17 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     else
         restore[restore_count++] = Transition(g_sr_stage.Get(),
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    if (legacy_input)
+        restore[restore_count++] = Transition(g_packed_color.Get(),
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     g_neural_list->ResourceBarrier(restore_count, restore);
     if (!SubmitNeuralCommands(false)) return false;
+    if (legacy_input)
+    {
+        const UINT64 done = ++g_legacy_fence_value;
+        if (FAILED(g_command_queue->Signal(g_legacy_fence12.Get(), done))) return false;
+        g_legacy_d3d12_done_value = done;
+    }
     if (NVSDK_NGX_FAILED(nr_result) || NVSDK_NGX_FAILED(sr_result))
     {
         Log("on-present evaluation failure: NR=0x%08X (%s), SR=0x%08X (%s)",
@@ -1792,6 +2118,7 @@ static void OnInitCommandQueue(reshade::api::command_queue *queue)
 
 static bool AdoptPresentQueue(reshade::api::command_queue *queue)
 {
+    if (!queue || queue->get_device()->get_api() != reshade::api::device_api::d3d12) return false;
     auto *native = reinterpret_cast<ID3D12CommandQueue *>(queue->get_native());
     if (!native) return false;
     if (native == g_command_queue)
@@ -1821,6 +2148,12 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
 
     const bool use_framegen = g_framegen_enabled && !g_framegen_failed &&
         g_show_neural_output && g_fg_stage && g_fg_frames.load() >= 2;
+    const bool legacy = g_present_api == reshade::api::device_api::d3d11 ||
+        g_present_api == reshade::api::device_api::d3d9;
+    const D3D12_RESOURCE_STATES original_base_state = legacy ?
+        D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const D3D12_RESOURCE_STATES post_base_state = legacy ?
+        D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_PRESENT;
     ID3D12Resource *present_sources[2] = {
         use_framegen ? g_fg_stage.Get() : real_source,
         real_source
@@ -1890,12 +2223,12 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
         D3D12_RESOURCE_BARRIER barriers[8] = {
             Transition(destination.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET),
             Transition(neural_source, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-            Transition(original_source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-            Transition(backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+            Transition(original_source, original_base_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+            Transition(backbuffer, post_base_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
             Transition(destination.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT),
             Transition(neural_source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-            Transition(original_source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-            Transition(backbuffer, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PRESENT)
+            Transition(original_source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, original_base_state),
+            Transition(backbuffer, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, post_base_state)
         };
         list->ResourceBarrier(4, barriers);
         ID3D12DescriptorHeap *heaps[] = {g_proxy_srv_heap.Get()}; list->SetDescriptorHeaps(1, heaps);
@@ -1918,6 +2251,12 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
         ++g_frames_presented;
         UpdateOutputFps();
     }
+    if (legacy)
+    {
+        const UINT64 done = ++g_legacy_fence_value;
+        if (FAILED(g_command_queue->Signal(g_legacy_fence12.Get(), done))) return false;
+        g_legacy_d3d12_done_value = done;
+    }
     const unsigned long long post_frame = ++g_post_reshade_frames;
     if (post_frame == 1)
         Log("post-ReShade native presentation active; effects and overlay are available to the proxy compositor");
@@ -1927,21 +2266,32 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
     return true;
 }
 
+static bool EnsureStandaloneResources(ID3D12Resource *backbuffer)
+{
+    if (!backbuffer) return false;
+    const D3D12_RESOURCE_DESC desc = backbuffer->GetDesc();
+    return EnsureStandaloneResources(static_cast<UINT>(desc.Width), desc.Height, desc.Format);
+}
+
 static void OnReshadePresent(reshade::api::effect_runtime *runtime)
 {
     if (runtime == nullptr || runtime != g_runtime || !g_pending_proxy_frame) return;
     g_pending_proxy_frame = false;
     if (!g_enabled || g_neural_failed || g_proxy_hidden) return;
     const reshade::api::resource resource = runtime->get_current_back_buffer();
-    auto *backbuffer = reinterpret_cast<ID3D12Resource *>(resource.handle);
-    if (!backbuffer) return;
+    if (!resource.handle) return;
 
     // ReShade emits this event after recording effects and its overlay, but
     // before the D3D12 immediate list is normally submitted. Submit it now so
     // the native proxy samples the completed ReShade frame on the same queue.
     reshade::api::command_queue *queue = runtime->get_command_queue();
     if (queue) queue->flush_immediate_command_list();
-    PresentProxyAfterReshade(backbuffer);
+    const reshade::api::device_api api = runtime->get_device()->get_api();
+    if (api == reshade::api::device_api::d3d12)
+        PresentProxyAfterReshade(reinterpret_cast<ID3D12Resource *>(resource.handle));
+    else if ((api == reshade::api::device_api::d3d11 || api == reshade::api::device_api::d3d9) &&
+        CopyLegacyFrameToD3D12(reinterpret_cast<void *>(resource.handle), true))
+        PresentProxyAfterReshade(g_legacy_post12.Get());
 }
 
 static bool OnReshadeOpenOverlay(reshade::api::effect_runtime *runtime, bool open, reshade::api::input_source)
@@ -1969,7 +2319,27 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         ShowWindow(g_proxy_window, SW_SHOWNOACTIVATE);
         Log("native proxy restored after primary borderless presentation resumed");
     }
-    if (!AdoptPresentQueue(queue)) return;
+    const reshade::api::device_api api = queue->get_device()->get_api();
+    if (api == reshade::api::device_api::d3d12)
+    {
+        g_present_api = api;
+        if (!AdoptPresentQueue(queue)) return;
+    }
+    else if (api == reshade::api::device_api::d3d11 || api == reshade::api::device_api::d3d9)
+    {
+        g_rs_queue = queue;
+        if (!InitializeLegacyTransport(queue->get_device()))
+        {
+            SetStatus("failed to initialize %s -> D3D12 interop; see log",
+                api == reshade::api::device_api::d3d11 ? "D3D11" : "D3D9");
+            return;
+        }
+    }
+    else
+    {
+        SetStatus("unsupported graphics API (D3D9/D3D11/D3D12 required)");
+        return;
+    }
     UpdateSourceFps();
     const unsigned long long routed_mouse_events = g_overlay_mouse_events.load();
     if (routed_mouse_events != g_last_logged_mouse_event && routed_mouse_events <= 8)
@@ -2021,12 +2391,31 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     g_home_down = home;
     g_alt_x_down = alt_x;
     const reshade::api::resource backbuffer_resource = swapchain->get_current_back_buffer();
-    auto *backbuffer = reinterpret_cast<ID3D12Resource *>(backbuffer_resource.handle);
-    if (!backbuffer) return;
-    const D3D12_RESOURCE_DESC backbuffer_desc = backbuffer->GetDesc();
-    g_input_width = static_cast<UINT>(backbuffer_desc.Width);
-    g_input_height = backbuffer_desc.Height;
-    if (!ExecuteOnPresentPipeline(backbuffer)) return;
+    if (!backbuffer_resource.handle) return;
+    if (api == reshade::api::device_api::d3d12)
+    {
+        auto *backbuffer = reinterpret_cast<ID3D12Resource *>(backbuffer_resource.handle);
+        const D3D12_RESOURCE_DESC backbuffer_desc = backbuffer->GetDesc();
+        g_input_width = static_cast<UINT>(backbuffer_desc.Width);
+        g_input_height = backbuffer_desc.Height;
+        if (!ExecuteOnPresentPipeline(backbuffer)) return;
+    }
+    else
+    {
+        const auto desc = swapchain->get_device()->get_resource_desc(backbuffer_resource);
+        const UINT width = static_cast<UINT>(desc.texture.width);
+        const UINT height = desc.texture.height;
+        const DXGI_FORMAT format = static_cast<DXGI_FORMAT>(desc.texture.format);
+        g_input_width = width; g_input_height = height;
+        if (!EnsureStandaloneResources(width, height, format) ||
+            !CopyLegacyFrameToD3D12(reinterpret_cast<void *>(backbuffer_resource.handle), false) ||
+            !ExecuteOnPresentPipeline(nullptr))
+        {
+            if (!g_neural_failed) SetStatus("waiting for a valid %s shared frame",
+                api == reshade::api::device_api::d3d11 ? "D3D11" : "D3D9");
+            return;
+        }
+    }
     if (g_nr_output != nullptr && EnsureProxy(g_nr_output)) g_pending_proxy_frame = true;
 }
 
@@ -2101,6 +2490,10 @@ static void DrawOverlay(reshade::api::effect_runtime *)
 {
     constexpr const char *section = "Standalone.DLSSNR";
     ImGui::TextUnformatted("Standalone DLSS-NR + Super Resolution");
+    const char *api_name = g_present_api == reshade::api::device_api::d3d9 ? "D3D9 -> D3D11 -> D3D12" :
+        g_present_api == reshade::api::device_api::d3d11 ? "D3D11 -> D3D12" :
+        g_present_api == reshade::api::device_api::d3d12 ? "D3D12 native" : "waiting";
+    ImGui::Text("Graphics transport: %s", api_name);
     if (ImGui::Checkbox("Enable addon", &g_enabled))
     {
         reshade::set_config_value(nullptr, section, "Enabled", g_enabled ? "1" : "0");
@@ -2231,6 +2624,14 @@ static void OnDestroyDevice(reshade::api::device *device)
         g_neural_failed = true;
         SetStatus("D3D12 device destroyed");
     }
+    else if ((device->get_api() == reshade::api::device_api::d3d11 ||
+              device->get_api() == reshade::api::device_api::d3d9) && g_present_api == device->get_api())
+    {
+        Log("game legacy graphics device is being destroyed; standalone session ending");
+        g_neural_ready = false;
+        g_neural_failed = true;
+        SetStatus("legacy graphics device destroyed");
+    }
 }
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
@@ -2318,6 +2719,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         if (g_nr_output) g_nr_output->Release();
         g_captured_depth.Reset(); g_captured_motion.Reset(); g_captured_mask.Reset();
         g_fallback_depth.Reset(); g_fallback_motion.Reset(); g_guide_rtv_heap.Reset();
+        ReleaseLegacyFrameResources();
+        g_legacy_query9.Reset(); g_legacy_device9.Reset();
+        g_legacy_fence11.Reset(); g_legacy_fence12.Reset(); g_legacy_context4.Reset();
+        g_legacy_context11.Reset(); g_legacy_device11.Reset();
         g_fg_stage.Reset(); g_sr_stage.Reset(); g_nr_stage.Reset(); g_packed_color.Reset();
         g_neural_list.Reset(); g_neural_allocator.Reset(); g_neural_fence.Reset(); g_neural_device.Reset();
         if (g_neural_fence_event) CloseHandle(g_neural_fence_event);

@@ -14,7 +14,7 @@ cl /nologo /LD /EHsc /O2 /MD /W4 /std:c++20 ^
   /I"..\..\work\DLSS5-Feeder\external\reshade\include" ^
   /I"..\..\work\DLSS5-Feeder\external\imgui" ^
   /Fobuild\ /Fdbuild\standalone-dlssnr.pdb src\nr-standalone.cpp ^
-  /link /OUT:build\standalone-dlssnr.addon64 kernel32.lib user32.lib d3d12.lib dxgi.lib d3dcompiler.lib
+  /link /OUT:build\standalone-dlssnr.addon64 kernel32.lib user32.lib d3d9.lib d3d11.lib d3d12.lib dxgi.lib d3dcompiler.lib
 if errorlevel 1 exit /b 1
 
 copy /y "..\lab\nvngx_dlssnr.sf.dll" "build\nvngx_dlssnr.dll" >nul || exit /b 1
