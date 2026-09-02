@@ -28,7 +28,7 @@
 #include "../../../work/DLSS5-Feeder/src/feed_vk.h"
 #include "../../../work/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.4-vulkan-window-contract"
+#define ADDON_VERSION "1.7.5-vulkan-input"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -111,7 +111,7 @@ static float g_nr_local_tone = 1.0f;
 static float g_nr_local_structure = 1.0f;
 static float g_nr_skin_structure = -1.0f;
 static bool g_reset_every_frame = false;
-static bool g_stable_sr_history = true;
+static bool g_stable_sr_history = false;
 static bool g_bypass_nr_for_ab = false;
 static bool g_framegen_enabled = true;
 static bool g_framegen_failed = false;
@@ -2191,9 +2191,24 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
         SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)));
         return TRUE;
     }
-    if (message >= WM_MOUSEFIRST && message <= WM_MOUSELAST && g_game_window != nullptr)
+    // The foreground game continues receiving its registered raw/relative mouse
+    // input even though this no-activate proxy covers its reduced window. Posting
+    // an additional, scaled absolute WM_MOUSEMOVE makes games which recenter the
+    // cursor feed that position back through the proxy repeatedly (visible as
+    // cursor "gravity"). Leave movement to the game's native raw-input path and
+    // bridge only events whose hit target is otherwise consumed by the proxy.
+    if (message == WM_MOUSEMOVE && g_game_window != nullptr)
+        return 0;
+
+    const bool routed_mouse_message = message == WM_LBUTTONDOWN || message == WM_LBUTTONUP ||
+        message == WM_RBUTTONDOWN || message == WM_RBUTTONUP ||
+        message == WM_MBUTTONDOWN || message == WM_MBUTTONUP ||
+        message == WM_XBUTTONDOWN || message == WM_XBUTTONUP ||
+        message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL;
+    if (routed_mouse_message && g_game_window != nullptr)
     {
-        if (message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN || message == WM_MBUTTONDOWN)
+        if (message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN ||
+            message == WM_MBUTTONDOWN || message == WM_XBUTTONDOWN)
             SetForegroundWindow(g_game_window);
         POINT screen_point = {static_cast<short>(LOWORD(lparam)), static_cast<short>(HIWORD(lparam))};
         ClientToScreen(hwnd, &screen_point);
@@ -2203,7 +2218,11 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
             ScreenToClient(g_game_window, &screen_point);
             client_point = screen_point;
         }
-        const LPARAM mapped = MAKELPARAM(static_cast<short>(client_point.x), static_cast<short>(client_point.y));
+        // Wheel messages use screen coordinates; button messages use client
+        // coordinates. Mixing these conventions can misroute menu interactions.
+        const bool screen_coordinates = message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL;
+        const POINT mapped_point = screen_coordinates ? mapped_screen : client_point;
+        const LPARAM mapped = MAKELPARAM(static_cast<short>(mapped_point.x), static_cast<short>(mapped_point.y));
         PostMessageW(g_game_window, message, wparam, mapped);
         return 0;
     }
@@ -3003,7 +3022,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         Log("DLSS SR history mode changed to %s",
             g_stable_sr_history ? "per-frame reset with zero motion" : "experimental temporal VORT motion");
     }
-    ImGui::TextDisabled("Recommended for generic OnPresent use; NR still receives VORT motion.");
+    ImGui::TextDisabled("Off by default; enable only as a per-frame SR-history diagnostic.");
     if (ImGui::Checkbox("Experimental DLSS Frame Generation (2x)", &g_framegen_enabled))
     {
         reshade::set_config_value(nullptr, section, "FrameGeneration", g_framegen_enabled ? "1" : "0");
@@ -3143,7 +3162,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("LocalStructure", "1.0", value, sizeof(value)); g_nr_local_structure = std::clamp(static_cast<float>(atof(value)), 0.0f, 2.0f);
         read_setting("SkinStructure", "-1.0", value, sizeof(value)); g_nr_skin_structure = std::clamp(static_cast<float>(atof(value)), -1.0f, 1.0f);
         read_setting("ResetEveryFrame", "0", value, sizeof(value)); g_reset_every_frame = strcmp(value, "0") != 0;
-        read_setting("StableSrHistory", "1", value, sizeof(value)); g_stable_sr_history = strcmp(value, "0") != 0;
+        read_setting("StableSrHistory", "0", value, sizeof(value)); g_stable_sr_history = strcmp(value, "0") != 0;
         read_setting("FrameGeneration", "1", value, sizeof(value)); g_framegen_enabled = strcmp(value, "0") != 0;
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
