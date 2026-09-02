@@ -1,5 +1,26 @@
 # Standalone DLSS-NR + Super Resolution prototype
 
+## Basic usage
+
+1. Disable the game's built-in DLSS and antialiasing entirely.
+2. Use fullscreen or fullscreen borderless mode.
+3. Set the game to a resolution lower than your display's native resolution.
+4. NR, Frame Generation, and DLSS Super Resolution should all report as enabled once the steps above are complete.
+
+This can provide **massive performance improvements** compared with native-resolution rendering.
+
+- Press **F10** to switch to the non-NR/DLSS/Frame Generation output.
+- The addon places an FPS counter at the top of the output because the DLSS presentation approach currently prevents other overlays from working reliably.
+- Project page: [DLSS5-Reshade-AIO](https://github.com/kibblerz/DLSS5-Reshade-AIO)
+
+## Known issues
+
+- Occasional stuttering may occur.
+- Mouse clicks do not currently work in the ReShade interface. Use ReShade's keyboard shortcuts to navigate for now.
+- Changing resolution may cause visual glitching. Restarting the game should fix it.
+- No Man's Sky, and potentially other Vulkan games, may not display the ReShade menu correctly.
+- Additional Vulkan-specific issues may still be present.
+
 This project contains two independently useful pieces:
 
 - `lab/`: a deterministic D3D12 test program that reverse-engineers and validates the private DLSS-NR feature-18 contract without launching a game.
