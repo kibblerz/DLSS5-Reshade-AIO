@@ -28,7 +28,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.14-nr-toggle"
+#define ADDON_VERSION "1.7.15-dlaa"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -213,6 +213,18 @@ static UINT g_resource_input_height;
 static UINT g_resource_output_width;
 static UINT g_resource_output_height;
 static DXGI_FORMAT g_resource_input_format = DXGI_FORMAT_UNKNOWN;
+
+static bool IsDlaaMode()
+{
+    return g_resource_input_width != 0 && g_resource_input_height != 0 &&
+        g_resource_input_width == g_resource_output_width &&
+        g_resource_input_height == g_resource_output_height;
+}
+
+static const char *SrModeName()
+{
+    return IsDlaaMode() ? "DLAA" : "DLSS SR";
+}
 
 static constexpr NVSDK_NGX_Feature kFeatureDlssNr = static_cast<NVSDK_NGX_Feature>(0x12);
 static constexpr unsigned long long kGenericCustomCoreId = 0x0876232CULL;
@@ -783,12 +795,13 @@ static bool CreateFeatures()
         Log("CreateFeature(feature=18) skipped: Neural Rendering is disabled; SR + FG-only mode");
     }
 
+    const bool dlaa = IsDlaaMode();
     const float ratio = static_cast<float>(g_resource_input_width) / static_cast<float>(g_resource_output_width);
-    // UltraQuality is an extended NGX enum that is rejected by otherwise
-    // compatible production DLSS runtimes (0xBAD00010). Quality is the
-    // highest broadly supported SR preset and also accepts ratios above its
-    // nominal recommendation, including common ultrawide inputs.
-    const int quality = ratio >= 0.62f ? NVSDK_NGX_PerfQuality_Value_MaxQuality :
+    // A 1:1 render/output contract is explicitly DLAA. For true upscaling,
+    // Quality is the highest broadly supported preset and also accepts ratios
+    // above its nominal recommendation, including common ultrawide inputs.
+    const int quality = dlaa ? NVSDK_NGX_PerfQuality_Value_DLAA :
+        ratio >= 0.62f ? NVSDK_NGX_PerfQuality_Value_MaxQuality :
         ratio >= 0.54f ? NVSDK_NGX_PerfQuality_Value_Balanced :
         ratio >= 0.42f ? NVSDK_NGX_PerfQuality_Value_MaxPerf : NVSDK_NGX_PerfQuality_Value_UltraPerformance;
     g_ngx_params->Reset();
@@ -803,7 +816,8 @@ static bool CreateFeatures()
     result = SafeCreate(false, &exception);
     if (exception) { g_neural_list->Close(); Fail("DLSS SR feature creation exception", exception); return false; }
     if (!SubmitNeuralCommands(true)) return false;
-    Log("CreateFeature(feature=SuperSampling) = 0x%08X (%s), handle=%p quality=%d", static_cast<unsigned int>(result), ResultName(result), g_sr_feature, quality);
+    Log("CreateFeature(feature=SuperSampling) = 0x%08X (%s), handle=%p mode=%s quality=%d",
+        static_cast<unsigned int>(result), ResultName(result), g_sr_feature, SrModeName(), quality);
     if (NVSDK_NGX_FAILED(result) || !g_sr_feature) { Fail("DLSS SR feature creation", static_cast<unsigned int>(result)); return false; }
 
     if (!g_framegen_failed)
@@ -837,9 +851,10 @@ static bool CreateFeatures()
             if (NVSDK_NGX_FAILED(result) || !g_fg_feature) g_framegen_failed = true;
         }
     }
-    Log("standalone contract ready: NR=%s at %ux%u, DLSS SR -> %ux%u, DLSS-G=%s, model=%d, profile=%s",
+    Log("standalone contract ready: NR=%s at %ux%u, %s -> %ux%u, DLSS-G=%s, model=%d, profile=%s",
         g_nr_feature ? "feature 18 active" : "disabled",
-        g_resource_input_width, g_resource_input_height, g_resource_output_width, g_resource_output_height,
+        g_resource_input_width, g_resource_input_height, SrModeName(),
+        g_resource_output_width, g_resource_output_height,
         (!g_framegen_failed && g_fg_feature) ? "ready" : "fallback-off",
         g_nr_model, ProfileName(g_active_color_profile));
     g_active_nr_model = g_nr_feature ? g_nr_model : 0;
@@ -1570,12 +1585,6 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
         SetStatus("render resolution exceeds native output");
         return false;
     }
-    if (iw == ow && ih == oh)
-    {
-        if (g_proxy_window) { g_proxy_hidden = true; ShowWindow(g_proxy_window, SW_HIDE); }
-        SetStatus("waiting for a reduced fullscreen render resolution");
-        return false;
-    }
     if (g_neural_ready) return true;
 
     if (!g_neural_device)
@@ -1625,11 +1634,13 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
         g_proxy_hidden = false;
         ShowWindow(g_proxy_window, g_proxy_overlay_bypass ? SW_HIDE : SW_SHOWNOACTIVATE);
     }
-    SetStatus("active on present: %s + DLSS SR (fallback guides)",
-        g_nr_enabled ? "NR" : "NR disabled");
-    Log("resources ready on present: compact packed/NR=%ux%u, SR=%ux%u, input fmt=%u result fmt=%u; fallback guides=%ux%u",
-        iw, ih, ow, oh, static_cast<unsigned int>(input_format), static_cast<unsigned int>(result_format), iw, ih);
-    Log("resolution configuration active without restart: input=%ux%u output=%ux%u", iw, ih, ow, oh);
+    SetStatus("active on present: %s + %s (fallback guides)",
+        g_nr_enabled ? "NR" : "NR disabled", SrModeName());
+    Log("resources ready on present: compact packed/NR=%ux%u, %s=%ux%u, input fmt=%u result fmt=%u; fallback guides=%ux%u",
+        iw, ih, SrModeName(), ow, oh, static_cast<unsigned int>(input_format),
+        static_cast<unsigned int>(result_format), iw, ih);
+    Log("resolution configuration active without restart: input=%ux%u output=%ux%u mode=%s",
+        iw, ih, ow, oh, SrModeName());
     return true;
 }
 
@@ -2172,14 +2183,14 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     const char *fg_status = (!g_framegen_failed && g_fg_frames.load() > 1) ? "2x" : "warming/fallback";
     const char *guide_status = use_external_guides ? "same-frame motion" : "fallback";
     if (evaluate_nr)
-        SetStatus("active on present: NR model %d + DLSS SR + FG %s (%s guides)",
-            g_active_nr_model, fg_status, guide_status);
+        SetStatus("active on present: NR model %d + %s + FG %s (%s guides)",
+            g_active_nr_model, SrModeName(), fg_status, guide_status);
     else
-        SetStatus("active on present: NR disabled + DLSS SR + FG %s (%s guides)",
-            fg_status, guide_status);
+        SetStatus("active on present: NR disabled + %s + FG %s (%s guides)",
+            SrModeName(), fg_status, guide_status);
     if (frame <= 8 || frame % 1800 == 0)
-        Log("on-present frame %llu: NR=%s, SR=Success, model=%d, NR-reset=%d, NR-guides=%s, SR-history=%s, DLSS history mask=%s, input=%ux%u, output=%ux%u",
-            frame, evaluate_nr ? "Success" : "DISABLED", g_active_nr_model,
+        Log("on-present frame %llu: NR=%s, %s=Success, model=%d, NR-reset=%d, NR-guides=%s, SR-history=%s, DLSS history mask=%s, input=%ux%u, output=%ux%u",
+            frame, evaluate_nr ? "Success" : "DISABLED", SrModeName(), g_active_nr_model,
             reset ? 1 : 0, use_external_guides ? "same-frame-motion" : "fallback",
             g_stable_sr_history ? "per-frame-reset/zero-motion" : "temporal/VORT",
             history_mask ? "BOUND" : "none",
@@ -2283,6 +2294,10 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
         }
         if (overlay_input)
         {
+            // ReShade tracks hover from the cursor position even on an
+            // inactive window, but deliberately ignores button state unless
+            // its runtime window owns foreground/focus. Temporarily activate
+            // the proxy only while its mirrored overlay is open.
             SetForegroundWindow(hwnd);
             SetActiveWindow(hwnd);
             SetFocus(hwnd);
@@ -3291,9 +3306,9 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::Separator();
     ImGui::Text("Status: %s", g_neural_status);
     ImGui::TextUnformatted("Activation boundary: game OnPresent (standalone private NGX runtime)");
-    ImGui::Text("Pipeline: NR=%s (%llu evals); SR=%llu; generated=%llu; FG=%s; active model=%d",
+    ImGui::Text("Pipeline: NR=%s (%llu evals); %s=%llu; generated=%llu; FG=%s; active model=%d",
         g_nr_enabled ? (g_nr_feature ? "enabled" : "starting") : "disabled",
-        g_nr_frames.load(), g_sr_frames.load(), g_fg_frames.load(),
+        g_nr_frames.load(), SrModeName(), g_sr_frames.load(), g_fg_frames.load(),
         g_framegen_failed ? "failed/off" : (g_framegen_enabled ? "2x" : "off"),
         g_active_nr_model);
     ImGui::Text("Contract: %ux%u -> %ux%u", g_input_width.load(), g_input_height.load(), g_output_width.load(), g_output_height.load());
@@ -3309,7 +3324,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g_reshade_overlay_open.load() ? (g_proxy_runtime.load() ? "native proxy overlay" : "direct game window") : "game forwarding");
     ImGui::Text("Forwarded proxy gameplay mouse events: %llu", g_overlay_mouse_events.load());
     ImGui::Text("Presented image: %s", g_show_neural_output ? "processed native output" : "stretched original backbuffer");
-    ImGui::TextWrapped("Set a reduced game resolution in fullscreen or borderless mode. Vulkan games must create a genuinely reduced windowed swapchain; the addon then supplies native-size borderless presentation. It performs NR followed by DLSS Super Resolution.");
+    ImGui::TextWrapped("At native screen resolution the pipeline uses DLAA. At a reduced game resolution it uses DLSS Super Resolution to reach the native output size. NR and optional Frame Generation remain available in either mode.");
     ImGui::TextUnformatted("Press F10 for neural/stretched-original A/B. Home is composited into the proxy; Alt+X hides it for NVIDIA.");
     ImGui::Text("Log: %s", g_log_path);
 }

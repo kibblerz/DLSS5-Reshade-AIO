@@ -4,12 +4,12 @@
 
 1. Disable the game's built-in DLSS and antialiasing entirely.
 2. Use fullscreen or fullscreen borderless mode.
-3. Set the game to a resolution lower than your display's native resolution.
-4. NR, Frame Generation, and DLSS Super Resolution should all report as enabled once the steps above are complete.
+3. Choose the game resolution: native resolution activates DLAA, while a lower resolution activates DLSS Super Resolution.
+4. NR, Frame Generation, and either DLAA or DLSS Super Resolution should report as enabled once the steps above are complete.
 
-This can provide **massive performance improvements** compared with native-resolution rendering.
+Reduced-resolution DLSS Super Resolution mode can provide **massive performance improvements** compared with native-resolution rendering. Native-resolution DLAA mode instead prioritizes image quality.
 
-- Press **F10** to switch to the non-NR/DLSS/Frame Generation output.
+- Press **F10** to switch to the unprocessed game output.
 - The addon places an FPS counter at the top of the output because the DLSS presentation approach currently prevents other overlays from working reliably.
 - Project page: [DLSS5-Reshade-AIO](https://github.com/kibblerz/DLSS5-Reshade-AIO)
 
@@ -31,6 +31,10 @@ This project contains two independently useful pieces:
 The laboratory established that this feature-18 package is a neural-rendering stage, not a spatial upscaler by itself. NVIDIA's own `DLSSNRComputeScalingRatioCallback` resolves every supported NR quality preset to `1.0`. In a direct 2x probe, feature 18 evaluates successfully but writes exactly the input-sized top-left quadrant (25% of the target). The working and efficient layout therefore gives NR render-sized color/output allocations, then gives only the downstream DLSS Super Resolution feature a native-sized output:
 
 `low-resolution game color + depth + motion -> DLSS-NR feature 18 -> DLSS Super Resolution -> native presentation`
+
+At native render resolution, the downstream reconstruction stage instead uses NVIDIA's explicit 1:1 DLAA mode:
+
+`native-resolution game color + depth + motion -> DLSS-NR feature 18 -> DLAA -> native presentation`
 
 The matrix validates all three input profiles and all three NR models using this compact layout. It verifies full output coverage and verifies that changing NR intensity changes the final native-output checksum, which demonstrates that NR is materially participating rather than being bypassed. A separate expected-failure probe records the NR-only 25% coverage boundary so a later runtime change cannot be mistaken for the current contract.
 
@@ -74,7 +78,7 @@ Run `addon\build.bat`. The available runtime set is emitted under `addon\build`:
 - `nvngx_dlssg.dll`
 - `DLSS5_Feed.fx`
 
-The game may be set to fullscreen or borderless at the desired lower render resolution. The addon keeps the desktop at native resolution, rejects auxiliary/helper swapchains, and presents the reconstructed native output in its proxy window.
+The game may be set to fullscreen or borderless at the desired render resolution. A native-resolution game swapchain selects DLAA automatically; a lower-resolution swapchain selects DLSS Super Resolution. The addon keeps the desktop at native resolution, rejects auxiliary/helper swapchains, and presents the processed native output in its proxy window.
 
 The game `OnPresent` event is the activation and evaluation boundary. The addon copies the reduced game backbuffer there and loads its own private `nvngx_dlssnr.dll`, `nvngx_dlss.dll`, and caller-identity bridge; it does not hook or reuse the game's DLSS implementation. RHI may deploy only the `.addon64` file to the game directory, so the addon also searches `%LOCALAPPDATA%\RHI\Custom\Addons` for the complete private runtime set.
 
@@ -97,6 +101,8 @@ Version 1.7.10 serializes native proxy initialization. Some injectors can re-ent
 Version 1.7.13 fixes mouse buttons being swallowed by the native presentation proxy. Gameplay retains the established proxy-to-game button forwarding and the addon no longer installs a global low-level mouse hook. If the proxy does not receive its own ReShade runtime, opening the ReShade menu temporarily hides the proxy so the native-sized game/ReShade window receives genuine Windows mouse input; closing the menu restores the DLSS output automatically. This removes the frozen duplicate cursor and makes ReShade controls clickable, with the temporary reduced-resolution menu view documented above.
 
 Version 1.7.14 adds a persisted `Enable Neural Rendering` checkbox, enabled by default. Turning it off skips feature-18 evaluation while retaining DLSS Super Resolution and optional Frame Generation, providing an SR + FG-only presentation mode. Starting with NR disabled also skips creation of the feature-18 handle; enabling it live recreates the NGX feature set at the next Present when necessary.
+
+Version 1.7.15 adds automatic DLAA selection for native-resolution games. When the game render dimensions exactly match the native output, the addon creates the NGX Super Sampling feature with `NVSDK_NGX_PerfQuality_Value_DLAA` and a 1:1 input/output contract. Lower resolutions continue selecting the existing DLSS Super Resolution quality modes. NR and optional Frame Generation remain available in either path, and the overlay/log now identify the active reconstruction mode explicitly.
 
 Version 1.4 uses `GetCapabilityParameters`, restores the snippet's provider callbacks after each parameter reset, and invokes NVIDIA's scaling-ratio callback during NR creation. Packed color and NR output are now allocated at the game's reduced render resolution; only the DLSS SR output is native-sized. This is the tested low-cost topology and removes the previous native-sized NR intermediates.
 
@@ -132,4 +138,4 @@ The persistent game log is `%LOCALAPPDATA%\RHI\Logs\standalone-dlssnr.log`. It r
 
 Color-profile changes require a game restart because they change the intermediate resource format and native proxy swapchain. The overlay reports the requested profile, the detected game swapchain color space and format, and the profile actually active in NGX/proxy presentation. Model 1/2/3 changes are applied live: the addon waits for the prior neural frame, releases both NGX handles, and recreates feature 18 plus DLSS SR at the next game `Present`. The overlay reports the actually active model.
 
-The `Enable Neural Rendering` checkbox keeps the same DLSS Super Resolution, optional Frame Generation, and native proxy stages while routing the packed game color directly into SR when disabled. Strength sliders apply when NR is enabled. F10 switches the native-size presentation window between processed output and a simple linear stretch of the original reduced-resolution game backbuffer, so the comparison still fills the monitor. Home opens ReShade using the direct-input proxy bypass when necessary. Alt+X hides the proxy for NVIDIA's external overlay; after that, F10 restores the presentation window.
+The `Enable Neural Rendering` checkbox keeps the same DLAA/DLSS Super Resolution, optional Frame Generation, and native proxy stages while routing the packed game color directly into reconstruction when disabled. Strength sliders apply when NR is enabled. F10 switches the native-size presentation window between processed output and a simple linear presentation of the original game backbuffer, so the comparison still fills the monitor. Home opens ReShade using the direct-input proxy bypass when necessary. Alt+X hides the proxy for NVIDIA's external overlay; after that, F10 restores the presentation window.

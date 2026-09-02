@@ -1123,7 +1123,7 @@ static bool CreateNrFeature(const Options &o, int flags)
     if (!SubmitAndWait()) return false;
     Log("CreateFeature(feature=18) = 0x%08X (%s), handle=%p", static_cast<unsigned>(result), ResultName(result), g.feature);
     if (NVSDK_NGX_FAILED(result) || g.feature == nullptr) return false;
-    Log("PASS raw DLSS-NR feature 18 created with unequal %ux%u -> %ux%u contract, model=%d profile=%s",
+    Log("PASS raw DLSS-NR feature 18 created with %ux%u -> %ux%u contract, model=%d profile=%s",
         o.input_w, o.input_h, o.output_w, o.output_h, o.model, ProfileName(o.profile));
     return true;
 }
@@ -1138,7 +1138,9 @@ static bool CreateSrFeature(const Options &o, int flags)
     g.params->Set("OutWidth", o.output_w);
     g.params->Set("OutHeight", o.output_h);
     const float ratio = static_cast<float>(o.input_w) / static_cast<float>(o.output_w);
-    const int quality = ratio >= 0.62f ? NVSDK_NGX_PerfQuality_Value_MaxQuality
+    const bool dlaa = o.input_w == o.output_w && o.input_h == o.output_h;
+    const int quality = dlaa ? NVSDK_NGX_PerfQuality_Value_DLAA
+        : ratio >= 0.62f ? NVSDK_NGX_PerfQuality_Value_MaxQuality
         : ratio >= 0.54f ? NVSDK_NGX_PerfQuality_Value_Balanced
         : ratio >= 0.42f ? NVSDK_NGX_PerfQuality_Value_MaxPerf
         : NVSDK_NGX_PerfQuality_Value_UltraPerformance;
@@ -1155,8 +1157,9 @@ static bool CreateSrFeature(const Options &o, int flags)
         return false;
     }
     if (!SubmitAndWait()) return false;
-    Log("CreateFeature(feature=SuperSampling) = 0x%08X (%s), handle=%p quality=%d",
-        static_cast<unsigned>(result), ResultName(result), g.sr_feature, quality);
+    Log("CreateFeature(feature=SuperSampling) = 0x%08X (%s), handle=%p mode=%s quality=%d",
+        static_cast<unsigned>(result), ResultName(result), g.sr_feature,
+        dlaa ? "DLAA" : "DLSS SR", quality);
     return NVSDK_NGX_SUCCEED(result) && g.sr_feature != nullptr;
 }
 
@@ -1644,8 +1647,10 @@ static int Run(const Options &o)
         static_cast<unsigned long long>(coverage.checksum));
     WriteResultJson(o, true, good, coverage, pass);
     if (pass) {
-        Log("VERDICT PASS: %s wrote the complete native-resolution target from lower-resolution inputs",
-            o.nr_only ? "DLSS-NR alone" : "DLSS-NR plus DLSS SR");
+        const bool dlaa = !o.nr_only && o.input_w == o.output_w && o.input_h == o.output_h;
+        Log("VERDICT PASS: %s wrote the complete native-resolution target%s",
+            o.nr_only ? "DLSS-NR alone" : (dlaa ? "DLSS-NR plus DLAA" : "DLSS-NR plus DLSS SR"),
+            dlaa ? " at a 1:1 render scale" : " from lower-resolution inputs");
         return 0;
     }
     Log("VERDICT FAIL: creation/evaluation ran, but native-target coverage was not proven (this catches upper-left-only output)");
