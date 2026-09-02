@@ -1362,6 +1362,7 @@ static void WriteResultJson(const Options &o, bool created, UINT evaluations, co
         "  \"profile\": \"%s\",\n"
         "  \"pipeline\": \"%s\",\n"
         "  \"compactNrResources\": %s,\n"
+        "  \"nrResolvedScalingRatio\": %.6f,\n"
         "  \"changedPercent\": %.5f,\n"
         "  \"quadrantChangedPercent\": [%.5f, %.5f, %.5f, %.5f],\n"
         "  \"checksumFnv1a64\": \"%016llX\",\n"
@@ -1369,7 +1370,7 @@ static void WriteResultJson(const Options &o, bool created, UINT evaluations, co
         "}\n",
         created ? "true" : "false", evaluations, o.input_w, o.input_h, o.output_w, o.output_h,
         o.model, ProfileName(o.profile), o.nr_only ? "nr-only" : "nr-plus-dlss-sr",
-        o.compact_nr ? "true" : "false", coverage.total,
+        o.compact_nr ? "true" : "false", g_nr_resolved_scaling_ratio, coverage.total,
         coverage.quadrant[0], coverage.quadrant[1], coverage.quadrant[2], coverage.quadrant[3],
         static_cast<unsigned long long>(coverage.checksum), pass ? "true" : "false");
     std::fclose(file);

@@ -7,7 +7,7 @@ set failures=0
 for %%P in (srgb scrgb hdr10) do (
   for %%M in (1 2 3) do (
     echo ==== profile=%%P model=%%M ====>>matrix-results.txt
-    nr-lab.exe --profile %%P --model %%M --input 960x540 --output 1920x1080 --frames 8 >>matrix-results.txt 2>&1
+    nr-lab.exe --profile %%P --model %%M --input 960x540 --output 1920x1080 --frames 8 --compact-nr >>matrix-results.txt 2>&1
     set result=!errorlevel!
     echo exit=!result!>>matrix-results.txt
     if not "!result!"=="0" set /a failures+=1
