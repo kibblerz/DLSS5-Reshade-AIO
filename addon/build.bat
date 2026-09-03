@@ -22,7 +22,7 @@ cl /nologo /LD /EHsc /O2 /MD /W4 /std:c++20 ^
   "%FEEDER_ROOT%\external\minhook\src\hook.c" ^
   "%FEEDER_ROOT%\external\minhook\src\trampoline.c" ^
   "%FEEDER_ROOT%\external\minhook\src\hde\hde64.c" ^
-  /link /OUT:build\standalone-dlssnr.addon64 kernel32.lib user32.lib d3d9.lib d3d11.lib d3d12.lib dxgi.lib d3dcompiler.lib
+  /link /OUT:build\standalone-dlssnr.addon64 kernel32.lib user32.lib d3d9.lib d3d11.lib d3d12.lib dxgi.lib d3dcompiler.lib dcomp.lib
 if errorlevel 1 exit /b 1
 
 for %%F in (nvngx_dlssnr.dll nvngx_dlss.dll nvngx_dlssg.dll) do (
