@@ -67,6 +67,7 @@ The persistent log records `early_proxy=enabled` at startup when the saved setti
 - Some games temporarily show their lower-resolution image while the ReShade menu is open.
 - No Man's Sky and potentially other Vulkan games may not display the ReShade menu correctly.
 - Additional game-specific and Vulkan issues are expected.
+- The experimental VORT NR rejection mask currently behaves more like a hard gate than a gradual blend at nonzero strength. Leave it disabled unless testing this feature; strength zero is an exact bypass that restores NVIDIA automatic masking.
 
 ## Companion guide shader
 
@@ -175,6 +176,8 @@ Version 1.7.17 adds an opt-in **Early proxy initialization (D3D11On12 compatibil
 Version 1.7.18 fixes the three DLSS-NR model controls. The private 310.8 runtime selects its three effective neural variants through `DLSSNR.Style` values 0, 1, and 2, rather than through `DLSSNR.Hint.Render.Preset` alone. Model changes now publish both parameters during feature creation and every evaluation, while preserving the existing live feature-recreation behavior.
 
 Version 1.7.22 moves native proxy presentation to a dedicated, bounded worker using a three-buffer frame-latency-waitable swapchain. Generated and real frames are paced independently from the game's Present callback, restoring Frame Generation output that v1.7.20's nonblocking safety path could discard whenever the proxy was busy. The game thread remains nonblocking, duplicate requests are coalesced, and finite GPU/swapchain waits fail open instead of hanging the game. This version also adds optional asynchronous CPU/GPU performance telemetry to the ReShade panel and persistent log.
+
+Version 1.7.24 expands that performance telemetry to measure the VORT/feed guide passes and the asynchronous proxy compositor separately. It also corrects the experimental NR rejection-mask contract: a bound manual `ControlMask` now disables NVIDIA automatic masking, while strength zero unbinds the manual resource completely and returns to the same automatic-mask path used when the option is disabled. Nonzero strengths remain experimental because the private runtime currently treats the mask more like a hard gate than a smooth blend.
 
 Version 1.7.21 removes the automatic Frame Generation block triggered by a loaded native Streamline module. Detection remains visible in the log and overlay, but the addon's normal Frame Generation checkbox is authoritative. Disable the game's built-in Frame Generation before enabling addon FG; running two Frame Generation implementations together is unsupported.
 

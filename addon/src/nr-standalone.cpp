@@ -29,7 +29,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.23-full-telemetry-prototype"
+#define ADDON_VERSION "1.7.24"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -2186,10 +2186,12 @@ static void SetNrEvaluationContract(ID3D12Resource *depth, ID3D12Resource *motio
     g_ngx_params->Set("DLSSNR.LocalStructureStrength", g_nr_local_structure);
     g_ngx_params->Set("DLSSNR.SkinStructureStrength", g_nr_skin_structure);
     g_ngx_params->Set("DLSSNR.Enabled", 1u);
-    // A supplied control mask overrides the runtime's generated mask. Keep
-    // automatic masking enabled as the fallback when VORT or the guide shader
-    // is unavailable.
-    g_ngx_params->Set("DLSSNR.UseAutoMask", 1u);
+    // The private runtime treats ControlMask as the manual-mask contract. The
+    // lab only validated this resource with automatic masking disabled; asking
+    // for both modes at once makes the provider ignore the intended continuum
+    // and can suppress NR across the frame. Fall back to NVIDIA's automatic
+    // mask only when no manual resource is bound.
+    g_ngx_params->Set("DLSSNR.UseAutoMask", control_mask != nullptr ? 0u : 1u);
     g_ngx_params->Set("DLSSNR.UICorrection", 0u);
 }
 
@@ -2720,7 +2722,11 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     g_neural_list->ResourceBarrier(1, &sr_to_uav);
     DWORD exception = 0;
     NVSDK_NGX_Result nr_result = NVSDK_NGX_Result_Success;
-    ID3D12Resource *nr_control_mask = g_nr_rejection_mask_enabled && use_external_guides &&
+    // Strength zero is an exact bypass for this experiment: do not merely bind
+    // an all-white texture, since the presence of ControlMask selects a
+    // different provider path than NVIDIA's automatic mask.
+    ID3D12Resource *nr_control_mask = g_nr_rejection_mask_enabled &&
+        g_nr_rejection_mask_strength > 0.0001f && use_external_guides &&
         g_nr_mask_available ? g_captured_nr_mask.Get() : nullptr;
     if (evaluate_nr)
     {
@@ -4411,6 +4417,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g_mask_available ? "valid" : "automatic mask");
     ImGui::Text("NR rejection mask: %s (strength %.2f)",
         !g_nr_rejection_mask_enabled ? "disabled" :
+        g_nr_rejection_mask_strength <= 0.0001f ? "bypassed at zero / NVIDIA automatic mask" :
         g_using_external_guides && g_nr_mask_available ? "active" : "waiting for VORT/guide texture",
         g_nr_rejection_mask_strength);
     ImGui::Text("Current-frame guide submissions: %llu", g_current_guide_frames.load());
