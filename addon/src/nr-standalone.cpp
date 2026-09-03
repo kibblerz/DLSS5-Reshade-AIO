@@ -30,7 +30,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.25-same-window-history-control"
+#define ADDON_VERSION "1.7.26-windowed-virtualization-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -206,6 +206,18 @@ static std::atomic<unsigned long long> g_neural_busy_frame_skips{0};
 static std::atomic<unsigned long long> g_proxy_busy_frame_skips{0};
 static bool g_native_streamline_present_hook;
 static std::atomic<bool> g_fullscreen_virtualization_pending{false};
+static bool g_windowed_virtualization_enabled;
+static std::atomic<bool> g_windowed_virtualization_pending{false};
+static std::atomic<bool> g_windowed_virtualization_active{false};
+static std::atomic<HWND> g_windowed_virtualization_window{nullptr};
+static std::atomic<unsigned int> g_windowed_render_width{0};
+static std::atomic<unsigned int> g_windowed_render_height{0};
+static RECT g_windowed_original_rect = {};
+static LONG_PTR g_windowed_original_style;
+static LONG_PTR g_windowed_original_ex_style;
+static HWND g_windowed_original_window;
+static bool g_windowed_original_state_saved;
+static std::atomic<unsigned long long> g_windowed_resize_overrides{0};
 
 static void RequestProxyOverlayInputMode()
 {
@@ -2987,6 +2999,108 @@ static LRESULT CALLBACK ProxyLowLevelMouseProc(int code, WPARAM wparam, LPARAM l
     return CallNextHookEx(g_proxy_mouse_hook, code, wparam, lparam);
 }
 
+static void ApplyDeferredWindowedVirtualization(HWND game_window)
+{
+    struct PendingGuard
+    {
+        ~PendingGuard() { g_windowed_virtualization_pending = false; }
+    } pending_guard;
+
+    if (game_window == nullptr || !IsWindow(game_window))
+        return;
+
+    if (!g_windowed_virtualization_enabled)
+    {
+        if (!g_windowed_virtualization_active.load() ||
+            !g_windowed_original_state_saved || g_windowed_original_window != game_window)
+            return;
+
+        g_windowed_virtualization_active = false;
+        SetWindowLongPtrW(game_window, GWL_STYLE, g_windowed_original_style);
+        SetWindowLongPtrW(game_window, GWL_EXSTYLE, g_windowed_original_ex_style);
+        SetWindowPos(game_window, nullptr,
+            g_windowed_original_rect.left, g_windowed_original_rect.top,
+            g_windowed_original_rect.right - g_windowed_original_rect.left,
+            g_windowed_original_rect.bottom - g_windowed_original_rect.top,
+            SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
+        Log("windowed virtualization disabled; restored original window rect=%ld,%ld %ldx%ld",
+            g_windowed_original_rect.left, g_windowed_original_rect.top,
+            g_windowed_original_rect.right - g_windowed_original_rect.left,
+            g_windowed_original_rect.bottom - g_windowed_original_rect.top);
+        g_windowed_original_state_saved = false;
+        g_windowed_original_window = nullptr;
+        return;
+    }
+
+    const UINT render_width = g_windowed_render_width.load();
+    const UINT render_height = g_windowed_render_height.load();
+    if (render_width < 640 || render_height < 360)
+        return;
+
+    HMONITOR monitor = MonitorFromWindow(game_window, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info = {sizeof(info)};
+    if (!GetMonitorInfoW(monitor, &info))
+        return;
+    const LONG monitor_width = info.rcMonitor.right - info.rcMonitor.left;
+    const LONG monitor_height = info.rcMonitor.bottom - info.rcMonitor.top;
+    if (render_width >= static_cast<UINT>(monitor_width) &&
+        render_height >= static_cast<UINT>(monitor_height))
+        return;
+
+    if (!g_windowed_original_state_saved || g_windowed_original_window != game_window)
+    {
+        if (!GetWindowRect(game_window, &g_windowed_original_rect))
+            return;
+        g_windowed_original_style = GetWindowLongPtrW(game_window, GWL_STYLE);
+        g_windowed_original_ex_style = GetWindowLongPtrW(game_window, GWL_EXSTYLE);
+        g_windowed_original_window = game_window;
+        g_windowed_original_state_saved = true;
+    }
+
+    // Mark this active before SetWindowPos. The resulting WM_SIZE can make the
+    // game synchronously call ResizeBuffers, and OnCreateSwapchain must pin that
+    // request to the reduced render dimensions rather than the new client size.
+    g_windowed_virtualization_window = game_window;
+    g_windowed_virtualization_active = true;
+
+    LONG_PTR style = GetWindowLongPtrW(game_window, GWL_STYLE);
+    style &= ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU);
+    style |= WS_POPUP | WS_VISIBLE;
+    LONG_PTR ex_style = GetWindowLongPtrW(game_window, GWL_EXSTYLE);
+    ex_style &= ~(WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE);
+    SetWindowLongPtrW(game_window, GWL_STYLE, style);
+    SetWindowLongPtrW(game_window, GWL_EXSTYLE, ex_style);
+    if (!SetWindowPos(game_window, HWND_TOP,
+        info.rcMonitor.left, info.rcMonitor.top, monitor_width, monitor_height,
+        SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW))
+    {
+        g_windowed_virtualization_active = false;
+        Log("windowed virtualization SetWindowPos failed: error=%lu", GetLastError());
+        return;
+    }
+
+    Log("windowed virtualization active: render=%ux%u client target=%ldx%ld hwnd=%p",
+        render_width, render_height, monitor_width, monitor_height, game_window);
+}
+
+static DWORD WINAPI DeferredWindowedVirtualizationWorker(void *parameter)
+{
+    ApplyDeferredWindowedVirtualization(static_cast<HWND>(parameter));
+    return 0;
+}
+
+static void QueueWindowedVirtualization(HWND game_window)
+{
+    if (game_window == nullptr || !IsWindow(game_window) ||
+        g_windowed_virtualization_pending.exchange(true))
+        return;
+    if (!QueueUserWorkItem(DeferredWindowedVirtualizationWorker, game_window, WT_EXECUTEDEFAULT))
+    {
+        g_windowed_virtualization_pending = false;
+        Log("windowed virtualization worker could not be queued: error=%lu", GetLastError());
+    }
+}
+
 static void ApplyDeferredFullscreenVirtualization(HWND game_window)
 {
     if (game_window == nullptr || !IsWindow(game_window))
@@ -4303,6 +4417,66 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     if (g_nr_output != nullptr && EnsureProxy(g_nr_output)) g_pending_proxy_frame = true;
 }
 
+static bool OnCreateSwapchain(reshade::api::device_api api,
+    reshade::api::swapchain_desc &desc, void *window)
+{
+    if (!g_enabled || !g_windowed_virtualization_enabled || window == nullptr ||
+        (api != reshade::api::device_api::d3d9 &&
+         api != reshade::api::device_api::d3d11 &&
+         api != reshade::api::device_api::d3d12))
+        return false;
+
+    HWND hwnd = static_cast<HWND>(window);
+    if (!g_windowed_virtualization_active.load() ||
+        hwnd != g_windowed_virtualization_window.load() || desc.fullscreen_state)
+        return false;
+
+    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info = {sizeof(info)};
+    if (!GetMonitorInfoW(monitor, &info))
+        return false;
+    const UINT monitor_width = static_cast<UINT>(info.rcMonitor.right - info.rcMonitor.left);
+    const UINT monitor_height = static_cast<UINT>(info.rcMonitor.bottom - info.rcMonitor.top);
+    UINT request_width = desc.back_buffer.texture.width;
+    UINT request_height = desc.back_buffer.texture.height;
+    UINT render_width = g_windowed_render_width.load();
+    UINT render_height = g_windowed_render_height.load();
+    if (render_width < 640 || render_height < 360)
+        return false;
+
+    // A genuinely reduced request is an in-game resolution change. Adopt it as
+    // the new logical render contract, then keep the already-expanded HWND.
+    if (request_width >= 640 && request_height >= 360 &&
+        request_width <= monitor_width && request_height <= monitor_height &&
+        (request_width < monitor_width || request_height < monitor_height))
+    {
+        if (request_width != render_width || request_height != render_height)
+        {
+            g_windowed_render_width = request_width;
+            g_windowed_render_height = request_height;
+            Log("windowed virtualization adopted game resolution change: %ux%u", request_width, request_height);
+            QueueWindowedVirtualization(hwnd);
+        }
+        return false;
+    }
+
+    // SetWindowPos makes many games issue ResizeBuffers(0, 0) or explicitly use
+    // the new native client size. Override only that window-driven resize; all
+    // reduced requests above remain under game control.
+    if (request_width == 0 || request_height == 0 ||
+        (request_width >= monitor_width && request_height >= monitor_height))
+    {
+        desc.back_buffer.texture.width = render_width;
+        desc.back_buffer.texture.height = render_height;
+        const unsigned long long overrides = ++g_windowed_resize_overrides;
+        if (overrides <= 8 || overrides % 120 == 0)
+            Log("windowed virtualization pinned client-driven swapchain resize: requested=%ux%u render=%ux%u count=%llu",
+                request_width, request_height, render_width, render_height, overrides);
+        return true;
+    }
+    return false;
+}
+
 static void OnInitSwapchain(reshade::api::swapchain *swapchain, bool)
 {
     if (swapchain == nullptr) return;
@@ -4339,11 +4513,25 @@ static void OnInitSwapchain(reshade::api::swapchain *swapchain, bool)
     }
     RECT client = {};
     GetClientRect(hwnd, &client);
+    const LONG client_width = client.right - client.left;
+    const LONG client_height = client.bottom - client.top;
     Log("adopted primary swapchain: render=%ux%u client=%ldx%ld monitor=%ux%u hwnd=%p mode=%s",
-        g_input_width.load(), g_input_height.load(), client.right - client.left, client.bottom - client.top,
+        g_input_width.load(), g_input_height.load(), client_width, client_height,
         g_output_width.load(), g_output_height.load(), hwnd,
-        (client.right - client.left == static_cast<LONG>(g_output_width.load()) &&
-         client.bottom - client.top == static_cast<LONG>(g_output_height.load())) ? "borderless/native-client" : "reduced borderless/windowed");
+        (client_width == static_cast<LONG>(g_output_width.load()) &&
+         client_height == static_cast<LONG>(g_output_height.load())) ? "borderless/native-client" : "reduced borderless/windowed");
+
+    if (g_windowed_virtualization_enabled && width < g_output_width.load() &&
+        height < g_output_height.load() && client_width > 0 && client_height > 0 &&
+        (client_width < static_cast<LONG>(g_output_width.load()) ||
+         client_height < static_cast<LONG>(g_output_height.load())))
+    {
+        g_windowed_render_width = width;
+        g_windowed_render_height = height;
+        g_windowed_virtualization_window = hwnd;
+        QueueWindowedVirtualization(hwnd);
+        Log("reduced ordinary window detected; queued native-client virtualization for %ux%u render", width, height);
+    }
 }
 
 static bool OnSetFullscreenState(reshade::api::swapchain *swapchain, bool fullscreen, void *)
@@ -4393,6 +4581,24 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     }
     ImGui::SameLine();
     ImGui::TextDisabled("supports reduced-resolution fullscreen and borderless swapchains");
+
+    if (ImGui::Checkbox("Virtualize reduced window to native monitor", &g_windowed_virtualization_enabled))
+    {
+        reshade::set_config_value(nullptr, section, "WindowedVirtualization",
+            g_windowed_virtualization_enabled ? "1" : "0");
+        HWND hwnd = g_windowed_virtualization_window.load();
+        if (hwnd == nullptr) hwnd = g_game_window;
+        if (g_windowed_virtualization_enabled && hwnd != nullptr)
+        {
+            g_windowed_render_width = g_input_width.load();
+            g_windowed_render_height = g_input_height.load();
+            g_windowed_virtualization_window = hwnd;
+        }
+        QueueWindowedVirtualization(hwnd);
+        Log("windowed virtualization setting changed to %s",
+            g_windowed_virtualization_enabled ? "enabled" : "disabled");
+    }
+    ImGui::TextDisabled("Opt-in: keeps a reduced game backbuffer while expanding the same window to native size.");
 
     ImGui::TextDisabled("Vulkan: select a real reduced windowed resolution in-game; the native proxy supplies borderless output.");
 
@@ -4550,6 +4756,12 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::Text("Same-window compositor: %s; frames=%llu; post-ReShade=%llu",
         g_proxy_failed ? "failed/quarantined" : (g_proxy_swapchain ? "presenting" : "waiting"),
         g_frames_presented.load(), g_post_reshade_frames.load());
+    ImGui::Text("Windowed virtualization: %s; render pin=%ux%u; resize overrides=%llu",
+        !g_windowed_virtualization_enabled ? "off" :
+        g_windowed_virtualization_active.load() ? "active" :
+        g_windowed_virtualization_pending.load() ? "pending" : "waiting for reduced window",
+        g_windowed_render_width.load(), g_windowed_render_height.load(),
+        g_windowed_resize_overrides.load());
     ImGui::Text("Present safety: neural skips=%llu; proxy skips=%llu; native Streamline=%s",
         g_neural_busy_frame_skips.load(), g_proxy_busy_frame_skips.load(),
         g_native_streamline_present_hook ? "detected" : "not detected");
@@ -4720,12 +4932,15 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
         read_setting("PerformanceTelemetry", "1", value, sizeof(value)); g_performance_telemetry_enabled = strcmp(value, "0") != 0;
         read_setting("EarlyProxyInitialization", "0", value, sizeof(value)); g_early_proxy_initialization = strcmp(value, "0") != 0;
-        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d style=%u NR=%s NR-mask=%s strength=%.2f early_proxy=%s telemetry=%s",
+        read_setting("WindowedVirtualization", "0", value, sizeof(value)); g_windowed_virtualization_enabled = strcmp(value, "0") != 0;
+        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d style=%u NR=%s NR-mask=%s strength=%.2f early_proxy=%s windowed_virtualization=%s telemetry=%s",
             ADDON_VERSION, ProfileName(g_color_profile), g_nr_model, NrStyle(), g_nr_enabled ? "enabled" : "disabled",
             g_nr_rejection_mask_enabled ? "enabled" : "disabled", g_nr_rejection_mask_strength,
             g_early_proxy_initialization ? "enabled" : "disabled",
+            g_windowed_virtualization_enabled ? "enabled" : "disabled",
             g_performance_telemetry_enabled ? "enabled" : "disabled");
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
+        reshade::register_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
@@ -4743,6 +4958,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     else if (reason == DLL_PROCESS_DETACH)
     {
         reshade::unregister_event<reshade::addon_event::create_device>(OnCreateDevice);
+        reshade::unregister_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
         reshade::unregister_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
         reshade::unregister_overlay(nullptr, DrawOverlay);
         reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(OnReshadeOpenOverlay);
