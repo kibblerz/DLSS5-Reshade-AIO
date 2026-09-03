@@ -28,7 +28,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.19-f10-raw-prototype"
+#define ADDON_VERSION "1.7.20-present-safety-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -102,6 +102,27 @@ static std::atomic<unsigned long long> g_last_primary_present_tick{0};
 static std::atomic<bool> g_proxy_watchdog_hidden{false};
 static std::atomic<unsigned long long> g_ignored_secondary_surfaces{0};
 static constexpr UINT kProxyOverlayInputModeMessage = WM_APP + 0x51;
+static constexpr UINT kProxyVirtualizeFullscreenMessage = WM_APP + 0x52;
+static constexpr UINT kProxyVisibilityMessage = WM_APP + 0x53;
+static constexpr UINT kProxyResizeToMonitorMessage = WM_APP + 0x54;
+static constexpr DWORD kInitializationGpuWaitMs = 2000;
+static constexpr DWORD kTransitionGpuWaitMs = 250;
+static constexpr DWORD kProxyWindowStartupWaitMs = 1000;
+static constexpr ULONGLONG kInitialNativeSettleMs = 15000;
+static constexpr ULONGLONG kReducedOrResizeSettleMs = 750;
+static constexpr unsigned int kStableContractFrames = 30;
+static UINT g_candidate_input_width;
+static UINT g_candidate_input_height;
+static UINT g_candidate_output_width;
+static UINT g_candidate_output_height;
+static DXGI_FORMAT g_candidate_input_format = DXGI_FORMAT_UNKNOWN;
+static ULONGLONG g_candidate_contract_since;
+static unsigned int g_candidate_contract_frames;
+static std::atomic<unsigned long long> g_neural_busy_frame_skips{0};
+static std::atomic<unsigned long long> g_proxy_busy_frame_skips{0};
+static bool g_native_streamline_present_hook;
+static bool g_allow_framegen_with_native_streamline;
+static std::atomic<bool> g_fullscreen_virtualization_pending{false};
 
 static void RequestProxyOverlayInputMode()
 {
@@ -263,6 +284,33 @@ static NVSDK_NGX_Parameter *g_ngx_params;
 static NVSDK_NGX_Handle *g_nr_feature;
 static NVSDK_NGX_Handle *g_sr_feature;
 static NVSDK_NGX_Handle *g_fg_feature;
+static void Log(const char *format, ...);
+static void SetStatus(const char *format, ...);
+static void RequestProxyVisibility(bool visible);
+
+static bool EffectiveFramegenEnabled()
+{
+    return g_framegen_enabled &&
+        (!g_native_streamline_present_hook || g_allow_framegen_with_native_streamline);
+}
+
+static void DetectNativeStreamlinePresentHook()
+{
+    if (g_native_streamline_present_hook) return;
+    HMODULE interposer = GetModuleHandleW(L"sl.interposer.dll");
+    HMODULE dlssg = GetModuleHandleW(L"sl.dlss_g.dll");
+    if (interposer == nullptr && dlssg == nullptr) return;
+
+    g_native_streamline_present_hook = true;
+    Log("native Streamline presentation hook detected: sl.interposer=%p sl.dlss_g=%p; addon FG=%s",
+        interposer, dlssg, g_allow_framegen_with_native_streamline ? "expert override" : "safety-blocked");
+    if (g_fg_feature != nullptr && !g_allow_framegen_with_native_streamline)
+    {
+        g_feature_recreate_requested = true;
+        g_need_history_reset = true;
+        SetStatus("native Streamline detected; safely removing addon Frame Generation");
+    }
+}
 static NgxCreateFeature g_nr_create;
 static NgxEvaluateFeature g_nr_evaluate;
 static NgxReleaseFeature g_nr_release;
@@ -425,26 +473,41 @@ static void Fail(const char *stage, unsigned int code = 0)
     if (g_proxy_window)
     {
         g_proxy_hidden = true;
-        ShowWindow(g_proxy_window, SW_HIDE);
+        RequestProxyVisibility(false);
     }
 }
 
-static bool WaitForNeuralGpu(DWORD timeout = 30000)
+static bool NeuralGpuIdle()
 {
-    if (!g_neural_fence || g_neural_fence_value == 0 || g_neural_fence->GetCompletedValue() >= g_neural_fence_value)
-        return true;
+    return !g_neural_fence || g_neural_fence_value == 0 ||
+        g_neural_fence->GetCompletedValue() >= g_neural_fence_value;
+}
+
+static bool WaitForNeuralGpu(DWORD timeout, bool fatal_on_timeout, const char *stage)
+{
+    if (NeuralGpuIdle()) return true;
+    if (timeout == 0) return false;
+    const ULONGLONG started = GetTickCount64();
     if (FAILED(g_neural_fence->SetEventOnCompletion(g_neural_fence_value, g_neural_fence_event)) ||
         WaitForSingleObject(g_neural_fence_event, timeout) != WAIT_OBJECT_0)
     {
-        Fail("neural GPU fence timeout", static_cast<unsigned int>(GetLastError()));
+        const DWORD error = GetLastError();
+        Log("%s did not complete within %lu ms; completed=%llu submitted=%llu (fail-open)",
+            stage, timeout, g_neural_fence ? g_neural_fence->GetCompletedValue() : 0,
+            g_neural_fence_value);
+        if (fatal_on_timeout)
+            Fail(stage, static_cast<unsigned int>(error == ERROR_SUCCESS ? WAIT_TIMEOUT : error));
         return false;
     }
+    const ULONGLONG elapsed = GetTickCount64() - started;
+    if (elapsed >= 50)
+        Log("%s completed after %llu ms", stage, elapsed);
     return true;
 }
 
-static bool BeginNeuralCommands()
+static bool BeginNeuralCommands(DWORD timeout = 0, bool fatal_on_timeout = false)
 {
-    if (!WaitForNeuralGpu()) return false;
+    if (!WaitForNeuralGpu(timeout, fatal_on_timeout, "neural GPU fence")) return false;
     HRESULT hr = g_neural_allocator->Reset();
     if (SUCCEEDED(hr)) hr = g_neural_list->Reset(g_neural_allocator.Get(), nullptr);
     if (FAILED(hr)) { Fail("neural command-list reset", static_cast<unsigned int>(hr)); return false; }
@@ -460,7 +523,7 @@ static bool SubmitNeuralCommands(bool wait)
     const UINT64 value = ++g_neural_fence_value;
     hr = g_command_queue->Signal(g_neural_fence.Get(), value);
     if (FAILED(hr)) { Fail("neural queue signal", static_cast<unsigned int>(hr)); return false; }
-    return !wait || WaitForNeuralGpu();
+    return !wait || WaitForNeuralGpu(kInitializationGpuWaitMs, true, "NGX initialization GPU fence");
 }
 
 static HMODULE LoadInstalledNgxCore()
@@ -694,6 +757,13 @@ static int FeatureFlags()
         (g_active_color_profile == ColorProfile::Srgb ? 0 : NVSDK_NGX_DLSS_Feature_Flags_IsHDR);
 }
 
+static void RequestProxyVisibility(bool visible)
+{
+    const HWND proxy = g_proxy_window;
+    if (proxy != nullptr)
+        PostMessageW(proxy, kProxyVisibilityMessage, visible ? 1 : 0, 0);
+}
+
 static unsigned int NrStyle()
 {
     // The private 310.8 NR package exposes three effective networks through
@@ -803,7 +873,7 @@ static bool CreateFeatures()
     if (g_nr_enabled)
     {
         SetNrCreationContract();
-        if (!BeginNeuralCommands()) return false;
+        if (!BeginNeuralCommands(kInitializationGpuWaitMs, true)) return false;
         result = SafeCreate(true, &exception);
         if (exception) { g_neural_list->Close(); Fail("NR feature creation exception", exception); return false; }
         if (!SubmitNeuralCommands(true)) return false;
@@ -832,7 +902,7 @@ static bool CreateFeatures()
     g_ngx_params->Set("PerfQualityValue", quality);
     g_ngx_params->Set("DLSS.Feature.Create.Flags", FeatureFlags());
     g_ngx_params->Set("DLSS.Enable.Output.Subrects", 0);
-    if (!BeginNeuralCommands()) return false;
+    if (!BeginNeuralCommands(kInitializationGpuWaitMs, true)) return false;
     exception = 0;
     result = SafeCreate(false, &exception);
     if (exception) { g_neural_list->Close(); Fail("DLSS SR feature creation exception", exception); return false; }
@@ -841,7 +911,7 @@ static bool CreateFeatures()
         static_cast<unsigned int>(result), ResultName(result), g_sr_feature, SrModeName(), quality);
     if (NVSDK_NGX_FAILED(result) || !g_sr_feature) { Fail("DLSS SR feature creation", static_cast<unsigned int>(result)); return false; }
 
-    if (!g_framegen_failed)
+    if (!g_framegen_failed && EffectiveFramegenEnabled())
     {
         g_ngx_params->Reset();
         const NVSDK_NGX_Result populate_result = g_bridge_populate(g_fg_populate, g_ngx_params);
@@ -855,7 +925,7 @@ static bool CreateFeatures()
         g_ngx_params->Set("DLSSG.InternalWidth", g_resource_input_width);
         g_ngx_params->Set("DLSSG.InternalHeight", g_resource_input_height);
         g_ngx_params->Set("DLSSG.DynamicResolution", 0u);
-        if (!BeginNeuralCommands()) return false;
+        if (!BeginNeuralCommands(kInitializationGpuWaitMs, true)) return false;
         exception = 0;
         result = SafeCreateFg(&exception);
         if (exception)
@@ -872,11 +942,21 @@ static bool CreateFeatures()
             if (NVSDK_NGX_FAILED(result) || !g_fg_feature) g_framegen_failed = true;
         }
     }
+    else
+    {
+        g_fg_feature = nullptr;
+        Log("CreateFeature(feature=FrameGeneration) skipped: %s",
+            !g_framegen_enabled ? "Frame Generation is disabled" :
+            g_native_streamline_present_hook && !g_allow_framegen_with_native_streamline ?
+                "native Streamline presentation hook safety block" : "previous failure");
+    }
     Log("standalone contract ready: NR=%s at %ux%u, %s -> %ux%u, DLSS-G=%s, model=%d style=%u, profile=%s",
         g_nr_feature ? "feature 18 active" : "disabled",
         g_resource_input_width, g_resource_input_height, SrModeName(),
         g_resource_output_width, g_resource_output_height,
-        (!g_framegen_failed && g_fg_feature) ? "ready" : "fallback-off",
+        (!g_framegen_failed && g_fg_feature) ? "ready" :
+            (g_native_streamline_present_hook && !g_allow_framegen_with_native_streamline ?
+                "native-hook-safety-off" : "fallback-off"),
         g_nr_model, NrStyle(), ProfileName(g_active_color_profile));
     g_active_nr_model = g_nr_feature ? g_nr_model : 0;
     return true;
@@ -885,7 +965,8 @@ static bool CreateFeatures()
 static bool RecreateFeatures()
 {
     if (!g_neural_ready || !g_sr_feature) return false;
-    if (!WaitForNeuralGpu()) return false;
+    if (!WaitForNeuralGpu(0, false, "pipeline switch GPU fence"))
+        return false;
     DWORD exception = 0;
     if (g_fg_feature)
     {
@@ -1036,14 +1117,12 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
     // work has completed.
     if (g_proxy_fence && g_proxy_fence_value != 0 && g_proxy_fence->GetCompletedValue() < g_proxy_fence_value)
     {
-        if (FAILED(g_proxy_fence->SetEventOnCompletion(g_proxy_fence_value, g_proxy_fence_event)) ||
-            WaitForSingleObject(g_proxy_fence_event, 30000) != WAIT_OBJECT_0)
-        {
-            Fail("proxy GPU fence during resolution change", static_cast<unsigned int>(GetLastError()));
-            return false;
-        }
+        Log("resolution reconfiguration deferred: proxy GPU work is still active (completed=%llu submitted=%llu)",
+            g_proxy_fence->GetCompletedValue(), g_proxy_fence_value);
+        return false;
     }
-    if (!WaitForNeuralGpu()) return false;
+    if (!WaitForNeuralGpu(0, false, "resolution transition GPU fence"))
+        return false;
 
     DWORD exception = 0;
     if (g_fg_feature)
@@ -1547,7 +1626,7 @@ static bool WaitForD3D9Copy()
     if (!g_legacy_query9 && g_legacy_device9)
         g_legacy_device9->CreateQuery(D3DQUERYTYPE_EVENT, &g_legacy_query9);
     if (!g_legacy_query9 || FAILED(g_legacy_query9->Issue(D3DISSUE_END))) return false;
-    const ULONGLONG deadline = GetTickCount64() + 3000;
+    const ULONGLONG deadline = GetTickCount64() + kTransitionGpuWaitMs;
     HRESULT hr = S_FALSE;
     while ((hr = g_legacy_query9->GetData(nullptr, 0, D3DGETDATA_FLUSH)) == S_FALSE && GetTickCount64() < deadline)
         SwitchToThread();
@@ -1590,12 +1669,66 @@ static bool CopyLegacyFrameToD3D12(void *native_resource, bool post_effects)
     return true;
 }
 
+static void ResetContractCandidate()
+{
+    g_candidate_input_width = g_candidate_input_height = 0;
+    g_candidate_output_width = g_candidate_output_height = 0;
+    g_candidate_input_format = DXGI_FORMAT_UNKNOWN;
+    g_candidate_contract_since = 0;
+    g_candidate_contract_frames = 0;
+}
+
+static bool ResourceContractIsStable(UINT iw, UINT ih, UINT ow, UINT oh, DXGI_FORMAT format)
+{
+    if (g_neural_ready && iw == g_resource_input_width && ih == g_resource_input_height &&
+        ow == g_resource_output_width && oh == g_resource_output_height && format == g_resource_input_format)
+    {
+        ResetContractCandidate();
+        return true;
+    }
+
+    const ULONGLONG now = GetTickCount64();
+    if (iw != g_candidate_input_width || ih != g_candidate_input_height ||
+        ow != g_candidate_output_width || oh != g_candidate_output_height ||
+        format != g_candidate_input_format)
+    {
+        g_candidate_input_width = iw; g_candidate_input_height = ih;
+        g_candidate_output_width = ow; g_candidate_output_height = oh;
+        g_candidate_input_format = format;
+        g_candidate_contract_since = now;
+        g_candidate_contract_frames = 1;
+        if (g_proxy_window != nullptr)
+        {
+            g_proxy_hidden = true;
+            RequestProxyVisibility(false);
+        }
+        Log("presentation contract candidate: %ux%u -> %ux%u fmt=%u; waiting for stability",
+            iw, ih, ow, oh, static_cast<unsigned int>(format));
+    }
+    else if (g_candidate_contract_frames != ~0u)
+    {
+        ++g_candidate_contract_frames;
+    }
+
+    const bool initial_native = !g_neural_ready && iw == ow && ih == oh;
+    const ULONGLONG settle_ms = initial_native ? kInitialNativeSettleMs : kReducedOrResizeSettleMs;
+    const ULONGLONG elapsed = now - g_candidate_contract_since;
+    if (elapsed < settle_ms || g_candidate_contract_frames < kStableContractFrames)
+    {
+        SetStatus("waiting for stable presentation contract: %ux%u -> %ux%u (%llums/%llums)",
+            iw, ih, ow, oh, elapsed, settle_ms);
+        return false;
+    }
+    return true;
+}
+
 static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format)
 {
     if (g_neural_failed || !g_command_queue) return false;
     const UINT ow = g_output_width.load(), oh = g_output_height.load();
     input_format = TypedInputFormat(input_format);
     if (iw == 0 || ih == 0 || ow == 0 || oh == 0) return false;
+    if (!ResourceContractIsStable(iw, ih, ow, oh, input_format)) return false;
     if (g_neural_ready && (iw != g_resource_input_width || ih != g_resource_input_height ||
         ow != g_resource_output_width || oh != g_resource_output_height || input_format != g_resource_input_format))
     {
@@ -1603,7 +1736,7 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
     }
     if (iw > ow || ih > oh)
     {
-        if (g_proxy_window) { g_proxy_hidden = true; ShowWindow(g_proxy_window, SW_HIDE); }
+        if (g_proxy_window) { g_proxy_hidden = true; RequestProxyVisibility(false); }
         SetStatus("render resolution exceeds native output");
         return false;
     }
@@ -1655,7 +1788,7 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
     {
         g_proxy_hidden = false;
         if (!g_proxy_early_pending_activation)
-            ShowWindow(g_proxy_window, g_proxy_overlay_bypass ? SW_HIDE : SW_SHOWNOACTIVATE);
+            RequestProxyVisibility(!g_proxy_overlay_bypass);
     }
     SetStatus("active on present: %s + %s (fallback guides)",
         g_nr_enabled ? "NR" : "NR disabled", SrModeName());
@@ -1664,6 +1797,7 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
         static_cast<unsigned int>(result_format), iw, ih);
     Log("resolution configuration active without restart: input=%ux%u output=%ux%u mode=%s",
         iw, ih, ow, oh, SrModeName());
+    ResetContractCandidate();
     return true;
 }
 
@@ -1845,7 +1979,7 @@ static void OnInitEffectRuntime(reshade::api::effect_runtime *runtime)
         g_proxy_overlay_open = false;
         if (g_proxy_overlay_bypass.exchange(false) && !g_proxy_hidden &&
             !g_proxy_failed && !g_proxy_early_pending_activation)
-            ShowWindow(g_proxy_window, SW_SHOWNOACTIVATE);
+            RequestProxyVisibility(true);
         RequestProxyOverlayInputMode();
         Log("adopted native proxy ReShade runtime for overlay mirroring: runtime=%p hwnd=%p surface=%llux%u",
             runtime, runtime_window, runtime_desc.texture.width, runtime_desc.texture.height);
@@ -1897,7 +2031,7 @@ static void OnInitEffectRuntime(reshade::api::effect_runtime *runtime)
             {
                 g_proxy_initialized_early = true;
                 g_proxy_early_pending_activation = true;
-                if (g_proxy_window != nullptr) ShowWindow(g_proxy_window, SW_HIDE);
+                if (g_proxy_window != nullptr) RequestProxyVisibility(false);
                 Log("native proxy initialized synchronously before first Present; awaiting queue validation");
             }
             else
@@ -1924,7 +2058,7 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *runtime)
         {
             g_proxy_overlay_bypass = true;
             UpdateProxyCursorClip(false);
-            if (g_proxy_window) ShowWindow(g_proxy_window, SW_HIDE);
+            if (g_proxy_window) RequestProxyVisibility(false);
         }
         return;
     }
@@ -1943,7 +2077,7 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *runtime)
     if (g_proxy_overlay_bypass.exchange(false) && g_proxy_window != nullptr &&
         g_enabled && !g_neural_failed && !g_proxy_hidden &&
         !g_proxy_failed && !g_proxy_early_pending_activation)
-        ShowWindow(g_proxy_window, SW_SHOWNOACTIVATE);
+        RequestProxyVisibility(true);
 }
 
 static void OnRenderTechnique(reshade::api::effect_runtime *runtime, reshade::api::effect_technique technique,
@@ -2087,7 +2221,20 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
 {
     const bool legacy_input = backbuffer == nullptr;
     if ((!legacy_input && !EnsureStandaloneResources(backbuffer)) || (legacy_input && !g_neural_ready)) return false;
-    if (g_feature_recreate_requested.exchange(false) && !RecreateFeatures()) return false;
+    if (g_feature_recreate_requested.load())
+    {
+        if (!NeuralGpuIdle()) return false;
+        if (!RecreateFeatures()) return false;
+        g_feature_recreate_requested = false;
+    }
+    if (!NeuralGpuIdle())
+    {
+        const unsigned long long skipped = ++g_neural_busy_frame_skips;
+        if (skipped <= 8 || skipped % 600 == 0)
+            Log("neural frame skipped without blocking Present: GPU work still active (skip=%llu completed=%llu submitted=%llu)",
+                skipped, g_neural_fence ? g_neural_fence->GetCompletedValue() : 0, g_neural_fence_value);
+        return false;
+    }
     const bool evaluate_nr = g_nr_enabled && g_nr_feature != nullptr;
 
     const bool use_external_guides = !legacy_input && RenderCurrentFrameGuides(backbuffer);
@@ -2210,7 +2357,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         return false;
     }
     NVSDK_NGX_Result fg_result = static_cast<NVSDK_NGX_Result>(0xBAD00004);
-    const bool evaluate_fg = g_framegen_enabled && !g_framegen_failed && g_fg_feature &&
+    const bool evaluate_fg = EffectiveFramegenEnabled() && !g_framegen_failed && g_fg_feature &&
         NVSDK_NGX_SUCCEED(nr_result) && NVSDK_NGX_SUCCEED(sr_result);
     if (evaluate_fg)
     {
@@ -2380,8 +2527,70 @@ static LRESULT CALLBACK ProxyLowLevelMouseProc(int code, WPARAM wparam, LPARAM l
     return CallNextHookEx(g_proxy_mouse_hook, code, wparam, lparam);
 }
 
+static void ApplyDeferredFullscreenVirtualization(HWND game_window)
+{
+    if (game_window == nullptr || !IsWindow(game_window))
+    {
+        g_fullscreen_virtualization_pending = false;
+        return;
+    }
+    HMONITOR monitor = MonitorFromWindow(game_window, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info = {sizeof(info)};
+    if (!GetMonitorInfoW(monitor, &info))
+    {
+        g_fullscreen_virtualization_pending = false;
+        return;
+    }
+    LONG_PTR style = GetWindowLongPtrW(game_window, GWL_STYLE);
+    style &= ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU);
+    style |= WS_POPUP | WS_VISIBLE;
+    SetWindowLongPtrW(game_window, GWL_STYLE, style);
+    SetWindowPos(game_window, HWND_TOP,
+        info.rcMonitor.left, info.rcMonitor.top,
+        info.rcMonitor.right - info.rcMonitor.left,
+        info.rcMonitor.bottom - info.rcMonitor.top,
+        SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    Log("deferred exclusive fullscreen virtualization applied on UI worker: monitor=%ldx%ld",
+        info.rcMonitor.right - info.rcMonitor.left, info.rcMonitor.bottom - info.rcMonitor.top);
+    g_fullscreen_virtualization_pending = false;
+}
+
+static DWORD WINAPI DeferredFullscreenWorker(void *parameter)
+{
+    ApplyDeferredFullscreenVirtualization(static_cast<HWND>(parameter));
+    return 0;
+}
+
 static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
 {
+    if (message == kProxyVirtualizeFullscreenMessage)
+    {
+        ApplyDeferredFullscreenVirtualization(reinterpret_cast<HWND>(wparam));
+        return 0;
+    }
+    if (message == kProxyVisibilityMessage)
+    {
+        if (wparam != 0 && !g_proxy_hidden && !g_proxy_failed &&
+            !g_proxy_overlay_bypass && !g_proxy_early_pending_activation)
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        else
+        {
+            UpdateProxyCursorClip(false);
+            ShowWindow(hwnd, SW_HIDE);
+        }
+        return 0;
+    }
+    if (message == kProxyResizeToMonitorMessage)
+    {
+        HMONITOR monitor = MonitorFromWindow(g_game_window, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO info = {sizeof(info)};
+        if (GetMonitorInfoW(monitor, &info))
+            SetWindowPos(hwnd, HWND_TOPMOST, info.rcMonitor.left, info.rcMonitor.top,
+                info.rcMonitor.right - info.rcMonitor.left, info.rcMonitor.bottom - info.rcMonitor.top,
+                SWP_NOACTIVATE | (g_proxy_hidden || g_proxy_overlay_bypass || g_proxy_failed ||
+                    g_proxy_early_pending_activation ? 0 : SWP_SHOWWINDOW));
+        return 0;
+    }
     if (message == kProxyOverlayInputModeMessage)
     {
         const bool overlay_input = wparam != 0;
@@ -2604,7 +2813,7 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
     g_proxy_window_start_hidden = early;
     g_proxy_window_ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_proxy_window_thread = CreateThread(nullptr, 0, ProxyWindowThread, nullptr, 0, nullptr);
-    if (g_proxy_window_thread == nullptr || WaitForSingleObject(g_proxy_window_ready, 3000) != WAIT_OBJECT_0 || g_proxy_window == nullptr)
+    if (g_proxy_window_thread == nullptr || WaitForSingleObject(g_proxy_window_ready, kProxyWindowStartupWaitMs) != WAIT_OBJECT_0 || g_proxy_window == nullptr)
     {
         Log("native presentation failed: proxy UI thread/window error=%lu", GetLastError());
         g_proxy_failed = true; return false;
@@ -2784,8 +2993,8 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
         if (g_proxy_window)
         {
             UpdateProxyCursorClip(false);
-            if (early) ShowWindow(g_proxy_window, SW_HIDE);
-            else { DestroyWindow(g_proxy_window); g_proxy_window = nullptr; }
+            if (early) RequestProxyVisibility(false);
+            else PostMessageW(g_proxy_window, WM_CLOSE, 0, 0);
         }
         g_proxy_swapchain.Reset(); return false;
     }
@@ -2835,7 +3044,7 @@ static bool AdoptPresentQueue(reshade::api::command_queue *queue)
         g_proxy_hidden = true;
         g_proxy_early_pending_activation = false;
         UpdateProxyCursorClip(false);
-        if (g_proxy_window != nullptr) ShowWindow(g_proxy_window, SW_HIDE);
+        if (g_proxy_window != nullptr) RequestProxyVisibility(false);
         SetStatus("early proxy queue mismatch; native proxy safely disabled");
     }
     else if (g_neural_ready || g_proxy_swapchain)
@@ -2858,7 +3067,7 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
     if (g_proxy_hidden || g_sr_frames.load() == 0 || real_source == nullptr ||
         original_source == nullptr || backbuffer == nullptr || !EnsureProxy(real_source)) return false;
 
-    const bool use_framegen = g_framegen_enabled && !g_framegen_failed &&
+    const bool use_framegen = EffectiveFramegenEnabled() && !g_framegen_failed &&
         g_show_neural_output && g_fg_stage && g_fg_frames.load() >= 2;
     const bool legacy = g_present_api == reshade::api::device_api::d3d11 ||
         g_present_api == reshade::api::device_api::d3d9 ||
@@ -2875,8 +3084,11 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
 
     if (g_proxy_fence_value != 0 && g_proxy_fence->GetCompletedValue() < g_proxy_fence_value)
     {
-        g_proxy_fence->SetEventOnCompletion(g_proxy_fence_value, g_proxy_fence_event);
-        if (WaitForSingleObject(g_proxy_fence_event, 1000) != WAIT_OBJECT_0) return false;
+        const unsigned long long skipped = ++g_proxy_busy_frame_skips;
+        if (skipped <= 8 || skipped % 600 == 0)
+            Log("proxy frame skipped without blocking Present: compositor GPU work still active (skip=%llu completed=%llu submitted=%llu)",
+                skipped, g_proxy_fence->GetCompletedValue(), g_proxy_fence_value);
+        return false;
     }
     Microsoft::WRL::ComPtr<ID3D12Device> device;
     if (FAILED(g_command_queue->GetDevice(IID_PPV_ARGS(&device)))) return false;
@@ -2959,8 +3171,26 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
         ID3D12CommandList *lists[] = {list};
         g_command_queue->ExecuteCommandLists(1, lists);
         ++g_proxy_fence_value; g_command_queue->Signal(g_proxy_fence.Get(), g_proxy_fence_value);
-        const UINT present_flags = g_proxy_allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0u;
-        if (FAILED(g_proxy_swapchain->Present(0, present_flags))) return false;
+        const UINT present_flags = (g_proxy_allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0u) |
+            DXGI_PRESENT_DO_NOT_WAIT;
+        const HRESULT present_result = g_proxy_swapchain->Present(0, present_flags);
+        if (present_result == DXGI_ERROR_WAS_STILL_DRAWING)
+        {
+            const unsigned long long skipped = ++g_proxy_busy_frame_skips;
+            if (skipped <= 8 || skipped % 600 == 0)
+                Log("proxy DXGI Present was busy; frame dropped without blocking (skip=%llu)", skipped);
+            return false;
+        }
+        if (FAILED(present_result))
+        {
+            Log("proxy DXGI Present failed: 0x%08X; proxy quarantined and game surface restored",
+                static_cast<unsigned int>(present_result));
+            g_proxy_failed = true;
+            g_proxy_hidden = true;
+            UpdateProxyCursorClip(false);
+            RequestProxyVisibility(false);
+            return false;
+        }
         ++g_frames_presented;
         UpdateOutputFps();
     }
@@ -2980,7 +3210,7 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
     {
         g_proxy_early_pending_activation = false;
         if (!g_proxy_hidden && !g_proxy_overlay_bypass)
-            ShowWindow(g_proxy_window, SW_SHOWNOACTIVATE);
+            RequestProxyVisibility(true);
         Log("early native proxy activated after its first completed frame");
     }
     return true;
@@ -3056,7 +3286,7 @@ static void OnReshadeFinishEffects(reshade::api::effect_runtime *runtime,
         if (g_proxy_window && !g_proxy_hidden)
         {
             g_proxy_hidden = true;
-            ShowWindow(g_proxy_window, SW_HIDE);
+            RequestProxyVisibility(false);
         }
         SetStatus("Vulkan effects-boundary handoff failed; see log");
         return;
@@ -3108,10 +3338,10 @@ static bool OnReshadeOpenOverlay(reshade::api::effect_runtime *runtime, bool ope
     if (g_proxy_window != nullptr)
     {
         if (open)
-            ShowWindow(g_proxy_window, SW_HIDE);
+            RequestProxyVisibility(false);
         else if (g_enabled && !g_neural_failed && !g_proxy_hidden &&
             !g_proxy_failed && !g_proxy_early_pending_activation)
-            ShowWindow(g_proxy_window, SW_SHOWNOACTIVATE);
+            RequestProxyVisibility(true);
     }
     Log("primary ReShade overlay %s; native proxy %s for direct game-window input",
         open ? "opened" : "closed", open ? "hidden" : "restored");
@@ -3136,7 +3366,7 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         !g_proxy_early_pending_activation)
     {
         g_proxy_watchdog_hidden = false;
-        ShowWindow(g_proxy_window, SW_SHOWNOACTIVATE);
+        RequestProxyVisibility(true);
         Log("native proxy restored after primary borderless presentation resumed");
     }
     const reshade::api::device_api api = queue->get_device()->get_api();
@@ -3178,6 +3408,7 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         SetStatus("unsupported graphics API (D3D9/D3D11/D3D12/Vulkan required)");
         return;
     }
+    DetectNativeStreamlinePresentHook();
     UpdateSourceFps();
     const unsigned long long routed_mouse_events = g_overlay_mouse_events.load();
     if (routed_mouse_events != g_last_logged_mouse_event && routed_mouse_events <= 8)
@@ -3196,7 +3427,7 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         {
             g_proxy_hidden = true;
             UpdateProxyCursorClip(false);
-            ShowWindow(g_proxy_window, SW_HIDE);
+            RequestProxyVisibility(false);
         }
         return;
     }
@@ -3209,7 +3440,7 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
             // Home/Alt+X deliberately hide the topmost presentation window so
             // external overlays can receive input. F10 first restores it.
             g_proxy_hidden = false;
-            ShowWindow(g_proxy_window, g_proxy_overlay_bypass ? SW_HIDE : SW_SHOWNOACTIVATE);
+            RequestProxyVisibility(!g_proxy_overlay_bypass);
             Log("native presentation restored after overlay access; output=%s",
                 g_show_neural_output ? "neural native" : "point-stretched raw game frame");
         }
@@ -3230,7 +3461,7 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     {
         g_proxy_hidden = true;
         UpdateProxyCursorClip(false);
-        ShowWindow(g_proxy_window, SW_HIDE);
+        RequestProxyVisibility(false);
         Log("native proxy hidden automatically for NVIDIA overlay");
     }
     g_home_down = home;
@@ -3243,7 +3474,16 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         const D3D12_RESOURCE_DESC backbuffer_desc = backbuffer->GetDesc();
         g_input_width = static_cast<UINT>(backbuffer_desc.Width);
         g_input_height = backbuffer_desc.Height;
-        if (!ExecuteOnPresentPipeline(backbuffer)) return;
+        if (!ExecuteOnPresentPipeline(backbuffer))
+        {
+            // A busy neural queue is a dropped enhancement frame, not a reason
+            // to stall the game's Present thread. Re-present the last completed
+            // output when it is safe and otherwise leave the game surface alone.
+            if (!g_neural_failed && !g_proxy_hidden && g_neural_ready &&
+                g_nr_output != nullptr && EnsureProxy(g_nr_output))
+                g_pending_proxy_frame = true;
+            return;
+        }
     }
     else if (api == reshade::api::device_api::d3d11 || api == reshade::api::device_api::d3d9)
     {
@@ -3308,10 +3548,7 @@ static void OnInitSwapchain(reshade::api::swapchain *swapchain, bool)
         g_output_width = static_cast<unsigned int>(info.rcMonitor.right - info.rcMonitor.left);
         g_output_height = static_cast<unsigned int>(info.rcMonitor.bottom - info.rcMonitor.top);
         if (g_proxy_window != nullptr)
-            SetWindowPos(g_proxy_window, HWND_TOPMOST, info.rcMonitor.left, info.rcMonitor.top,
-                static_cast<int>(g_output_width.load()), static_cast<int>(g_output_height.load()),
-                SWP_NOACTIVATE | (g_proxy_hidden || g_proxy_overlay_bypass || g_proxy_failed ||
-                    g_proxy_early_pending_activation ? 0 : SWP_SHOWWINDOW));
+            PostMessageW(g_proxy_window, kProxyResizeToMonitorMessage, 0, 0);
     }
     RECT client = {};
     GetClientRect(hwnd, &client);
@@ -3327,21 +3564,19 @@ static bool OnSetFullscreenState(reshade::api::swapchain *swapchain, bool fullsc
     if (!g_enabled || !fullscreen || swapchain == nullptr) return false;
     HWND hwnd = static_cast<HWND>(swapchain->get_hwnd());
     if (hwnd == nullptr) return false;
-    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO info = {sizeof(info)};
-    if (!GetMonitorInfoW(monitor, &info)) return false;
-
-    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-    style &= ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU);
-    style |= WS_POPUP | WS_VISIBLE;
-    SetWindowLongPtrW(hwnd, GWL_STYLE, style);
-    SetWindowPos(hwnd, HWND_TOP,
-        info.rcMonitor.left, info.rcMonitor.top,
-        info.rcMonitor.right - info.rcMonitor.left,
-        info.rcMonitor.bottom - info.rcMonitor.top,
-        SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    Log("exclusive fullscreen request virtualized with window-only handling: monitor=%ldx%ld",
-        info.rcMonitor.right - info.rcMonitor.left, info.rcMonitor.bottom - info.rcMonitor.top);
+    if (!g_fullscreen_virtualization_pending.exchange(true))
+    {
+        if (g_proxy_window != nullptr)
+            PostMessageW(g_proxy_window, kProxyVirtualizeFullscreenMessage,
+                reinterpret_cast<WPARAM>(hwnd), 0);
+        else if (!QueueUserWorkItem(DeferredFullscreenWorker, hwnd, WT_EXECUTEDEFAULT))
+        {
+            g_fullscreen_virtualization_pending = false;
+            Log("exclusive fullscreen virtualization worker could not be queued: error=%lu", GetLastError());
+            return false;
+        }
+        Log("exclusive fullscreen request virtualized; window mutation deferred outside DXGI callback");
+    }
     return true;
 }
 
@@ -3365,9 +3600,8 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         if (g_proxy_window)
         {
             g_proxy_hidden = !g_enabled;
-            ShowWindow(g_proxy_window,
-                g_enabled && !g_proxy_overlay_bypass && !g_proxy_failed &&
-                    !g_proxy_early_pending_activation ? SW_SHOWNOACTIVATE : SW_HIDE);
+            RequestProxyVisibility(g_enabled && !g_proxy_overlay_bypass && !g_proxy_failed &&
+                !g_proxy_early_pending_activation);
         }
     }
     ImGui::SameLine();
@@ -3477,10 +3711,28 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         reshade::set_config_value(nullptr, section, "FrameGeneration", g_framegen_enabled ? "1" : "0");
         g_fg_frames = 0;
         g_need_history_reset = true;
+        if (g_neural_ready) g_feature_recreate_requested = true;
         Log("experimental DLSS-G changed to %s", g_framegen_enabled ? "enabled" : "disabled");
     }
-    ImGui::TextDisabled(g_framegen_failed ? "DLSS-G unavailable/failed; real-frame fallback is active." :
-        "Presents one generated frame followed by one real frame; F10 original bypasses FG.");
+    if (g_native_streamline_present_hook)
+    {
+        if (ImGui::Checkbox("Allow addon FG with native Streamline (unsafe)", &g_allow_framegen_with_native_streamline))
+        {
+            reshade::set_config_value(nullptr, section, "AllowFramegenWithNativeStreamline",
+                g_allow_framegen_with_native_streamline ? "1" : "0");
+            g_fg_frames = 0;
+            g_need_history_reset = true;
+            if (g_neural_ready) g_feature_recreate_requested = true;
+            Log("native Streamline Frame Generation safety override changed to %s",
+                g_allow_framegen_with_native_streamline ? "ENABLED (unsafe)" : "disabled");
+        }
+        ImGui::TextDisabled(g_allow_framegen_with_native_streamline ?
+            "Warning: two presentation/FG systems may deadlock during resize or fullscreen changes." :
+            "Native Streamline is loaded; addon FG is safety-blocked. NR and DLSS/DLAA remain active.");
+    }
+    else
+        ImGui::TextDisabled(g_framegen_failed ? "DLSS-G unavailable/failed; real-frame fallback is active." :
+            "Presents one generated frame followed by one real frame; F10 original bypasses FG.");
     if (ImGui::Checkbox("Present processed output (F10)", &g_show_neural_output))
     {
         g_need_history_reset = true;
@@ -3499,7 +3751,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::Text("Pipeline: NR=%s (%llu evals); %s=%llu; generated=%llu; FG=%s; active model=%d",
         g_nr_enabled ? (g_nr_feature ? "enabled" : "starting") : "disabled",
         g_nr_frames.load(), SrModeName(), g_sr_frames.load(), g_fg_frames.load(),
-        g_framegen_failed ? "failed/off" : (g_framegen_enabled ? "2x" : "off"),
+        g_framegen_failed ? "failed/off" : (EffectiveFramegenEnabled() ? "2x" : "off/safety"),
         g_active_nr_model);
     ImGui::Text("Contract: %ux%u -> %ux%u", g_input_width.load(), g_input_height.load(), g_output_width.load(), g_output_height.load());
     ImGui::Text("NR guides: %s; DLSS SR history: %s; validation mask=%s",
@@ -3514,6 +3766,9 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::Text("Native proxy: %s; frames=%llu; post-ReShade=%llu",
         g_proxy_failed ? "failed/quarantined" : (g_proxy_swapchain ? "presenting" : "waiting"),
         g_frames_presented.load(), g_post_reshade_frames.load());
+    ImGui::Text("Present safety: neural skips=%llu; proxy skips=%llu; native Streamline=%s",
+        g_neural_busy_frame_skips.load(), g_proxy_busy_frame_skips.load(),
+        g_native_streamline_present_hook ? "detected" : "not detected");
     ImGui::Text("Early proxy compatibility: %s",
         g_early_proxy_restart_required ? "restart required" :
         !g_early_proxy_initialization ? "off" :
@@ -3621,13 +3876,15 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("StableSrHistory", "0", value, sizeof(value)); g_stable_sr_history = strcmp(value, "0") != 0;
         read_setting("NeuralRendering", "1", value, sizeof(value)); g_nr_enabled = strcmp(value, "0") != 0;
         read_setting("FrameGeneration", "1", value, sizeof(value)); g_framegen_enabled = strcmp(value, "0") != 0;
+        read_setting("AllowFramegenWithNativeStreamline", "0", value, sizeof(value)); g_allow_framegen_with_native_streamline = strcmp(value, "0") != 0;
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
         read_setting("EarlyProxyInitialization", "0", value, sizeof(value)); g_early_proxy_initialization = strcmp(value, "0") != 0;
-        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d style=%u NR=%s NR-mask=%s strength=%.2f early_proxy=%s",
+        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d style=%u NR=%s NR-mask=%s strength=%.2f early_proxy=%s native-FG-override=%s",
             ADDON_VERSION, ProfileName(g_color_profile), g_nr_model, NrStyle(), g_nr_enabled ? "enabled" : "disabled",
             g_nr_rejection_mask_enabled ? "enabled" : "disabled", g_nr_rejection_mask_strength,
-            g_early_proxy_initialization ? "enabled" : "disabled");
+            g_early_proxy_initialization ? "enabled" : "disabled",
+            g_allow_framegen_with_native_streamline ? "enabled (unsafe)" : "off");
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
