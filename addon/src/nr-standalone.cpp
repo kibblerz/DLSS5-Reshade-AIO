@@ -29,7 +29,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.22-ring-pipeline-prototype"
+#define ADDON_VERSION "1.7.22-telemetry-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -53,15 +53,9 @@ static HWND g_proxy_window;
 static HANDLE g_proxy_window_thread;
 static HANDLE g_proxy_window_ready;
 static HHOOK g_proxy_mouse_hook;
-static constexpr UINT kNeuralCommandSlots = 3;
-static constexpr UINT kProxyCommandSlots = 6;
-static constexpr UINT kProxyBackBufferCount = 3;
 static Microsoft::WRL::ComPtr<IDXGISwapChain3> g_proxy_swapchain;
-static Microsoft::WRL::ComPtr<ID3D12CommandAllocator> g_proxy_allocators[kProxyCommandSlots];
-static Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> g_proxy_lists[kProxyCommandSlots];
-static UINT64 g_proxy_slot_fence_values[kProxyCommandSlots] = {};
-static UINT64 g_proxy_backbuffer_fence_values[kProxyBackBufferCount] = {};
-static UINT g_proxy_next_slot;
+static Microsoft::WRL::ComPtr<ID3D12CommandAllocator> g_proxy_allocators[2];
+static Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> g_proxy_lists[2];
 static Microsoft::WRL::ComPtr<ID3D12Fence> g_proxy_fence;
 static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> g_proxy_rtv_heap;
 static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> g_proxy_srv_heap;
@@ -107,8 +101,8 @@ static constexpr UINT kTelemetryQueryCount = 6;
 static Microsoft::WRL::ComPtr<ID3D12QueryHeap> g_telemetry_query_heap;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_telemetry_readback;
 static UINT64 g_telemetry_timestamp_frequency;
-static UINT64 g_telemetry_fence_values[kNeuralCommandSlots] = {};
-static bool g_telemetry_pending[kNeuralCommandSlots] = {};
+static UINT64 g_telemetry_fence_value;
+static bool g_telemetry_pending;
 static std::atomic<bool> g_gpu_telemetry_available{false};
 static std::atomic<unsigned int> g_gpu_prep_us{0};
 static std::atomic<unsigned int> g_gpu_nr_us{0};
@@ -223,13 +217,6 @@ static std::vector<BackbufferView> g_backbuffer_views;
 static std::atomic<unsigned long long> g_current_guide_frames{0};
 
 static Microsoft::WRL::ComPtr<ID3D12Device> g_neural_device;
-static Microsoft::WRL::ComPtr<ID3D12CommandAllocator> g_neural_allocators[kNeuralCommandSlots];
-static Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> g_neural_lists[kNeuralCommandSlots];
-static UINT64 g_neural_slot_fence_values[kNeuralCommandSlots] = {};
-static UINT g_neural_next_slot;
-static UINT g_neural_current_slot = UINT_MAX;
-// Active aliases keep the NGX bridge call sites simple while ownership stays
-// in the bounded command ring above.
 static Microsoft::WRL::ComPtr<ID3D12CommandAllocator> g_neural_allocator;
 static Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> g_neural_list;
 static Microsoft::WRL::ComPtr<ID3D12Fence> g_neural_fence;
@@ -527,11 +514,7 @@ static void ResetPerformanceTelemetry()
     g_addon_cpu_current_us = 0; g_addon_cpu_avg_us = 0; g_addon_cpu_peak_us = 0;
     g_telemetry_samples = 0;
     g_gpu_telemetry_available = false;
-    for (UINT slot = 0; slot < kNeuralCommandSlots; ++slot)
-    {
-        g_telemetry_pending[slot] = false;
-        g_telemetry_fence_values[slot] = 0;
-    }
+    g_telemetry_pending = false;
     g_last_telemetry_log_tick = 0;
     g_source_frame_samples.fill(0);
     g_source_frame_sample_count = 0;
@@ -550,14 +533,14 @@ static bool InitializeGpuTelemetry()
     HRESULT hr = g_command_queue->GetTimestampFrequency(&frequency);
     D3D12_QUERY_HEAP_DESC query_desc = {};
     query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-    query_desc.Count = kTelemetryQueryCount * kNeuralCommandSlots;
+    query_desc.Count = kTelemetryQueryCount;
     if (SUCCEEDED(hr)) hr = g_neural_device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&g_telemetry_query_heap));
 
     D3D12_HEAP_PROPERTIES heap = {};
     heap.Type = D3D12_HEAP_TYPE_READBACK;
     D3D12_RESOURCE_DESC buffer = {};
     buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    buffer.Width = sizeof(UINT64) * kTelemetryQueryCount * kNeuralCommandSlots;
+    buffer.Width = sizeof(UINT64) * kTelemetryQueryCount;
     buffer.Height = 1; buffer.DepthOrArraySize = 1; buffer.MipLevels = 1;
     buffer.SampleDesc.Count = 1; buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     if (SUCCEEDED(hr)) hr = g_neural_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE,
@@ -584,24 +567,23 @@ static unsigned int TimestampDeltaMicroseconds(UINT64 begin, UINT64 end)
     return static_cast<unsigned int>(std::min<long double>(microseconds, UINT_MAX));
 }
 
-static void ConsumeGpuTelemetry(UINT slot)
+static void ConsumeGpuTelemetry()
 {
-    if (slot >= kNeuralCommandSlots || !g_telemetry_pending[slot] || !g_neural_fence ||
-        g_neural_fence->GetCompletedValue() < g_telemetry_fence_values[slot] || !g_telemetry_readback)
+    if (!g_telemetry_pending || !g_neural_fence ||
+        g_neural_fence->GetCompletedValue() < g_telemetry_fence_value || !g_telemetry_readback)
         return;
     UINT64 *timestamps = nullptr;
-    const SIZE_T offset = sizeof(UINT64) * kTelemetryQueryCount * slot;
-    const D3D12_RANGE read_range = {offset, offset + sizeof(UINT64) * kTelemetryQueryCount};
+    const D3D12_RANGE read_range = {0, sizeof(UINT64) * kTelemetryQueryCount};
     if (FAILED(g_telemetry_readback->Map(0, &read_range, reinterpret_cast<void **>(&timestamps))) || !timestamps)
     {
-        g_telemetry_pending[slot] = false;
+        g_telemetry_pending = false;
         return;
     }
     std::array<UINT64, kTelemetryQueryCount> values = {};
-    memcpy(values.data(), reinterpret_cast<const uint8_t *>(timestamps) + offset, sizeof(values));
+    memcpy(values.data(), timestamps, sizeof(values));
     const D3D12_RANGE written_range = {0, 0};
     g_telemetry_readback->Unmap(0, &written_range);
-    g_telemetry_pending[slot] = false;
+    g_telemetry_pending = false;
 
     SmoothMicroseconds(g_gpu_prep_us, TimestampDeltaMicroseconds(values[0], values[1]));
     SmoothMicroseconds(g_gpu_nr_us, TimestampDeltaMicroseconds(values[1], values[2]));
@@ -613,29 +595,10 @@ static void ConsumeGpuTelemetry(UINT slot)
     g_gpu_telemetry_available = true;
 }
 
-static void ConsumeCompletedGpuTelemetry()
-{
-    for (UINT slot = 0; slot < kNeuralCommandSlots; ++slot)
-        ConsumeGpuTelemetry(slot);
-}
-
 static bool NeuralGpuIdle()
 {
     return !g_neural_fence || g_neural_fence_value == 0 ||
         g_neural_fence->GetCompletedValue() >= g_neural_fence_value;
-}
-
-static bool NeuralCommandSlotAvailable()
-{
-    if (!g_neural_fence) return false;
-    const UINT64 completed = g_neural_fence->GetCompletedValue();
-    for (UINT offset = 0; offset < kNeuralCommandSlots; ++offset)
-    {
-        const UINT slot = (g_neural_next_slot + offset) % kNeuralCommandSlots;
-        if (g_neural_slot_fence_values[slot] == 0 || completed >= g_neural_slot_fence_values[slot])
-            return true;
-    }
-    return false;
 }
 
 static bool WaitForNeuralGpu(DWORD timeout, bool fatal_on_timeout, const char *stage)
@@ -662,27 +625,8 @@ static bool WaitForNeuralGpu(DWORD timeout, bool fatal_on_timeout, const char *s
 
 static bool BeginNeuralCommands(DWORD timeout = 0, bool fatal_on_timeout = false)
 {
-    ConsumeCompletedGpuTelemetry();
-    if (!NeuralCommandSlotAvailable() &&
-        !WaitForNeuralGpu(timeout, fatal_on_timeout, "neural command ring fence")) return false;
-    ConsumeCompletedGpuTelemetry();
-
-    const UINT64 completed = g_neural_fence->GetCompletedValue();
-    UINT selected = UINT_MAX;
-    for (UINT offset = 0; offset < kNeuralCommandSlots; ++offset)
-    {
-        const UINT slot = (g_neural_next_slot + offset) % kNeuralCommandSlots;
-        if (g_neural_slot_fence_values[slot] == 0 || completed >= g_neural_slot_fence_values[slot])
-        {
-            selected = slot;
-            break;
-        }
-    }
-    if (selected == UINT_MAX) return false;
-    ConsumeGpuTelemetry(selected);
-    g_neural_current_slot = selected;
-    g_neural_allocator = g_neural_allocators[selected];
-    g_neural_list = g_neural_lists[selected];
+    if (!WaitForNeuralGpu(timeout, fatal_on_timeout, "neural GPU fence")) return false;
+    ConsumeGpuTelemetry();
     HRESULT hr = g_neural_allocator->Reset();
     if (SUCCEEDED(hr)) hr = g_neural_list->Reset(g_neural_allocator.Get(), nullptr);
     if (FAILED(hr)) { Fail("neural command-list reset", static_cast<unsigned int>(hr)); return false; }
@@ -698,14 +642,7 @@ static bool SubmitNeuralCommands(bool wait)
     const UINT64 value = ++g_neural_fence_value;
     hr = g_command_queue->Signal(g_neural_fence.Get(), value);
     if (FAILED(hr)) { Fail("neural queue signal", static_cast<unsigned int>(hr)); return false; }
-    if (g_neural_current_slot < kNeuralCommandSlots)
-    {
-        g_neural_slot_fence_values[g_neural_current_slot] = value;
-        g_neural_next_slot = (g_neural_current_slot + 1) % kNeuralCommandSlots;
-    }
-    const bool completed = !wait || WaitForNeuralGpu(kInitializationGpuWaitMs, true, "NGX initialization GPU fence");
-    if (wait) ConsumeCompletedGpuTelemetry();
-    return completed;
+    return !wait || WaitForNeuralGpu(kInitializationGpuWaitMs, true, "NGX initialization GPU fence");
 }
 
 static HMODULE LoadInstalledNgxCore()
@@ -1923,14 +1860,10 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
     if (!g_neural_device)
     {
         HRESULT hr = g_command_queue->GetDevice(IID_PPV_ARGS(&g_neural_device));
-        for (UINT slot = 0; slot < kNeuralCommandSlots && SUCCEEDED(hr); ++slot)
-        {
-            hr = g_neural_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                IID_PPV_ARGS(&g_neural_allocators[slot]));
-            if (SUCCEEDED(hr)) hr = g_neural_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                g_neural_allocators[slot].Get(), nullptr, IID_PPV_ARGS(&g_neural_lists[slot]));
-            if (SUCCEEDED(hr)) hr = g_neural_lists[slot]->Close();
-        }
+        if (SUCCEEDED(hr)) hr = g_neural_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_neural_allocator));
+        if (SUCCEEDED(hr)) hr = g_neural_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            g_neural_allocator.Get(), nullptr, IID_PPV_ARGS(&g_neural_list));
+        if (SUCCEEDED(hr)) hr = g_neural_list->Close();
         if (SUCCEEDED(hr)) hr = g_neural_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_neural_fence));
         D3D12_DESCRIPTOR_HEAP_DESC guide_heap_desc = {};
         guide_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
@@ -1940,7 +1873,6 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
         g_guide_rtv_stride = g_neural_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         g_neural_fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!g_neural_fence_event) { Fail("neural fence event", GetLastError()); return false; }
-        Log("bounded neural submission ring ready: slots=%u", kNeuralCommandSlots);
         // Timestamp telemetry is deliberately optional. Failure here must not
         // prevent the rendering pipeline from starting on unusual drivers.
         InitializeGpuTelemetry();
@@ -2413,13 +2345,12 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         if (!RecreateFeatures()) return false;
         g_feature_recreate_requested = false;
     }
-    if (!NeuralCommandSlotAvailable())
+    if (!NeuralGpuIdle())
     {
         const unsigned long long skipped = ++g_neural_busy_frame_skips;
         if (skipped <= 8 || skipped % 600 == 0)
-            Log("neural frame skipped without blocking Present: command ring full (skip=%llu completed=%llu submitted=%llu slots=%u)",
-                skipped, g_neural_fence ? g_neural_fence->GetCompletedValue() : 0,
-                g_neural_fence_value, kNeuralCommandSlots);
+            Log("neural frame skipped without blocking Present: GPU work still active (skip=%llu completed=%llu submitted=%llu)",
+                skipped, g_neural_fence ? g_neural_fence->GetCompletedValue() : 0, g_neural_fence_value);
         return false;
     }
     const bool evaluate_nr = g_nr_enabled && g_nr_feature != nullptr;
@@ -2435,15 +2366,11 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     ID3D12Resource *depth = use_external_guides ? g_captured_depth.Get() : g_fallback_depth.Get();
 
     if (!BeginNeuralCommands()) return false;
-    const UINT submitted_slot = g_neural_current_slot;
-    const bool record_gpu_telemetry = submitted_slot < kNeuralCommandSlots &&
-        g_performance_telemetry_enabled && InitializeGpuTelemetry();
-    const UINT telemetry_query_base = submitted_slot * kTelemetryQueryCount;
-    auto timestamp = [record_gpu_telemetry, telemetry_query_base](UINT index)
+    const bool record_gpu_telemetry = g_performance_telemetry_enabled && InitializeGpuTelemetry();
+    auto timestamp = [record_gpu_telemetry](UINT index)
     {
         if (record_gpu_telemetry)
-            g_neural_list->EndQuery(g_telemetry_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
-                telemetry_query_base + index);
+            g_neural_list->EndQuery(g_telemetry_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, index);
     };
     timestamp(0);
     if (!legacy_input)
@@ -2605,13 +2532,12 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     timestamp(5);
     if (record_gpu_telemetry)
         g_neural_list->ResolveQueryData(g_telemetry_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
-            telemetry_query_base, kTelemetryQueryCount, g_telemetry_readback.Get(),
-            sizeof(UINT64) * kTelemetryQueryCount * submitted_slot);
+            0, kTelemetryQueryCount, g_telemetry_readback.Get(), 0);
     if (!SubmitNeuralCommands(false)) return false;
     if (record_gpu_telemetry)
     {
-        g_telemetry_fence_values[submitted_slot] = g_neural_fence_value;
-        g_telemetry_pending[submitted_slot] = true;
+        g_telemetry_fence_value = g_neural_fence_value;
+        g_telemetry_pending = true;
     }
     if (legacy_input)
     {
@@ -3152,7 +3078,7 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
     DXGI_SWAP_CHAIN_DESC1 desc = {};
     desc.Width = width; desc.Height = height; desc.Format = present_format;
     desc.SampleDesc.Count = 1; desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    desc.BufferCount = kProxyBackBufferCount; desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    desc.BufferCount = 2; desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     desc.Scaling = DXGI_SCALING_STRETCH; desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
     if (g_proxy_allow_tearing) desc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
     Microsoft::WRL::ComPtr<IDXGISwapChain1> swapchain1;
@@ -3182,7 +3108,7 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
     }
     Microsoft::WRL::ComPtr<ID3D12Device> device;
     if (SUCCEEDED(hr)) { failed_stage = "ID3D12CommandQueue::GetDevice"; hr = g_command_queue->GetDevice(IID_PPV_ARGS(&device)); }
-    for (UINT index = 0; index < kProxyCommandSlots && SUCCEEDED(hr); ++index)
+    for (UINT index = 0; index < 2 && SUCCEEDED(hr); ++index)
     {
         failed_stage = "CreateCommandAllocator";
         hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_proxy_allocators[index]));
@@ -3196,11 +3122,9 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
     }
     if (SUCCEEDED(hr)) { failed_stage = "CreateFence"; hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_proxy_fence)); }
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
-    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; heap_desc.NumDescriptors = kProxyBackBufferCount;
+    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; heap_desc.NumDescriptors = 2;
     if (SUCCEEDED(hr)) { failed_stage = "Create RTV heap"; hr = device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&g_proxy_rtv_heap)); }
-    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    heap_desc.NumDescriptors = kProxyCommandSlots * 3;
-    heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; heap_desc.NumDescriptors = 6; heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (SUCCEEDED(hr)) { failed_stage = "Create SRV heap"; hr = device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&g_proxy_srv_heap)); }
 
     D3D12_DESCRIPTOR_RANGE range = {};
@@ -3267,7 +3191,7 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
         g_proxy_rtv_stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         g_proxy_srv_stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         auto rtv = g_proxy_rtv_heap->GetCPUDescriptorHandleForHeapStart();
-        for (UINT index = 0; index < kProxyBackBufferCount; ++index)
+        for (UINT index = 0; index < 2; ++index)
         {
             Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
             if (FAILED(g_proxy_swapchain->GetBuffer(index, IID_PPV_ARGS(&buffer)))) { hr = E_FAIL; failed_stage = "Get proxy buffer"; break; }
@@ -3293,10 +3217,9 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
         g_proxy_swapchain.Reset(); return false;
     }
     g_proxy_present_format = present_format;
-    Log("native proxy ready: %ux%u source_format=%u present_format=%u hwnd=%p tearing=%s command_slots=%u buffers=%u", width, height,
+    Log("native proxy ready: %ux%u source_format=%u present_format=%u hwnd=%p tearing=%s", width, height,
         static_cast<unsigned int>(source_format), static_cast<unsigned int>(present_format), g_proxy_window,
-        g_proxy_allow_tearing ? "supported" : "unavailable", kProxyCommandSlots,
-        kProxyBackBufferCount);
+        g_proxy_allow_tearing ? "supported" : "unavailable");
     return true;
 }
 
@@ -3355,44 +3278,6 @@ static bool AdoptPresentQueue(reshade::api::command_queue *queue)
     return true;
 }
 
-static UINT AvailableProxyCommandSlots()
-{
-    if (!g_proxy_fence) return 0;
-    const UINT64 completed = g_proxy_fence->GetCompletedValue();
-    UINT available = 0;
-    for (UINT slot = 0; slot < kProxyCommandSlots; ++slot)
-        if (g_proxy_slot_fence_values[slot] == 0 || completed >= g_proxy_slot_fence_values[slot])
-            ++available;
-    return available;
-}
-
-static UINT AcquireProxyCommandSlot()
-{
-    if (!g_proxy_fence) return UINT_MAX;
-    const UINT64 completed = g_proxy_fence->GetCompletedValue();
-    for (UINT offset = 0; offset < kProxyCommandSlots; ++offset)
-    {
-        const UINT slot = (g_proxy_next_slot + offset) % kProxyCommandSlots;
-        if (g_proxy_slot_fence_values[slot] == 0 || completed >= g_proxy_slot_fence_values[slot])
-            return slot;
-    }
-    return UINT_MAX;
-}
-
-static bool ProxyBackbuffersAvailable(UINT count)
-{
-    if (!g_proxy_swapchain || !g_proxy_fence || count > kProxyBackBufferCount) return false;
-    const UINT64 completed = g_proxy_fence->GetCompletedValue();
-    const UINT first = g_proxy_swapchain->GetCurrentBackBufferIndex();
-    for (UINT offset = 0; offset < count; ++offset)
-    {
-        const UINT buffer = (first + offset) % kProxyBackBufferCount;
-        if (g_proxy_backbuffer_fence_values[buffer] != 0 &&
-            completed < g_proxy_backbuffer_fence_values[buffer]) return false;
-    }
-    return true;
-}
-
 static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
 {
     ID3D12Resource *real_source = g_nr_output;
@@ -3415,13 +3300,12 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
     };
     const UINT present_count = use_framegen ? 2u : 1u;
 
-    if (AvailableProxyCommandSlots() < present_count || !ProxyBackbuffersAvailable(present_count))
+    if (g_proxy_fence_value != 0 && g_proxy_fence->GetCompletedValue() < g_proxy_fence_value)
     {
         const unsigned long long skipped = ++g_proxy_busy_frame_skips;
         if (skipped <= 8 || skipped % 600 == 0)
-            Log("proxy frame skipped without blocking Present: bounded compositor queue lacks %u slots/buffers (skip=%llu completed=%llu submitted=%llu slots=%u buffers=%u)",
-                present_count, skipped, g_proxy_fence->GetCompletedValue(), g_proxy_fence_value,
-                kProxyCommandSlots, kProxyBackBufferCount);
+            Log("proxy frame skipped without blocking Present: compositor GPU work still active (skip=%llu completed=%llu submitted=%llu)",
+                skipped, g_proxy_fence->GetCompletedValue(), g_proxy_fence_value);
         return false;
     }
     Microsoft::WRL::ComPtr<ID3D12Device> device;
@@ -3460,21 +3344,17 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
 
     for (UINT present_index = 0; present_index < present_count; ++present_index)
     {
-        const UINT command_slot = AcquireProxyCommandSlot();
-        if (command_slot == UINT_MAX) return false;
-        ID3D12CommandAllocator *allocator = g_proxy_allocators[command_slot].Get();
-        ID3D12GraphicsCommandList *list = g_proxy_lists[command_slot].Get();
+        ID3D12CommandAllocator *allocator = g_proxy_allocators[present_index].Get();
+        ID3D12GraphicsCommandList *list = g_proxy_lists[present_index].Get();
         if (allocator == nullptr || list == nullptr || FAILED(allocator->Reset()) ||
             FAILED(list->Reset(allocator, nullptr))) return false;
         Microsoft::WRL::ComPtr<ID3D12Resource> destination;
         const UINT buffer_index = g_proxy_swapchain->GetCurrentBackBufferIndex();
-        if (g_proxy_backbuffer_fence_values[buffer_index] != 0 &&
-            g_proxy_fence->GetCompletedValue() < g_proxy_backbuffer_fence_values[buffer_index]) return false;
         if (FAILED(g_proxy_swapchain->GetBuffer(buffer_index, IID_PPV_ARGS(&destination)))) return false;
         ID3D12Resource *neural_source = present_sources[present_index];
         ID3D12Resource *sources[3] = {neural_source, original_source, backbuffer};
         auto srv_handle = g_proxy_srv_heap->GetCPUDescriptorHandleForHeapStart();
-        srv_handle.ptr += static_cast<SIZE_T>(command_slot) * 3 * g_proxy_srv_stride;
+        srv_handle.ptr += static_cast<SIZE_T>(present_index) * 3 * g_proxy_srv_stride;
         for (ID3D12Resource *source : sources)
         {
             D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
@@ -3497,7 +3377,7 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
         ID3D12DescriptorHeap *heaps[] = {g_proxy_srv_heap.Get()}; list->SetDescriptorHeaps(1, heaps);
         list->SetGraphicsRootSignature(g_proxy_root_signature.Get()); list->SetPipelineState(g_proxy_pipeline.Get());
         auto gpu_srv = g_proxy_srv_heap->GetGPUDescriptorHandleForHeapStart();
-        gpu_srv.ptr += static_cast<UINT64>(command_slot) * 3 * g_proxy_srv_stride;
+        gpu_srv.ptr += static_cast<UINT64>(present_index) * 3 * g_proxy_srv_stride;
         list->SetGraphicsRootDescriptorTable(0, gpu_srv);
         list->SetGraphicsRoot32BitConstants(1, 8, &constants, 0);
         list->RSSetViewports(1, &viewport); list->RSSetScissorRects(1, &scissor);
@@ -3508,11 +3388,7 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
         if (FAILED(list->Close())) return false;
         ID3D12CommandList *lists[] = {list};
         g_command_queue->ExecuteCommandLists(1, lists);
-        ++g_proxy_fence_value;
-        if (FAILED(g_command_queue->Signal(g_proxy_fence.Get(), g_proxy_fence_value))) return false;
-        g_proxy_slot_fence_values[command_slot] = g_proxy_fence_value;
-        g_proxy_backbuffer_fence_values[buffer_index] = g_proxy_fence_value;
-        g_proxy_next_slot = (command_slot + 1) % kProxyCommandSlots;
+        ++g_proxy_fence_value; g_command_queue->Signal(g_proxy_fence.Get(), g_proxy_fence_value);
         const UINT present_flags = (g_proxy_allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0u) |
             DXGI_PRESENT_DO_NOT_WAIT;
         const HRESULT present_result = g_proxy_swapchain->Present(0, present_flags);
@@ -4283,7 +4159,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::unregister_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
         if (g_proxy_fence_event) CloseHandle(g_proxy_fence_event);
         g_proxy_pipeline.Reset(); g_proxy_root_signature.Reset(); g_proxy_srv_heap.Reset(); g_proxy_rtv_heap.Reset();
-        for (UINT index = 0; index < kProxyCommandSlots; ++index)
+        for (UINT index = 0; index < 2; ++index)
         {
             g_proxy_lists[index].Reset();
             g_proxy_allocators[index].Reset();
@@ -4308,13 +4184,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         g_legacy_context11.Reset(); g_legacy_device11.Reset();
         g_fg_stage.Reset(); g_sr_stage.Reset(); g_nr_stage.Reset(); g_packed_color.Reset();
         g_telemetry_readback.Reset(); g_telemetry_query_heap.Reset();
-        g_neural_list.Reset(); g_neural_allocator.Reset();
-        for (UINT slot = 0; slot < kNeuralCommandSlots; ++slot)
-        {
-            g_neural_lists[slot].Reset();
-            g_neural_allocators[slot].Reset();
-        }
-        g_neural_fence.Reset(); g_neural_device.Reset();
+        g_neural_list.Reset(); g_neural_allocator.Reset(); g_neural_fence.Reset(); g_neural_device.Reset();
         if (g_neural_fence_event) CloseHandle(g_neural_fence_event);
         if (g_command_queue) g_command_queue->Release();
         reshade::unregister_addon(module);
