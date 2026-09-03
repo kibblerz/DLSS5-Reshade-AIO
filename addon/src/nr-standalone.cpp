@@ -28,7 +28,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.20"
+#define ADDON_VERSION "1.7.20-no-streamline-block-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -121,7 +121,6 @@ static unsigned int g_candidate_contract_frames;
 static std::atomic<unsigned long long> g_neural_busy_frame_skips{0};
 static std::atomic<unsigned long long> g_proxy_busy_frame_skips{0};
 static bool g_native_streamline_present_hook;
-static bool g_allow_framegen_with_native_streamline;
 static std::atomic<bool> g_fullscreen_virtualization_pending{false};
 
 static void RequestProxyOverlayInputMode()
@@ -290,8 +289,7 @@ static void RequestProxyVisibility(bool visible);
 
 static bool EffectiveFramegenEnabled()
 {
-    return g_framegen_enabled &&
-        (!g_native_streamline_present_hook || g_allow_framegen_with_native_streamline);
+    return g_framegen_enabled;
 }
 
 static void DetectNativeStreamlinePresentHook()
@@ -302,14 +300,8 @@ static void DetectNativeStreamlinePresentHook()
     if (interposer == nullptr && dlssg == nullptr) return;
 
     g_native_streamline_present_hook = true;
-    Log("native Streamline presentation hook detected: sl.interposer=%p sl.dlss_g=%p; addon FG=%s",
-        interposer, dlssg, g_allow_framegen_with_native_streamline ? "expert override" : "safety-blocked");
-    if (g_fg_feature != nullptr && !g_allow_framegen_with_native_streamline)
-    {
-        g_feature_recreate_requested = true;
-        g_need_history_reset = true;
-        SetStatus("native Streamline detected; safely removing addon Frame Generation");
-    }
+    Log("native Streamline detected: sl.interposer=%p sl.dlss_g=%p; addon FG remains controlled by its normal setting (disable in-game FG)",
+        interposer, dlssg);
 }
 static NgxCreateFeature g_nr_create;
 static NgxEvaluateFeature g_nr_evaluate;
@@ -946,17 +938,13 @@ static bool CreateFeatures()
     {
         g_fg_feature = nullptr;
         Log("CreateFeature(feature=FrameGeneration) skipped: %s",
-            !g_framegen_enabled ? "Frame Generation is disabled" :
-            g_native_streamline_present_hook && !g_allow_framegen_with_native_streamline ?
-                "native Streamline presentation hook safety block" : "previous failure");
+            !g_framegen_enabled ? "Frame Generation is disabled" : "previous failure");
     }
     Log("standalone contract ready: NR=%s at %ux%u, %s -> %ux%u, DLSS-G=%s, model=%d style=%u, profile=%s",
         g_nr_feature ? "feature 18 active" : "disabled",
         g_resource_input_width, g_resource_input_height, SrModeName(),
         g_resource_output_width, g_resource_output_height,
-        (!g_framegen_failed && g_fg_feature) ? "ready" :
-            (g_native_streamline_present_hook && !g_allow_framegen_with_native_streamline ?
-                "native-hook-safety-off" : "fallback-off"),
+        (!g_framegen_failed && g_fg_feature) ? "ready" : "fallback-off",
         g_nr_model, NrStyle(), ProfileName(g_active_color_profile));
     g_active_nr_model = g_nr_feature ? g_nr_model : 0;
     return true;
@@ -3715,21 +3703,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         Log("experimental DLSS-G changed to %s", g_framegen_enabled ? "enabled" : "disabled");
     }
     if (g_native_streamline_present_hook)
-    {
-        if (ImGui::Checkbox("Allow addon FG with native Streamline (unsafe)", &g_allow_framegen_with_native_streamline))
-        {
-            reshade::set_config_value(nullptr, section, "AllowFramegenWithNativeStreamline",
-                g_allow_framegen_with_native_streamline ? "1" : "0");
-            g_fg_frames = 0;
-            g_need_history_reset = true;
-            if (g_neural_ready) g_feature_recreate_requested = true;
-            Log("native Streamline Frame Generation safety override changed to %s",
-                g_allow_framegen_with_native_streamline ? "ENABLED (unsafe)" : "disabled");
-        }
-        ImGui::TextDisabled(g_allow_framegen_with_native_streamline ?
-            "Warning: two presentation/FG systems may deadlock during resize or fullscreen changes." :
-            "Native Streamline is loaded; addon FG is safety-blocked. NR and DLSS/DLAA remain active.");
-    }
+        ImGui::TextDisabled("Native Streamline is loaded. Addon FG is not blocked; disable the game's built-in Frame Generation.");
     else
         ImGui::TextDisabled(g_framegen_failed ? "DLSS-G unavailable/failed; real-frame fallback is active." :
             "Presents one generated frame followed by one real frame; F10 original bypasses FG.");
@@ -3751,7 +3725,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::Text("Pipeline: NR=%s (%llu evals); %s=%llu; generated=%llu; FG=%s; active model=%d",
         g_nr_enabled ? (g_nr_feature ? "enabled" : "starting") : "disabled",
         g_nr_frames.load(), SrModeName(), g_sr_frames.load(), g_fg_frames.load(),
-        g_framegen_failed ? "failed/off" : (EffectiveFramegenEnabled() ? "2x" : "off/safety"),
+        g_framegen_failed ? "failed/off" : (EffectiveFramegenEnabled() ? "2x" : "off"),
         g_active_nr_model);
     ImGui::Text("Contract: %ux%u -> %ux%u", g_input_width.load(), g_input_height.load(), g_output_width.load(), g_output_height.load());
     ImGui::Text("NR guides: %s; DLSS SR history: %s; validation mask=%s",
@@ -3876,15 +3850,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("StableSrHistory", "0", value, sizeof(value)); g_stable_sr_history = strcmp(value, "0") != 0;
         read_setting("NeuralRendering", "1", value, sizeof(value)); g_nr_enabled = strcmp(value, "0") != 0;
         read_setting("FrameGeneration", "1", value, sizeof(value)); g_framegen_enabled = strcmp(value, "0") != 0;
-        read_setting("AllowFramegenWithNativeStreamline", "0", value, sizeof(value)); g_allow_framegen_with_native_streamline = strcmp(value, "0") != 0;
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
         read_setting("EarlyProxyInitialization", "0", value, sizeof(value)); g_early_proxy_initialization = strcmp(value, "0") != 0;
-        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d style=%u NR=%s NR-mask=%s strength=%.2f early_proxy=%s native-FG-override=%s",
+        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d style=%u NR=%s NR-mask=%s strength=%.2f early_proxy=%s",
             ADDON_VERSION, ProfileName(g_color_profile), g_nr_model, NrStyle(), g_nr_enabled ? "enabled" : "disabled",
             g_nr_rejection_mask_enabled ? "enabled" : "disabled", g_nr_rejection_mask_strength,
-            g_early_proxy_initialization ? "enabled" : "disabled",
-            g_allow_framegen_with_native_streamline ? "enabled (unsafe)" : "off");
+            g_early_proxy_initialization ? "enabled" : "disabled");
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
