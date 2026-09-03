@@ -29,7 +29,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.22-telemetry-prototype"
+#define ADDON_VERSION "1.7.22-async-present-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -67,6 +67,15 @@ static DXGI_FORMAT g_proxy_present_format;
 static HANDLE g_proxy_fence_event;
 static UINT64 g_proxy_fence_value;
 static bool g_proxy_allow_tearing;
+static HANDLE g_proxy_frame_latency_waitable;
+static HANDLE g_proxy_present_event;
+static HANDLE g_proxy_present_stop_event;
+static HANDLE g_proxy_present_thread;
+// 0 = idle, 1 = a completed pipeline frame is waiting, 2 = the presenter is
+// recording/submitting that frame. The game thread never waits on this state.
+static std::atomic<unsigned int> g_proxy_present_request_state{0};
+static std::atomic<unsigned long long> g_proxy_present_coalesced{0};
+static std::atomic<unsigned long long> g_proxy_present_timeouts{0};
 static bool g_proxy_failed;
 static std::atomic<bool> g_proxy_initializing{false};
 static std::atomic<unsigned int> g_proxy_initialization_deferrals{0};
@@ -1227,6 +1236,15 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
         g_resource_input_width, g_resource_input_height, static_cast<unsigned int>(g_resource_input_format),
         next_width, next_height, static_cast<unsigned int>(next_format));
 
+    // The async presenter may still hold the current output resources while it
+    // records their sampling commands. Defer retirement until those commands
+    // have been submitted; the proxy fence check below then covers GPU use.
+    if (g_proxy_present_request_state.load(std::memory_order_acquire) != 0)
+    {
+        Log("resolution reconfiguration deferred: async proxy presenter still owns the current frame");
+        return false;
+    }
+
     // The proxy submits after the neural fence, on the same queue, but owns a
     // later fence value. Do not withdraw its SRV resource until that sampling
     // work has completed.
@@ -2084,6 +2102,7 @@ static void ResolveHandles(reshade::api::effect_runtime *runtime)
 }
 
 static bool InitializeProxyPresentation(ID3D12Resource *source, bool early);
+static DWORD WINAPI ProxyPresentationThread(void *);
 
 static void OnInitEffectRuntime(reshade::api::effect_runtime *runtime)
 {
@@ -2339,6 +2358,17 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
 {
     const bool legacy_input = backbuffer == nullptr;
     if ((!legacy_input && !EnsureStandaloneResources(backbuffer)) || (legacy_input && !g_neural_ready)) return false;
+    // The presenter samples the persistent NR/SR/FG textures on a worker. Do
+    // not queue the next NGX evaluation until that worker has submitted its
+    // reads to the same D3D12 queue. This is a non-blocking ownership handoff:
+    // the game continues presenting and reuses the last completed output.
+    if (g_proxy_present_request_state.load(std::memory_order_acquire) != 0)
+    {
+        const unsigned long long skipped = ++g_neural_busy_frame_skips;
+        if (skipped <= 8 || skipped % 600 == 0)
+            Log("neural frame deferred for async proxy presenter (skip=%llu)", skipped);
+        return false;
+    }
     if (g_feature_recreate_requested.load())
     {
         if (!NeuralGpuIdle()) return false;
@@ -2923,7 +2953,7 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
         (g_last_telemetry_log_tick == 0 || now - g_last_telemetry_log_tick >= 5000))
     {
         g_last_telemetry_log_tick = now;
-        Log("performance telemetry: source=%u fps avg=%.3fms p99=%.3fms max=%.3fms; proxy=%u fps; addon CPU current=%.3fms avg=%.3fms peak=%.3fms; GPU prep=%.3fms NR=%.3fms %s=%.3fms FG=%.3fms cleanup=%.3fms total=%.3fms; skips neural=%llu proxy=%llu",
+        Log("performance telemetry: source=%u fps avg=%.3fms p99=%.3fms max=%.3fms; proxy=%u fps; addon CPU current=%.3fms avg=%.3fms peak=%.3fms; GPU prep=%.3fms NR=%.3fms %s=%.3fms FG=%.3fms cleanup=%.3fms total=%.3fms; skips neural=%llu proxy=%llu; async coalesced=%llu timeouts=%llu",
             g_source_fps.load(), g_source_frame_avg_us.load() / 1000.0f,
             g_source_frame_p99_us.load() / 1000.0f, g_source_frame_max_us.load() / 1000.0f,
             g_proxy_fps.load(), g_addon_cpu_current_us.load() / 1000.0f,
@@ -2931,7 +2961,8 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
             g_gpu_prep_us.load() / 1000.0f, g_gpu_nr_us.load() / 1000.0f,
             SrModeName(), g_gpu_sr_us.load() / 1000.0f, g_gpu_fg_us.load() / 1000.0f,
             g_gpu_cleanup_us.load() / 1000.0f, g_gpu_total_us.load() / 1000.0f,
-            g_neural_busy_frame_skips.load(), g_proxy_busy_frame_skips.load());
+            g_neural_busy_frame_skips.load(), g_proxy_busy_frame_skips.load(),
+            g_proxy_present_coalesced.load(), g_proxy_present_timeouts.load());
     }
 }
 
@@ -3078,12 +3109,25 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
     DXGI_SWAP_CHAIN_DESC1 desc = {};
     desc.Width = width; desc.Height = height; desc.Format = present_format;
     desc.SampleDesc.Count = 1; desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    desc.BufferCount = 2; desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    desc.BufferCount = 3; desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     desc.Scaling = DXGI_SCALING_STRETCH; desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+    desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
     if (g_proxy_allow_tearing) desc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
     Microsoft::WRL::ComPtr<IDXGISwapChain1> swapchain1;
     if (SUCCEEDED(hr)) { failed_stage = "CreateSwapChainForHwnd"; hr = factory->CreateSwapChainForHwnd(g_command_queue, g_proxy_window, &desc, nullptr, nullptr, &swapchain1); }
     if (SUCCEEDED(hr)) { failed_stage = "IDXGISwapChain3"; hr = swapchain1.As(&g_proxy_swapchain); }
+    if (SUCCEEDED(hr))
+    {
+        Microsoft::WRL::ComPtr<IDXGISwapChain2> swapchain2;
+        failed_stage = "IDXGISwapChain2 frame-latency setup";
+        hr = g_proxy_swapchain.As(&swapchain2);
+        if (SUCCEEDED(hr)) hr = swapchain2->SetMaximumFrameLatency(2);
+        if (SUCCEEDED(hr))
+        {
+            g_proxy_frame_latency_waitable = swapchain2->GetFrameLatencyWaitableObject();
+            if (g_proxy_frame_latency_waitable == nullptr) hr = E_FAIL;
+        }
+    }
     if (SUCCEEDED(hr) && g_active_color_profile == ColorProfile::Srgb)
     {
         const HRESULT color_hr = g_proxy_swapchain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
@@ -3122,7 +3166,7 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
     }
     if (SUCCEEDED(hr)) { failed_stage = "CreateFence"; hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_proxy_fence)); }
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
-    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; heap_desc.NumDescriptors = 2;
+    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; heap_desc.NumDescriptors = 3;
     if (SUCCEEDED(hr)) { failed_stage = "Create RTV heap"; hr = device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&g_proxy_rtv_heap)); }
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; heap_desc.NumDescriptors = 6; heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (SUCCEEDED(hr)) { failed_stage = "Create SRV heap"; hr = device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&g_proxy_srv_heap)); }
@@ -3191,7 +3235,7 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
         g_proxy_rtv_stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         g_proxy_srv_stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         auto rtv = g_proxy_rtv_heap->GetCPUDescriptorHandleForHeapStart();
-        for (UINT index = 0; index < 2; ++index)
+        for (UINT index = 0; index < 3; ++index)
         {
             Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
             if (FAILED(g_proxy_swapchain->GetBuffer(index, IID_PPV_ARGS(&buffer)))) { hr = E_FAIL; failed_stage = "Get proxy buffer"; break; }
@@ -3204,7 +3248,12 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
             device->CreateShaderResourceView(source, &srv, g_proxy_srv_heap->GetCPUDescriptorHandleForHeapStart());
     }
     if (SUCCEEDED(hr)) g_proxy_fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (FAILED(hr) || g_proxy_fence_event == nullptr)
+    if (SUCCEEDED(hr)) g_proxy_present_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (SUCCEEDED(hr)) g_proxy_present_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (SUCCEEDED(hr) && g_proxy_fence_event && g_proxy_present_event && g_proxy_present_stop_event)
+        g_proxy_present_thread = CreateThread(nullptr, 0, ProxyPresentationThread, nullptr, 0, nullptr);
+    if (FAILED(hr) || g_proxy_fence_event == nullptr || g_proxy_present_event == nullptr ||
+        g_proxy_present_stop_event == nullptr || g_proxy_present_thread == nullptr)
     {
         Log("native presentation initialization failed at %s: hr=0x%08X win32=%lu", failed_stage, static_cast<unsigned int>(hr), GetLastError());
         g_proxy_failed = true;
@@ -3217,7 +3266,7 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
         g_proxy_swapchain.Reset(); return false;
     }
     g_proxy_present_format = present_format;
-    Log("native proxy ready: %ux%u source_format=%u present_format=%u hwnd=%p tearing=%s", width, height,
+    Log("native proxy ready: %ux%u source_format=%u present_format=%u hwnd=%p tearing=%s async_presenter=ready buffers=3 max_latency=2", width, height,
         static_cast<unsigned int>(source_format), static_cast<unsigned int>(present_format), g_proxy_window,
         g_proxy_allow_tearing ? "supported" : "unavailable");
     return true;
@@ -3278,12 +3327,12 @@ static bool AdoptPresentQueue(reshade::api::command_queue *queue)
     return true;
 }
 
-static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
+static bool PresentProxyFrameOnWorker()
 {
     ID3D12Resource *real_source = g_nr_output;
     ID3D12Resource *original_source = g_packed_color.Get();
     if (g_proxy_hidden || g_sr_frames.load() == 0 || real_source == nullptr ||
-        original_source == nullptr || backbuffer == nullptr || !EnsureProxy(real_source)) return false;
+        original_source == nullptr || g_proxy_swapchain == nullptr) return false;
 
     const bool use_framegen = EffectiveFramegenEnabled() && !g_framegen_failed &&
         g_show_neural_output && g_fg_stage && g_fg_frames.load() >= 2;
@@ -3292,8 +3341,6 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
         g_present_api == reshade::api::device_api::vulkan;
     const D3D12_RESOURCE_STATES original_base_state = legacy ?
         D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    const D3D12_RESOURCE_STATES post_base_state = legacy ?
-        D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_PRESENT;
     ID3D12Resource *present_sources[2] = {
         use_framegen ? g_fg_stage.Get() : real_source,
         real_source
@@ -3302,11 +3349,15 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
 
     if (g_proxy_fence_value != 0 && g_proxy_fence->GetCompletedValue() < g_proxy_fence_value)
     {
-        const unsigned long long skipped = ++g_proxy_busy_frame_skips;
-        if (skipped <= 8 || skipped % 600 == 0)
-            Log("proxy frame skipped without blocking Present: compositor GPU work still active (skip=%llu completed=%llu submitted=%llu)",
-                skipped, g_proxy_fence->GetCompletedValue(), g_proxy_fence_value);
-        return false;
+        if (FAILED(g_proxy_fence->SetEventOnCompletion(g_proxy_fence_value, g_proxy_fence_event)) ||
+            WaitForSingleObject(g_proxy_fence_event, 50) != WAIT_OBJECT_0)
+        {
+            const unsigned long long timeouts = ++g_proxy_present_timeouts;
+            if (timeouts <= 8 || timeouts % 120 == 0)
+                Log("async proxy presenter timed out waiting for compositor GPU work (timeout=%llu completed=%llu submitted=%llu)",
+                    timeouts, g_proxy_fence->GetCompletedValue(), g_proxy_fence_value);
+            return false;
+        }
     }
     Microsoft::WRL::ComPtr<ID3D12Device> device;
     if (FAILED(g_command_queue->GetDevice(IID_PPV_ARGS(&device)))) return false;
@@ -3344,6 +3395,14 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
 
     for (UINT present_index = 0; present_index < present_count; ++present_index)
     {
+        if (g_proxy_frame_latency_waitable == nullptr ||
+            WaitForSingleObject(g_proxy_frame_latency_waitable, 50) != WAIT_OBJECT_0)
+        {
+            const unsigned long long timeouts = ++g_proxy_present_timeouts;
+            if (timeouts <= 8 || timeouts % 120 == 0)
+                Log("async proxy presenter timed out waiting for a swapchain slot (timeout=%llu)", timeouts);
+            return false;
+        }
         ID3D12CommandAllocator *allocator = g_proxy_allocators[present_index].Get();
         ID3D12GraphicsCommandList *list = g_proxy_lists[present_index].Get();
         if (allocator == nullptr || list == nullptr || FAILED(allocator->Reset()) ||
@@ -3352,7 +3411,12 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
         const UINT buffer_index = g_proxy_swapchain->GetCurrentBackBufferIndex();
         if (FAILED(g_proxy_swapchain->GetBuffer(buffer_index, IID_PPV_ARGS(&destination)))) return false;
         ID3D12Resource *neural_source = present_sources[present_index];
-        ID3D12Resource *sources[3] = {neural_source, original_source, backbuffer};
+        // The proxy is hidden whenever ReShade's interactive overlay is open,
+        // so presentation only needs persistent pipeline-owned textures here.
+        // Point the otherwise-unused post-effect descriptor at the packed game
+        // input as well; this avoids retaining a volatile game backbuffer on a
+        // worker after the game's Present callback has returned.
+        ID3D12Resource *sources[3] = {neural_source, original_source, original_source};
         auto srv_handle = g_proxy_srv_heap->GetCPUDescriptorHandleForHeapStart();
         srv_handle.ptr += static_cast<SIZE_T>(present_index) * 3 * g_proxy_srv_stride;
         for (ID3D12Resource *source : sources)
@@ -3363,17 +3427,15 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
             device->CreateShaderResourceView(source, &srv, srv_handle);
             srv_handle.ptr += g_proxy_srv_stride;
         }
-        D3D12_RESOURCE_BARRIER barriers[8] = {
+        D3D12_RESOURCE_BARRIER barriers[6] = {
             Transition(destination.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET),
             Transition(neural_source, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
             Transition(original_source, original_base_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-            Transition(backbuffer, post_base_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
             Transition(destination.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT),
             Transition(neural_source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-            Transition(original_source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, original_base_state),
-            Transition(backbuffer, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, post_base_state)
+            Transition(original_source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, original_base_state)
         };
-        list->ResourceBarrier(4, barriers);
+        list->ResourceBarrier(3, barriers);
         ID3D12DescriptorHeap *heaps[] = {g_proxy_srv_heap.Get()}; list->SetDescriptorHeaps(1, heaps);
         list->SetGraphicsRootSignature(g_proxy_root_signature.Get()); list->SetPipelineState(g_proxy_pipeline.Get());
         auto gpu_srv = g_proxy_srv_heap->GetGPUDescriptorHandleForHeapStart();
@@ -3384,21 +3446,13 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
         auto rtv = g_proxy_rtv_heap->GetCPUDescriptorHandleForHeapStart(); rtv.ptr += buffer_index * g_proxy_rtv_stride;
         list->OMSetRenderTargets(1, &rtv, FALSE, nullptr); list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         list->DrawInstanced(3, 1, 0, 0);
-        list->ResourceBarrier(4, barriers + 4);
+        list->ResourceBarrier(3, barriers + 3);
         if (FAILED(list->Close())) return false;
         ID3D12CommandList *lists[] = {list};
         g_command_queue->ExecuteCommandLists(1, lists);
         ++g_proxy_fence_value; g_command_queue->Signal(g_proxy_fence.Get(), g_proxy_fence_value);
-        const UINT present_flags = (g_proxy_allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0u) |
-            DXGI_PRESENT_DO_NOT_WAIT;
+        const UINT present_flags = g_proxy_allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0u;
         const HRESULT present_result = g_proxy_swapchain->Present(0, present_flags);
-        if (present_result == DXGI_ERROR_WAS_STILL_DRAWING)
-        {
-            const unsigned long long skipped = ++g_proxy_busy_frame_skips;
-            if (skipped <= 8 || skipped % 600 == 0)
-                Log("proxy DXGI Present was busy; frame dropped without blocking (skip=%llu)", skipped);
-            return false;
-        }
         if (FAILED(present_result))
         {
             Log("proxy DXGI Present failed: 0x%08X; proxy quarantined and game surface restored",
@@ -3430,6 +3484,60 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
         if (!g_proxy_hidden && !g_proxy_overlay_bypass)
             RequestProxyVisibility(true);
         Log("early native proxy activated after its first completed frame");
+    }
+    return true;
+}
+
+static DWORD WINAPI ProxyPresentationThread(void *)
+{
+    const HANDLE waits[2] = {g_proxy_present_stop_event, g_proxy_present_event};
+    Log("async proxy presentation worker started");
+    while (true)
+    {
+        const DWORD wait = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+        if (wait == WAIT_OBJECT_0) break;
+        if (wait != WAIT_OBJECT_0 + 1) continue;
+
+        unsigned int expected = 1;
+        if (!g_proxy_present_request_state.compare_exchange_strong(expected, 2,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+            continue;
+
+        if (!PresentProxyFrameOnWorker())
+        {
+            const unsigned long long skipped = ++g_proxy_busy_frame_skips;
+            if (skipped <= 8 || skipped % 120 == 0)
+                Log("async proxy presentation request dropped safely (skip=%llu)", skipped);
+        }
+        g_proxy_present_request_state.store(0, std::memory_order_release);
+    }
+    g_proxy_present_request_state.store(0, std::memory_order_release);
+    Log("async proxy presentation worker stopped");
+    return 0;
+}
+
+static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
+{
+    ID3D12Resource *real_source = g_nr_output;
+    ID3D12Resource *original_source = g_packed_color.Get();
+    if (g_proxy_hidden || g_sr_frames.load() == 0 || real_source == nullptr ||
+        original_source == nullptr || backbuffer == nullptr || !EnsureProxy(real_source) ||
+        g_proxy_present_event == nullptr || g_proxy_present_thread == nullptr)
+        return false;
+
+    unsigned int expected = 0;
+    if (!g_proxy_present_request_state.compare_exchange_strong(expected, 1,
+            std::memory_order_acq_rel, std::memory_order_acquire))
+    {
+        // The request already in flight uses the latest completed persistent
+        // pipeline output. Coalesce repeats instead of blocking the game.
+        ++g_proxy_present_coalesced;
+        return true;
+    }
+    if (!SetEvent(g_proxy_present_event))
+    {
+        g_proxy_present_request_state.store(0, std::memory_order_release);
+        return false;
     }
     return true;
 }
@@ -3984,6 +4092,9 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::Text("Present safety: neural skips=%llu; proxy skips=%llu; native Streamline=%s",
         g_neural_busy_frame_skips.load(), g_proxy_busy_frame_skips.load(),
         g_native_streamline_present_hook ? "detected" : "not detected");
+    ImGui::Text("Async presenter: state=%u; coalesced=%llu; timeouts=%llu",
+        g_proxy_present_request_state.load(), g_proxy_present_coalesced.load(),
+        g_proxy_present_timeouts.load());
     ImGui::Text("Early proxy compatibility: %s",
         g_early_proxy_restart_required ? "restart required" :
         !g_early_proxy_initialization ? "off" :
@@ -4157,6 +4268,15 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
         reshade::unregister_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
+        if (g_proxy_present_stop_event) SetEvent(g_proxy_present_stop_event);
+        if (g_proxy_present_event) SetEvent(g_proxy_present_event);
+        if (g_proxy_present_thread)
+        {
+            WaitForSingleObject(g_proxy_present_thread, 2000);
+            CloseHandle(g_proxy_present_thread);
+        }
+        if (g_proxy_present_event) CloseHandle(g_proxy_present_event);
+        if (g_proxy_present_stop_event) CloseHandle(g_proxy_present_stop_event);
         if (g_proxy_fence_event) CloseHandle(g_proxy_fence_event);
         g_proxy_pipeline.Reset(); g_proxy_root_signature.Reset(); g_proxy_srv_heap.Reset(); g_proxy_rtv_heap.Reset();
         for (UINT index = 0; index < 2; ++index)
