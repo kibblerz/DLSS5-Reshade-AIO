@@ -30,7 +30,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.25-same-window-overlay"
+#define ADDON_VERSION "1.7.25-same-window-history-control"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -172,7 +172,7 @@ static std::atomic<unsigned long long> g_neural_presenter_deferrals{0};
 static std::atomic<unsigned long long> g_neural_gpu_deferrals{0};
 static std::atomic<unsigned long long> g_source_frame_sequence{0};
 static unsigned long long g_last_neural_source_sequence;
-static std::atomic<unsigned long long> g_temporal_discontinuity_resets{0};
+static std::atomic<unsigned long long> g_temporal_discontinuities{0};
 static ULONGLONG g_last_telemetry_log_tick;
 static std::array<unsigned int, 240> g_source_frame_samples = {};
 static size_t g_source_frame_sample_count;
@@ -2663,12 +2663,11 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     const unsigned long long source_sequence = g_source_frame_sequence.load(std::memory_order_acquire);
     if (g_last_neural_source_sequence != 0 && source_sequence > g_last_neural_source_sequence + 1)
     {
-        g_need_history_reset = true;
-        const unsigned long long resets = ++g_temporal_discontinuity_resets;
-        if (resets <= 8 || resets % 600 == 0)
-            Log("temporal history reset: source capture discontinuity previous=%llu current=%llu gap=%llu reset=%llu",
+        const unsigned long long discontinuities = ++g_temporal_discontinuities;
+        if (discontinuities <= 8 || discontinuities % 600 == 0)
+            Log("source capture discontinuity observed without forcing an NGX history reset: previous=%llu current=%llu gap=%llu count=%llu",
                 g_last_neural_source_sequence, source_sequence,
-                source_sequence - g_last_neural_source_sequence - 1, resets);
+                source_sequence - g_last_neural_source_sequence - 1, discontinuities);
     }
     const bool evaluate_nr = g_nr_enabled && g_nr_feature != nullptr;
 
@@ -4557,9 +4556,9 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::Text("Async presenter: state=%u; coalesced=%llu; timeouts=%llu",
         g_proxy_present_request_state.load(), g_proxy_present_coalesced.load(),
         g_proxy_present_timeouts.load());
-    ImGui::Text("Capture continuity: source=%llu; last neural=%llu; history resets=%llu",
+    ImGui::Text("Capture continuity: source=%llu; last neural=%llu; gaps observed=%llu (no forced resets)",
         g_source_frame_sequence.load(), g_last_neural_source_sequence,
-        g_temporal_discontinuity_resets.load());
+        g_temporal_discontinuities.load());
     ImGui::Text("Early proxy compatibility: %s",
         g_early_proxy_restart_required ? "restart required" :
         !g_early_proxy_initialization ? "off" :
