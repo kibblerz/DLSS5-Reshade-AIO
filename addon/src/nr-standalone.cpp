@@ -30,7 +30,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.27-windowed-runtime-set-prototype"
+#define ADDON_VERSION "1.7.28-serialized-present-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -77,6 +77,7 @@ static HANDLE g_proxy_frame_latency_waitable;
 static HANDLE g_proxy_present_event;
 static HANDLE g_proxy_present_stop_event;
 static HANDLE g_proxy_present_thread;
+static bool g_synchronous_proxy_presentation;
 // 0 = idle, 1 = a completed pipeline frame is waiting, 2 = the presenter is
 // recording/submitting that frame. The game thread never waits on this state.
 static std::atomic<unsigned int> g_proxy_present_request_state{0};
@@ -3716,8 +3717,9 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
     }
     g_proxy_present_format = present_format;
     g_proxy_early_pending_activation = true;
-    Log("same-window compositor ready: %ux%u source_format=%u present_format=%u game_hwnd=%p input_owner=game DWM_paced=yes async_presenter=ready buffers=3 max_latency=2", width, height,
-        static_cast<unsigned int>(source_format), static_cast<unsigned int>(present_format), g_game_window);
+    Log("same-window compositor ready: %ux%u source_format=%u present_format=%u game_hwnd=%p input_owner=game DWM_paced=yes presenter=%s buffers=3 max_latency=2", width, height,
+        static_cast<unsigned int>(source_format), static_cast<unsigned int>(present_format), g_game_window,
+        g_synchronous_proxy_presentation ? "serialized/game-thread" : "asynchronous/worker");
     return true;
 }
 
@@ -4051,6 +4053,30 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
         return true;
     }
     ++g_proxy_present_requests;
+
+    if (g_synchronous_proxy_presentation)
+    {
+        // Compatibility path for games whose native presentation interposer is
+        // not safe when another swapchain calls Present concurrently. ReShade
+        // has already flushed the game command list at this boundary, so record,
+        // submit and present the composition image on this same game thread.
+        g_proxy_present_request_state.store(2, std::memory_order_release);
+        LARGE_INTEGER worker_begin = {}, worker_end = {};
+        if (g_performance_telemetry_enabled) QueryPerformanceCounter(&worker_begin);
+        const bool presented = PresentProxyFrameOnWorker();
+        if (presented) ++g_proxy_present_completed;
+        else ++g_proxy_busy_frame_skips;
+        if (g_performance_telemetry_enabled)
+        {
+            QueryPerformanceCounter(&worker_end);
+            const unsigned int duration = CounterDeltaMicroseconds(worker_begin, worker_end);
+            SmoothMicroseconds(g_cpu_proxy_worker_us, duration);
+            RecordPeakMicroseconds(g_cpu_proxy_worker_peak_us, duration);
+        }
+        g_proxy_present_request_state.store(0, std::memory_order_release);
+        return presented;
+    }
+
     if (g_performance_telemetry_enabled)
     {
         LARGE_INTEGER queued = {};
@@ -4620,6 +4646,9 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     }
     ImGui::TextDisabled("Opt-in: keeps a reduced game backbuffer while expanding the same window to native size.");
 
+    ImGui::Text("Compositor Present mode: %s",
+        g_synchronous_proxy_presentation ? "serialized compatibility" : "asynchronous performance");
+
     ImGui::TextDisabled("Vulkan: select a real reduced windowed resolution in-game; the native proxy supplies borderless output.");
 
     if (ImGui::Checkbox("Early proxy initialization (D3D11On12 compatibility)", &g_early_proxy_initialization))
@@ -4953,11 +4982,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("PerformanceTelemetry", "1", value, sizeof(value)); g_performance_telemetry_enabled = strcmp(value, "0") != 0;
         read_setting("EarlyProxyInitialization", "0", value, sizeof(value)); g_early_proxy_initialization = strcmp(value, "0") != 0;
         read_setting("WindowedVirtualization", "0", value, sizeof(value)); g_windowed_virtualization_enabled = strcmp(value, "0") != 0;
-        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d style=%u NR=%s NR-mask=%s strength=%.2f early_proxy=%s windowed_virtualization=%s telemetry=%s",
+        read_setting("SynchronousProxyPresentation", "0", value, sizeof(value)); g_synchronous_proxy_presentation = strcmp(value, "0") != 0;
+        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d style=%u NR=%s NR-mask=%s strength=%.2f early_proxy=%s windowed_virtualization=%s presenter=%s telemetry=%s",
             ADDON_VERSION, ProfileName(g_color_profile), g_nr_model, NrStyle(), g_nr_enabled ? "enabled" : "disabled",
             g_nr_rejection_mask_enabled ? "enabled" : "disabled", g_nr_rejection_mask_strength,
             g_early_proxy_initialization ? "enabled" : "disabled",
             g_windowed_virtualization_enabled ? "enabled" : "disabled",
+            g_synchronous_proxy_presentation ? "serialized" : "asynchronous",
             g_performance_telemetry_enabled ? "enabled" : "disabled");
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::register_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
