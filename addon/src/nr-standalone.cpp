@@ -30,7 +30,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.25-same-window-compositor"
+#define ADDON_VERSION "1.7.25-same-window-overlay"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -282,6 +282,8 @@ static Microsoft::WRL::ComPtr<ID3D12Fence> g_neural_fence;
 static HANDLE g_neural_fence_event;
 static UINT64 g_neural_fence_value;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_packed_color;
+static Microsoft::WRL::ComPtr<ID3D12Resource> g_post_reshade_color;
+static std::atomic<bool> g_post_reshade_color_ready{false};
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_nr_stage;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_sr_stage;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_fg_stage;
@@ -1527,7 +1529,9 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
     g_captured_motion.Reset(); g_captured_depth.Reset(); g_captured_mask.Reset(); g_captured_nr_mask.Reset();
     g_fallback_motion.Reset(); g_fallback_depth.Reset();
     ReleaseLegacyFrameResources();
-    g_fg_stage.Reset(); g_sr_stage.Reset(); g_nr_stage.Reset(); g_packed_color.Reset();
+    g_fg_stage.Reset(); g_sr_stage.Reset(); g_nr_stage.Reset();
+    g_post_reshade_color.Reset(); g_post_reshade_color_ready = false;
+    g_packed_color.Reset();
 
     if (g_runtime)
     {
@@ -2134,7 +2138,9 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
         (legacy ? BuildLegacyFrameResources(iw, ih, input_format) :
             CreateTexture(iw, ih, input_format, false,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g_packed_color));
-    if (!input_ready ||
+    const bool post_input_ready = legacy || CreateTexture(iw, ih, input_format, false,
+        D3D12_RESOURCE_STATE_COPY_DEST, g_post_reshade_color);
+    if (!input_ready || !post_input_ready ||
         !CreateTexture(iw, ih, result_format, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g_nr_stage) ||
         !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, g_sr_stage) ||
         !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, g_fg_stage)) return false;
@@ -3520,8 +3526,8 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
         "float4 PS(O i):SV_Target{float3 post=Post.SampleLevel(Samp,i.uv,0);float3 neural=Neural.SampleLevel(Samp,i.uv,0);float3 result;"
         "uint w,h; Post.GetDimensions(w,h); uint2 p=min(uint2(i.uv*float2(w,h)),uint2(w-1,h-1));"
         "uint ow,oh; Original.GetDimensions(ow,oh); uint2 op=min(uint2(i.uv*float2(ow,oh)),uint2(ow-1,oh-1));"
-        "float3 postPoint=Post.Load(int3(p,0)); float3 original=Original.Load(int3(op,0)); float3 d=abs(postPoint-original);"
-        "if(Mode==0)result=original;else if(Mode==1)result=neural;else result=max(d.r,max(d.g,d.b))>Threshold?post:neural;"
+        "float3 postPoint=Post.Load(int3(p,0)); float3 original=Original.Load(int3(op,0));"
+        "if(Mode==0)result=original;else if(Mode==1)result=neural;else result=neural+(postPoint-original);"
         "bool cursorNow=CursorInput.x>=0&&all(float2(p)>=CursorInput-float2(6,6))&&all(float2(p)<=CursorInput+float2(36,44));"
         "bool cursorPrevious=PreviousCursorInput.x>=0&&all(float2(p)>=PreviousCursorInput-float2(6,6))&&all(float2(p)<=PreviousCursorInput+float2(36,44));"
         "if((cursorNow||cursorPrevious)&&Mode!=1)result=Mode==0?original:neural;"
@@ -3651,6 +3657,9 @@ static bool PresentProxyFrameOnWorker()
         g_present_api == reshade::api::device_api::vulkan;
     const D3D12_RESOURCE_STATES original_base_state = legacy ?
         D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const bool composite_post = g_same_window_compositor && g_reshade_overlay_open.load() &&
+        g_post_reshade_color_ready.load(std::memory_order_acquire) && g_post_reshade_color;
+    ID3D12Resource *post_source = composite_post ? g_post_reshade_color.Get() : original_source;
     ID3D12Resource *present_sources[2] = {
         use_framegen ? g_fg_stage.Get() : real_source,
         real_source
@@ -3705,7 +3714,7 @@ static bool PresentProxyFrameOnWorker()
         UINT mode; UINT fps; UINT show_fps; float threshold;
         float cursor_x; float cursor_y; float previous_cursor_x; float previous_cursor_y;
     } constants = {
-        g_show_neural_output ? (g_composite_reshade_output && g_reshade_overlay_open.load() ? 2u : 1u) : 0u,
+        g_show_neural_output ? (g_composite_reshade_output && composite_post ? 2u : 1u) : 0u,
         g_proxy_fps.load(),
         g_show_proxy_fps ? 1u : 0u,
         0.0f,
@@ -3739,12 +3748,10 @@ static bool PresentProxyFrameOnWorker()
         const UINT buffer_index = g_proxy_swapchain->GetCurrentBackBufferIndex();
         if (FAILED(g_proxy_swapchain->GetBuffer(buffer_index, IID_PPV_ARGS(&destination)))) return false;
         ID3D12Resource *neural_source = present_sources[present_index];
-        // The proxy is hidden whenever ReShade's interactive overlay is open,
-        // so presentation only needs persistent pipeline-owned textures here.
-        // Point the otherwise-unused post-effect descriptor at the packed game
-        // input as well; this avoids retaining a volatile game backbuffer on a
-        // worker after the game's Present callback has returned.
-        ID3D12Resource *sources[3] = {neural_source, original_source, original_source};
+        // All descriptors reference persistent pipeline-owned textures. The
+        // post-ReShade menu snapshot is copied on the game queue before this
+        // worker is signaled, so it remains valid after the callback returns.
+        ID3D12Resource *sources[3] = {neural_source, original_source, post_source};
         auto srv_handle = g_proxy_srv_heap->GetCPUDescriptorHandleForHeapStart();
         srv_handle.ptr += static_cast<SIZE_T>(present_index) * 3 * g_proxy_srv_stride;
         for (ID3D12Resource *source : sources)
@@ -3755,17 +3762,22 @@ static bool PresentProxyFrameOnWorker()
             device->CreateShaderResourceView(source, &srv, srv_handle);
             srv_handle.ptr += g_proxy_srv_stride;
         }
-        D3D12_RESOURCE_BARRIER barriers[6] = {
-            Transition(destination.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET),
-            Transition(neural_source, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-            Transition(original_source, original_base_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-            Transition(destination.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT),
-            Transition(neural_source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-            Transition(original_source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, original_base_state)
-        };
+        D3D12_RESOURCE_BARRIER barriers[8] = {};
+        UINT begin_count = 0;
+        barriers[begin_count++] = Transition(destination.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        barriers[begin_count++] = Transition(neural_source, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        barriers[begin_count++] = Transition(original_source, original_base_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        if (composite_post)
+            barriers[begin_count++] = Transition(post_source, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        UINT end_count = 0;
+        barriers[begin_count + end_count++] = Transition(destination.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+        barriers[begin_count + end_count++] = Transition(neural_source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        barriers[begin_count + end_count++] = Transition(original_source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, original_base_state);
+        if (composite_post)
+            barriers[begin_count + end_count++] = Transition(post_source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
         if (record_proxy_gpu)
             list->EndQuery(g_proxy_telemetry_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, present_index * 2);
-        list->ResourceBarrier(3, barriers);
+        list->ResourceBarrier(begin_count, barriers);
         ID3D12DescriptorHeap *heaps[] = {g_proxy_srv_heap.Get()}; list->SetDescriptorHeaps(1, heaps);
         list->SetGraphicsRootSignature(g_proxy_root_signature.Get()); list->SetPipelineState(g_proxy_pipeline.Get());
         auto gpu_srv = g_proxy_srv_heap->GetGPUDescriptorHandleForHeapStart();
@@ -3776,7 +3788,7 @@ static bool PresentProxyFrameOnWorker()
         auto rtv = g_proxy_rtv_heap->GetCPUDescriptorHandleForHeapStart(); rtv.ptr += buffer_index * g_proxy_rtv_stride;
         list->OMSetRenderTargets(1, &rtv, FALSE, nullptr); list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         list->DrawInstanced(3, 1, 0, 0);
-        list->ResourceBarrier(3, barriers + 3);
+        list->ResourceBarrier(end_count, barriers + begin_count);
         if (record_proxy_gpu)
         {
             const UINT query_index = present_index * 2;
@@ -3927,6 +3939,35 @@ static bool EnsureStandaloneResources(ID3D12Resource *backbuffer)
     return EnsureStandaloneResources(static_cast<UINT>(desc.Width), desc.Height, desc.Format);
 }
 
+static bool CapturePostReshadeFrame(ID3D12Resource *source)
+{
+    if (!source || !g_post_reshade_color || !g_runtime ||
+        g_present_api != reshade::api::device_api::d3d12)
+        return false;
+    const D3D12_RESOURCE_DESC source_desc = source->GetDesc();
+    const D3D12_RESOURCE_DESC destination_desc = g_post_reshade_color->GetDesc();
+    if (source_desc.Width != destination_desc.Width || source_desc.Height != destination_desc.Height ||
+        TypedInputFormat(source_desc.Format) != TypedInputFormat(destination_desc.Format))
+        return false;
+    reshade::api::command_queue *queue = g_runtime->get_command_queue();
+    reshade::api::command_list *commands = queue ? queue->get_immediate_command_list() : nullptr;
+    auto *native_queue = queue ? reinterpret_cast<ID3D12CommandQueue *>(queue->get_native()) : nullptr;
+    auto *native_commands = commands ? reinterpret_cast<ID3D12GraphicsCommandList *>(commands->get_native()) : nullptr;
+    if (!queue || !native_queue || !native_commands || native_queue != g_command_queue)
+        return false;
+
+    D3D12_RESOURCE_BARRIER begin = Transition(source,
+        D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    native_commands->ResourceBarrier(1, &begin);
+    native_commands->CopyResource(g_post_reshade_color.Get(), source);
+    D3D12_RESOURCE_BARRIER end = Transition(source,
+        D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+    native_commands->ResourceBarrier(1, &end);
+    queue->flush_immediate_command_list();
+    g_post_reshade_color_ready.store(true, std::memory_order_release);
+    return true;
+}
+
 static void OnReshadePresent(reshade::api::effect_runtime *runtime)
 {
     if (runtime == nullptr) return;
@@ -3952,7 +3993,25 @@ static void OnReshadePresent(reshade::api::effect_runtime *runtime)
     if (api != reshade::api::device_api::vulkan && queue)
         queue->flush_immediate_command_list();
     if (api == reshade::api::device_api::d3d12)
-        PresentProxyAfterReshade(reinterpret_cast<ID3D12Resource *>(resource.handle));
+    {
+        auto *backbuffer = reinterpret_cast<ID3D12Resource *>(resource.handle);
+        if (g_same_window_compositor && g_reshade_overlay_open.load())
+        {
+            // Do not overwrite the persistent menu snapshot while the worker
+            // owns it. A later ReShade Present will refresh it.
+            if (g_proxy_present_request_state.load(std::memory_order_acquire) != 0)
+            {
+                ++g_proxy_present_coalesced;
+                return;
+            }
+            if (!CapturePostReshadeFrame(backbuffer))
+            {
+                Log("same-window compositor could not capture the post-ReShade menu frame");
+                return;
+            }
+        }
+        PresentProxyAfterReshade(backbuffer);
+    }
     else if ((api == reshade::api::device_api::d3d11 || api == reshade::api::device_api::d3d9) &&
         CopyLegacyFrameToD3D12(reinterpret_cast<void *>(resource.handle), true))
         PresentProxyAfterReshade(g_legacy_post12.Get());
@@ -4028,6 +4087,19 @@ static bool OnReshadeOpenOverlay(reshade::api::effect_runtime *runtime, bool ope
     {
         RequestProxyOverlayInputMode();
         Log("primary ReShade overlay %s; native proxy mirror requested",
+            open ? "opened" : "closed");
+        return false;
+    }
+
+    if (g_same_window_compositor && g_present_api == reshade::api::device_api::d3d12 &&
+        g_post_reshade_color)
+    {
+        // The composition visual is not a window and cannot intercept input.
+        // Keep it visible, then composite the primary runtime's post-ReShade
+        // frame so the menu does not reveal the reduced game swapchain.
+        g_proxy_overlay_bypass = false;
+        if (!open) g_post_reshade_color_ready = false;
+        Log("primary ReShade overlay %s; same-window compositor remains active with direct game-window input",
             open ? "opened" : "closed");
         return false;
     }
@@ -4729,7 +4801,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         g_legacy_query9.Reset(); g_legacy_device9.Reset();
         g_legacy_fence11.Reset(); g_legacy_fence12.Reset(); g_legacy_context4.Reset();
         g_legacy_context11.Reset(); g_legacy_device11.Reset();
-        g_fg_stage.Reset(); g_sr_stage.Reset(); g_nr_stage.Reset(); g_packed_color.Reset();
+        g_fg_stage.Reset(); g_sr_stage.Reset(); g_nr_stage.Reset();
+        g_post_reshade_color.Reset(); g_post_reshade_color_ready = false;
+        g_packed_color.Reset();
         g_guide_telemetry_fence.Reset(); g_guide_telemetry_readback.Reset();
         g_guide_telemetry_query_heap.Reset();
         g_telemetry_readback.Reset(); g_telemetry_query_heap.Reset();
