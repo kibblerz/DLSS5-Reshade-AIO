@@ -29,7 +29,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.22"
+#define ADDON_VERSION "1.7.23-full-telemetry-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -126,6 +126,44 @@ static std::atomic<unsigned int> g_addon_cpu_current_us{0};
 static std::atomic<unsigned int> g_addon_cpu_avg_us{0};
 static std::atomic<unsigned int> g_addon_cpu_peak_us{0};
 static std::atomic<unsigned long long> g_telemetry_samples{0};
+static constexpr UINT kGuideTelemetryQueryCount = 3;
+static Microsoft::WRL::ComPtr<ID3D12QueryHeap> g_guide_telemetry_query_heap;
+static Microsoft::WRL::ComPtr<ID3D12Resource> g_guide_telemetry_readback;
+static Microsoft::WRL::ComPtr<ID3D12Fence> g_guide_telemetry_fence;
+static UINT64 g_guide_telemetry_frequency;
+static UINT64 g_guide_telemetry_fence_value;
+static bool g_guide_telemetry_pending;
+static std::atomic<bool> g_guide_gpu_telemetry_available{false};
+static std::atomic<unsigned int> g_gpu_vort_us{0};
+static std::atomic<unsigned int> g_gpu_feed_us{0};
+static std::atomic<unsigned int> g_gpu_guides_total_us{0};
+static std::atomic<unsigned int> g_cpu_vort_submit_us{0};
+static std::atomic<unsigned int> g_cpu_feed_submit_us{0};
+static std::atomic<unsigned int> g_cpu_guide_flush_us{0};
+static std::atomic<unsigned long long> g_guide_telemetry_samples{0};
+static constexpr UINT kProxyTelemetryQueryCount = 4;
+static Microsoft::WRL::ComPtr<ID3D12QueryHeap> g_proxy_telemetry_query_heap;
+static Microsoft::WRL::ComPtr<ID3D12Resource> g_proxy_telemetry_readback;
+static UINT64 g_proxy_telemetry_frequency;
+static UINT64 g_proxy_telemetry_fence_value;
+static UINT g_proxy_telemetry_present_count;
+static bool g_proxy_telemetry_pending;
+static std::atomic<bool> g_proxy_gpu_telemetry_available{false};
+static std::atomic<unsigned int> g_gpu_proxy_generated_us{0};
+static std::atomic<unsigned int> g_gpu_proxy_real_us{0};
+static std::atomic<unsigned int> g_gpu_proxy_total_us{0};
+static std::atomic<unsigned long long> g_proxy_telemetry_samples{0};
+static std::atomic<long long> g_proxy_request_qpc{0};
+static std::atomic<unsigned int> g_cpu_proxy_mailbox_us{0};
+static std::atomic<unsigned int> g_cpu_proxy_fence_wait_us{0};
+static std::atomic<unsigned int> g_cpu_proxy_swap_wait_us{0};
+static std::atomic<unsigned int> g_cpu_proxy_present_us{0};
+static std::atomic<unsigned int> g_cpu_proxy_worker_us{0};
+static std::atomic<unsigned int> g_cpu_proxy_worker_peak_us{0};
+static std::atomic<unsigned long long> g_proxy_present_requests{0};
+static std::atomic<unsigned long long> g_proxy_present_completed{0};
+static std::atomic<unsigned long long> g_neural_presenter_deferrals{0};
+static std::atomic<unsigned long long> g_neural_gpu_deferrals{0};
 static ULONGLONG g_last_telemetry_log_tick;
 static std::array<unsigned int, 240> g_source_frame_samples = {};
 static size_t g_source_frame_sample_count;
@@ -323,6 +361,7 @@ static NVSDK_NGX_Handle *g_fg_feature;
 static void Log(const char *format, ...);
 static void SetStatus(const char *format, ...);
 static void RequestProxyVisibility(bool visible);
+static unsigned int CounterDeltaMicroseconds(const LARGE_INTEGER &begin, const LARGE_INTEGER &end);
 
 static bool EffectiveFramegenEnabled()
 {
@@ -515,15 +554,31 @@ static unsigned int SmoothMicroseconds(std::atomic<unsigned int> &destination, u
     return smoothed;
 }
 
+static void RecordPeakMicroseconds(std::atomic<unsigned int> &destination, unsigned int sample)
+{
+    unsigned int previous = destination.load(std::memory_order_relaxed);
+    while (sample > previous && !destination.compare_exchange_weak(previous, sample,
+        std::memory_order_relaxed, std::memory_order_relaxed)) {}
+}
+
 static void ResetPerformanceTelemetry()
 {
     g_gpu_prep_us = 0; g_gpu_nr_us = 0; g_gpu_sr_us = 0;
     g_gpu_fg_us = 0; g_gpu_cleanup_us = 0; g_gpu_total_us = 0;
     g_source_frame_avg_us = 0; g_source_frame_p99_us = 0; g_source_frame_max_us = 0;
     g_addon_cpu_current_us = 0; g_addon_cpu_avg_us = 0; g_addon_cpu_peak_us = 0;
+    g_gpu_vort_us = 0; g_gpu_feed_us = 0; g_gpu_guides_total_us = 0;
+    g_cpu_vort_submit_us = 0; g_cpu_feed_submit_us = 0; g_cpu_guide_flush_us = 0;
+    g_gpu_proxy_generated_us = 0; g_gpu_proxy_real_us = 0; g_gpu_proxy_total_us = 0;
+    g_cpu_proxy_mailbox_us = 0; g_cpu_proxy_fence_wait_us = 0; g_cpu_proxy_swap_wait_us = 0;
+    g_cpu_proxy_present_us = 0; g_cpu_proxy_worker_us = 0; g_cpu_proxy_worker_peak_us = 0;
     g_telemetry_samples = 0;
-    g_gpu_telemetry_available = false;
-    g_telemetry_pending = false;
+    g_guide_telemetry_samples = 0; g_proxy_telemetry_samples = 0;
+    g_gpu_telemetry_available = false; g_guide_gpu_telemetry_available = false;
+    g_proxy_gpu_telemetry_available = false;
+    // Proxy telemetry is owned by the presenter thread. Leave an in-flight
+    // query pending so its heap/readback slot cannot be reused by a UI reset.
+    g_telemetry_pending = false; g_guide_telemetry_pending = false;
     g_last_telemetry_log_tick = 0;
     g_source_frame_samples.fill(0);
     g_source_frame_sample_count = 0;
@@ -568,12 +623,17 @@ static bool InitializeGpuTelemetry()
     return true;
 }
 
+static unsigned int TimestampDeltaMicroseconds(UINT64 begin, UINT64 end, UINT64 frequency)
+{
+    if (end < begin || frequency == 0) return 0;
+    const long double microseconds = static_cast<long double>(end - begin) * 1000000.0L /
+        static_cast<long double>(frequency);
+    return static_cast<unsigned int>(std::min<long double>(microseconds, UINT_MAX));
+}
+
 static unsigned int TimestampDeltaMicroseconds(UINT64 begin, UINT64 end)
 {
-    if (end < begin || g_telemetry_timestamp_frequency == 0) return 0;
-    const long double microseconds = static_cast<long double>(end - begin) * 1000000.0L /
-        static_cast<long double>(g_telemetry_timestamp_frequency);
-    return static_cast<unsigned int>(std::min<long double>(microseconds, UINT_MAX));
+    return TimestampDeltaMicroseconds(begin, end, g_telemetry_timestamp_frequency);
 }
 
 static void ConsumeGpuTelemetry()
@@ -602,6 +662,144 @@ static void ConsumeGpuTelemetry()
     SmoothMicroseconds(g_gpu_total_us, TimestampDeltaMicroseconds(values[0], values[5]));
     ++g_telemetry_samples;
     g_gpu_telemetry_available = true;
+}
+
+static bool CreateTimestampResources(ID3D12Device *device, UINT count,
+    Microsoft::WRL::ComPtr<ID3D12QueryHeap> &query_heap,
+    Microsoft::WRL::ComPtr<ID3D12Resource> &readback)
+{
+    if (!device) return false;
+    D3D12_QUERY_HEAP_DESC query_desc = {};
+    query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    query_desc.Count = count;
+    HRESULT hr = device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&query_heap));
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC buffer = {};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = sizeof(UINT64) * count;
+    buffer.Height = 1; buffer.DepthOrArraySize = 1; buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1; buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (SUCCEEDED(hr)) hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE,
+        &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback));
+    if (FAILED(hr))
+    {
+        query_heap.Reset(); readback.Reset();
+        return false;
+    }
+    return true;
+}
+
+static bool InitializeGuideGpuTelemetry(ID3D12CommandQueue *queue)
+{
+    if (g_guide_telemetry_query_heap && g_guide_telemetry_readback &&
+        g_guide_telemetry_fence && g_guide_telemetry_frequency != 0)
+        return true;
+    if (!g_neural_device || !queue) return false;
+    UINT64 frequency = 0;
+    HRESULT hr = queue->GetTimestampFrequency(&frequency);
+    if (SUCCEEDED(hr) && !CreateTimestampResources(g_neural_device.Get(),
+        kGuideTelemetryQueryCount, g_guide_telemetry_query_heap, g_guide_telemetry_readback))
+        hr = E_FAIL;
+    if (SUCCEEDED(hr)) hr = g_neural_device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+        IID_PPV_ARGS(&g_guide_telemetry_fence));
+    if (FAILED(hr) || frequency == 0)
+    {
+        g_guide_telemetry_query_heap.Reset(); g_guide_telemetry_readback.Reset();
+        g_guide_telemetry_fence.Reset(); g_guide_telemetry_frequency = 0;
+        Log("guide telemetry unavailable: D3D12 timestamp setup failed hr=0x%08X frequency=%llu",
+            static_cast<unsigned int>(hr), frequency);
+        return false;
+    }
+    g_guide_telemetry_frequency = frequency;
+    Log("guide telemetry ready: VORT and feed GPU timestamps at %llu Hz", frequency);
+    return true;
+}
+
+static void ConsumeGuideGpuTelemetry()
+{
+    if (!g_guide_telemetry_pending || !g_guide_telemetry_fence ||
+        g_guide_telemetry_fence->GetCompletedValue() < g_guide_telemetry_fence_value ||
+        !g_guide_telemetry_readback) return;
+    UINT64 *timestamps = nullptr;
+    const D3D12_RANGE read_range = {0, sizeof(UINT64) * kGuideTelemetryQueryCount};
+    if (FAILED(g_guide_telemetry_readback->Map(0, &read_range,
+        reinterpret_cast<void **>(&timestamps))) || !timestamps)
+    {
+        g_guide_telemetry_pending = false;
+        return;
+    }
+    std::array<UINT64, kGuideTelemetryQueryCount> values = {};
+    memcpy(values.data(), timestamps, sizeof(values));
+    const D3D12_RANGE written_range = {0, 0};
+    g_guide_telemetry_readback->Unmap(0, &written_range);
+    g_guide_telemetry_pending = false;
+    SmoothMicroseconds(g_gpu_vort_us, TimestampDeltaMicroseconds(values[0], values[1], g_guide_telemetry_frequency));
+    SmoothMicroseconds(g_gpu_feed_us, TimestampDeltaMicroseconds(values[1], values[2], g_guide_telemetry_frequency));
+    SmoothMicroseconds(g_gpu_guides_total_us, TimestampDeltaMicroseconds(values[0], values[2], g_guide_telemetry_frequency));
+    ++g_guide_telemetry_samples;
+    g_guide_gpu_telemetry_available = true;
+}
+
+static bool InitializeProxyGpuTelemetry(ID3D12Device *device)
+{
+    if (g_proxy_telemetry_query_heap && g_proxy_telemetry_readback &&
+        g_proxy_telemetry_frequency != 0) return true;
+    if (!device || !g_command_queue) return false;
+    UINT64 frequency = 0;
+    HRESULT hr = g_command_queue->GetTimestampFrequency(&frequency);
+    if (SUCCEEDED(hr) && !CreateTimestampResources(device, kProxyTelemetryQueryCount,
+        g_proxy_telemetry_query_heap, g_proxy_telemetry_readback)) hr = E_FAIL;
+    if (FAILED(hr) || frequency == 0)
+    {
+        g_proxy_telemetry_query_heap.Reset(); g_proxy_telemetry_readback.Reset();
+        g_proxy_telemetry_frequency = 0;
+        Log("proxy telemetry unavailable: D3D12 timestamp setup failed hr=0x%08X frequency=%llu",
+            static_cast<unsigned int>(hr), frequency);
+        return false;
+    }
+    g_proxy_telemetry_frequency = frequency;
+    Log("proxy telemetry ready: compositor GPU timestamps at %llu Hz", frequency);
+    return true;
+}
+
+static void ConsumeProxyGpuTelemetry()
+{
+    if (!g_proxy_telemetry_pending || !g_proxy_fence ||
+        g_proxy_fence->GetCompletedValue() < g_proxy_telemetry_fence_value ||
+        !g_proxy_telemetry_readback) return;
+    UINT64 *timestamps = nullptr;
+    const D3D12_RANGE read_range = {0, sizeof(UINT64) * kProxyTelemetryQueryCount};
+    if (FAILED(g_proxy_telemetry_readback->Map(0, &read_range,
+        reinterpret_cast<void **>(&timestamps))) || !timestamps)
+    {
+        g_proxy_telemetry_pending = false;
+        return;
+    }
+    std::array<UINT64, kProxyTelemetryQueryCount> values = {};
+    memcpy(values.data(), timestamps, sizeof(values));
+    const D3D12_RANGE written_range = {0, 0};
+    g_proxy_telemetry_readback->Unmap(0, &written_range);
+    g_proxy_telemetry_pending = false;
+    if (g_proxy_telemetry_present_count == 2)
+    {
+        SmoothMicroseconds(g_gpu_proxy_generated_us,
+            TimestampDeltaMicroseconds(values[0], values[1], g_proxy_telemetry_frequency));
+        SmoothMicroseconds(g_gpu_proxy_real_us,
+            TimestampDeltaMicroseconds(values[2], values[3], g_proxy_telemetry_frequency));
+        SmoothMicroseconds(g_gpu_proxy_total_us,
+            TimestampDeltaMicroseconds(values[0], values[3], g_proxy_telemetry_frequency));
+    }
+    else
+    {
+        g_gpu_proxy_generated_us = 0;
+        SmoothMicroseconds(g_gpu_proxy_real_us,
+            TimestampDeltaMicroseconds(values[0], values[1], g_proxy_telemetry_frequency));
+        SmoothMicroseconds(g_gpu_proxy_total_us,
+            TimestampDeltaMicroseconds(values[0], values[1], g_proxy_telemetry_frequency));
+    }
+    ++g_proxy_telemetry_samples;
+    g_proxy_gpu_telemetry_available = true;
 }
 
 static bool NeuralGpuIdle()
@@ -2300,21 +2498,63 @@ static bool RenderCurrentFrameGuides(ID3D12Resource *backbuffer)
     reshade::api::command_list *commands = queue->get_immediate_command_list();
     const reshade::api::resource_view rtv = GetBackbufferRtv(backbuffer);
     if (!commands || !rtv.handle) return false;
+    auto *native_queue = reinterpret_cast<ID3D12CommandQueue *>(queue->get_native());
+    auto *native_commands = reinterpret_cast<ID3D12GraphicsCommandList *>(commands->get_native());
+    ConsumeGuideGpuTelemetry();
+    const bool record_gpu_telemetry = g_performance_telemetry_enabled &&
+        !g_guide_telemetry_pending && native_commands && native_queue &&
+        InitializeGuideGpuTelemetry(native_queue);
 
     // Present callbacks happen before ReShade's normal effect pass. Render the
     // optical-flow provider and packer now, then submit them before NGX work.
     const reshade::api::resource resource = {reinterpret_cast<uint64_t>(backbuffer)};
+    LARGE_INTEGER begin = {}, end = {};
+    if (record_gpu_telemetry)
+        native_commands->EndQuery(g_guide_telemetry_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
     commands->barrier(resource, reshade::api::resource_usage::present, reshade::api::resource_usage::render_target);
+    if (g_performance_telemetry_enabled) QueryPerformanceCounter(&begin);
     g_runtime->render_technique(g_motion_technique, commands, rtv);
+    if (g_performance_telemetry_enabled)
+    {
+        QueryPerformanceCounter(&end);
+        SmoothMicroseconds(g_cpu_vort_submit_us, CounterDeltaMicroseconds(begin, end));
+    }
+    if (record_gpu_telemetry)
+        native_commands->EndQuery(g_guide_telemetry_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
     if (g_nr_mask_strength_variable.handle)
         g_runtime->set_uniform_value_float(g_nr_mask_strength_variable, g_nr_rejection_mask_strength);
+    if (g_performance_telemetry_enabled) QueryPerformanceCounter(&begin);
     g_runtime->render_technique(g_feed_technique, commands, rtv);
+    if (g_performance_telemetry_enabled)
+    {
+        QueryPerformanceCounter(&end);
+        SmoothMicroseconds(g_cpu_feed_submit_us, CounterDeltaMicroseconds(begin, end));
+    }
+    if (record_gpu_telemetry)
+    {
+        native_commands->EndQuery(g_guide_telemetry_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
+        native_commands->ResolveQueryData(g_guide_telemetry_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+            0, kGuideTelemetryQueryCount, g_guide_telemetry_readback.Get(), 0);
+    }
     commands->barrier(resource, reshade::api::resource_usage::render_target, reshade::api::resource_usage::present);
+    if (g_performance_telemetry_enabled) QueryPerformanceCounter(&begin);
     queue->flush_immediate_command_list();
+    if (g_performance_telemetry_enabled)
+    {
+        QueryPerformanceCounter(&end);
+        SmoothMicroseconds(g_cpu_guide_flush_us, CounterDeltaMicroseconds(begin, end));
+    }
+    if (record_gpu_telemetry)
+    {
+        const UINT64 value = ++g_guide_telemetry_fence_value;
+        if (SUCCEEDED(native_queue->Signal(g_guide_telemetry_fence.Get(), value)))
+            g_guide_telemetry_pending = true;
+        else
+            Log("guide telemetry fence signal failed; sample discarded");
+    }
 
     // The runtime normally owns the same native queue as the Present callback.
     // Preserve ordering explicitly if an unusual game exposes a second queue.
-    auto *native_queue = reinterpret_cast<ID3D12CommandQueue *>(queue->get_native());
     if (native_queue && native_queue != g_command_queue)
     {
         const UINT64 value = ++g_neural_fence_value;
@@ -2364,6 +2604,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     // the game continues presenting and reuses the last completed output.
     if (g_proxy_present_request_state.load(std::memory_order_acquire) != 0)
     {
+        ++g_neural_presenter_deferrals;
         const unsigned long long skipped = ++g_neural_busy_frame_skips;
         if (skipped <= 8 || skipped % 600 == 0)
             Log("neural frame deferred for async proxy presenter (skip=%llu)", skipped);
@@ -2377,6 +2618,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     }
     if (!NeuralGpuIdle())
     {
+        ++g_neural_gpu_deferrals;
         const unsigned long long skipped = ++g_neural_busy_frame_skips;
         if (skipped <= 8 || skipped % 600 == 0)
             Log("neural frame skipped without blocking Present: GPU work still active (skip=%llu completed=%llu submitted=%llu)",
@@ -2963,6 +3205,22 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
             g_gpu_cleanup_us.load() / 1000.0f, g_gpu_total_us.load() / 1000.0f,
             g_neural_busy_frame_skips.load(), g_proxy_busy_frame_skips.load(),
             g_proxy_present_coalesced.load(), g_proxy_present_timeouts.load());
+        Log("performance guides: GPU VORT=%.3fms feed/masks=%.3fms total=%.3fms samples=%llu available=%u; CPU record VORT=%.3fms feed=%.3fms flush=%.3fms",
+            g_gpu_vort_us.load() / 1000.0f, g_gpu_feed_us.load() / 1000.0f,
+            g_gpu_guides_total_us.load() / 1000.0f, g_guide_telemetry_samples.load(),
+            g_guide_gpu_telemetry_available.load() ? 1u : 0u,
+            g_cpu_vort_submit_us.load() / 1000.0f, g_cpu_feed_submit_us.load() / 1000.0f,
+            g_cpu_guide_flush_us.load() / 1000.0f);
+        Log("performance proxy: GPU generated=%.3fms real=%.3fms pair=%.3fms samples=%llu available=%u; CPU mailbox=%.3fms fence_wait=%.3fms swap_wait=%.3fms Present=%.3fms worker=%.3fms peak=%.3fms; requests=%llu completed=%llu coalesced=%llu timeouts=%llu; neural deferrals presenter=%llu GPU=%llu",
+            g_gpu_proxy_generated_us.load() / 1000.0f, g_gpu_proxy_real_us.load() / 1000.0f,
+            g_gpu_proxy_total_us.load() / 1000.0f, g_proxy_telemetry_samples.load(),
+            g_proxy_gpu_telemetry_available.load() ? 1u : 0u,
+            g_cpu_proxy_mailbox_us.load() / 1000.0f, g_cpu_proxy_fence_wait_us.load() / 1000.0f,
+            g_cpu_proxy_swap_wait_us.load() / 1000.0f, g_cpu_proxy_present_us.load() / 1000.0f,
+            g_cpu_proxy_worker_us.load() / 1000.0f, g_cpu_proxy_worker_peak_us.load() / 1000.0f,
+            g_proxy_present_requests.load(), g_proxy_present_completed.load(),
+            g_proxy_present_coalesced.load(), g_proxy_present_timeouts.load(),
+            g_neural_presenter_deferrals.load(), g_neural_gpu_deferrals.load());
     }
 }
 
@@ -3152,6 +3410,8 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
     }
     Microsoft::WRL::ComPtr<ID3D12Device> device;
     if (SUCCEEDED(hr)) { failed_stage = "ID3D12CommandQueue::GetDevice"; hr = g_command_queue->GetDevice(IID_PPV_ARGS(&device)); }
+    if (SUCCEEDED(hr) && g_performance_telemetry_enabled)
+        InitializeProxyGpuTelemetry(device.Get());
     for (UINT index = 0; index < 2 && SUCCEEDED(hr); ++index)
     {
         failed_stage = "CreateCommandAllocator";
@@ -3347,6 +3607,8 @@ static bool PresentProxyFrameOnWorker()
     };
     const UINT present_count = use_framegen ? 2u : 1u;
 
+    LARGE_INTEGER wait_begin = {}, wait_end = {};
+    if (g_performance_telemetry_enabled) QueryPerformanceCounter(&wait_begin);
     if (g_proxy_fence_value != 0 && g_proxy_fence->GetCompletedValue() < g_proxy_fence_value)
     {
         if (FAILED(g_proxy_fence->SetEventOnCompletion(g_proxy_fence_value, g_proxy_fence_event)) ||
@@ -3359,8 +3621,18 @@ static bool PresentProxyFrameOnWorker()
             return false;
         }
     }
+    if (g_performance_telemetry_enabled)
+    {
+        QueryPerformanceCounter(&wait_end);
+        SmoothMicroseconds(g_cpu_proxy_fence_wait_us, CounterDeltaMicroseconds(wait_begin, wait_end));
+    }
+    ConsumeProxyGpuTelemetry();
+    const bool record_proxy_gpu = g_performance_telemetry_enabled &&
+        !g_proxy_telemetry_pending && g_proxy_telemetry_query_heap && g_proxy_telemetry_readback;
     Microsoft::WRL::ComPtr<ID3D12Device> device;
     if (FAILED(g_command_queue->GetDevice(IID_PPV_ARGS(&device)))) return false;
+    if (g_performance_telemetry_enabled)
+        InitializeProxyGpuTelemetry(device.Get());
     float cursor_x = -1000.0f, cursor_y = -1000.0f;
     static float previous_cursor_x = -1000.0f, previous_cursor_y = -1000.0f;
     if (g_reshade_overlay_open.load())
@@ -3395,6 +3667,7 @@ static bool PresentProxyFrameOnWorker()
 
     for (UINT present_index = 0; present_index < present_count; ++present_index)
     {
+        if (g_performance_telemetry_enabled) QueryPerformanceCounter(&wait_begin);
         if (g_proxy_frame_latency_waitable == nullptr ||
             WaitForSingleObject(g_proxy_frame_latency_waitable, 50) != WAIT_OBJECT_0)
         {
@@ -3402,6 +3675,11 @@ static bool PresentProxyFrameOnWorker()
             if (timeouts <= 8 || timeouts % 120 == 0)
                 Log("async proxy presenter timed out waiting for a swapchain slot (timeout=%llu)", timeouts);
             return false;
+        }
+        if (g_performance_telemetry_enabled)
+        {
+            QueryPerformanceCounter(&wait_end);
+            SmoothMicroseconds(g_cpu_proxy_swap_wait_us, CounterDeltaMicroseconds(wait_begin, wait_end));
         }
         ID3D12CommandAllocator *allocator = g_proxy_allocators[present_index].Get();
         ID3D12GraphicsCommandList *list = g_proxy_lists[present_index].Get();
@@ -3435,6 +3713,8 @@ static bool PresentProxyFrameOnWorker()
             Transition(neural_source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
             Transition(original_source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, original_base_state)
         };
+        if (record_proxy_gpu)
+            list->EndQuery(g_proxy_telemetry_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, present_index * 2);
         list->ResourceBarrier(3, barriers);
         ID3D12DescriptorHeap *heaps[] = {g_proxy_srv_heap.Get()}; list->SetDescriptorHeaps(1, heaps);
         list->SetGraphicsRootSignature(g_proxy_root_signature.Get()); list->SetPipelineState(g_proxy_pipeline.Get());
@@ -3447,12 +3727,25 @@ static bool PresentProxyFrameOnWorker()
         list->OMSetRenderTargets(1, &rtv, FALSE, nullptr); list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         list->DrawInstanced(3, 1, 0, 0);
         list->ResourceBarrier(3, barriers + 3);
+        if (record_proxy_gpu)
+        {
+            const UINT query_index = present_index * 2;
+            list->EndQuery(g_proxy_telemetry_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query_index + 1);
+            list->ResolveQueryData(g_proxy_telemetry_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                query_index, 2, g_proxy_telemetry_readback.Get(), sizeof(UINT64) * query_index);
+        }
         if (FAILED(list->Close())) return false;
         ID3D12CommandList *lists[] = {list};
         g_command_queue->ExecuteCommandLists(1, lists);
         ++g_proxy_fence_value; g_command_queue->Signal(g_proxy_fence.Get(), g_proxy_fence_value);
         const UINT present_flags = g_proxy_allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0u;
+        if (g_performance_telemetry_enabled) QueryPerformanceCounter(&wait_begin);
         const HRESULT present_result = g_proxy_swapchain->Present(0, present_flags);
+        if (g_performance_telemetry_enabled)
+        {
+            QueryPerformanceCounter(&wait_end);
+            SmoothMicroseconds(g_cpu_proxy_present_us, CounterDeltaMicroseconds(wait_begin, wait_end));
+        }
         if (FAILED(present_result))
         {
             Log("proxy DXGI Present failed: 0x%08X; proxy quarantined and game surface restored",
@@ -3465,6 +3758,12 @@ static bool PresentProxyFrameOnWorker()
         }
         ++g_frames_presented;
         UpdateOutputFps();
+    }
+    if (record_proxy_gpu)
+    {
+        g_proxy_telemetry_fence_value = g_proxy_fence_value;
+        g_proxy_telemetry_present_count = present_count;
+        g_proxy_telemetry_pending = true;
     }
     if (legacy)
     {
@@ -3503,11 +3802,33 @@ static DWORD WINAPI ProxyPresentationThread(void *)
                 std::memory_order_acq_rel, std::memory_order_acquire))
             continue;
 
-        if (!PresentProxyFrameOnWorker())
+        LARGE_INTEGER worker_begin = {}, worker_end = {};
+        if (g_performance_telemetry_enabled)
+        {
+            QueryPerformanceCounter(&worker_begin);
+            LARGE_INTEGER queued = {};
+            queued.QuadPart = g_proxy_request_qpc.exchange(0, std::memory_order_acq_rel);
+            if (queued.QuadPart != 0)
+                SmoothMicroseconds(g_cpu_proxy_mailbox_us,
+                    CounterDeltaMicroseconds(queued, worker_begin));
+        }
+        const bool presented = PresentProxyFrameOnWorker();
+        if (!presented)
         {
             const unsigned long long skipped = ++g_proxy_busy_frame_skips;
             if (skipped <= 8 || skipped % 120 == 0)
                 Log("async proxy presentation request dropped safely (skip=%llu)", skipped);
+        }
+        else
+        {
+            ++g_proxy_present_completed;
+        }
+        if (g_performance_telemetry_enabled)
+        {
+            QueryPerformanceCounter(&worker_end);
+            const unsigned int duration = CounterDeltaMicroseconds(worker_begin, worker_end);
+            SmoothMicroseconds(g_cpu_proxy_worker_us, duration);
+            RecordPeakMicroseconds(g_cpu_proxy_worker_peak_us, duration);
         }
         g_proxy_present_request_state.store(0, std::memory_order_release);
     }
@@ -3533,6 +3854,13 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
         // pipeline output. Coalesce repeats instead of blocking the game.
         ++g_proxy_present_coalesced;
         return true;
+    }
+    ++g_proxy_present_requests;
+    if (g_performance_telemetry_enabled)
+    {
+        LARGE_INTEGER queued = {};
+        QueryPerformanceCounter(&queued);
+        g_proxy_request_qpc.store(queued.QuadPart, std::memory_order_release);
     }
     if (!SetEvent(g_proxy_present_event))
     {
@@ -4126,6 +4454,30 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         }
         else
             ImGui::TextDisabled("Pipeline GPU: warming up or timestamp queries unavailable");
+        if (g_guide_gpu_telemetry_available.load())
+            ImGui::Text("Guides GPU: VORT %.3f | feed/masks %.3f | total %.3f ms (%llu samples)",
+                g_gpu_vort_us.load() / 1000.0f, g_gpu_feed_us.load() / 1000.0f,
+                g_gpu_guides_total_us.load() / 1000.0f, g_guide_telemetry_samples.load());
+        else
+            ImGui::TextDisabled("Guides GPU: inactive or timestamp queries unavailable");
+        ImGui::Text("Guides CPU record: VORT %.3f | feed %.3f | flush %.3f ms",
+            g_cpu_vort_submit_us.load() / 1000.0f, g_cpu_feed_submit_us.load() / 1000.0f,
+            g_cpu_guide_flush_us.load() / 1000.0f);
+        if (g_proxy_gpu_telemetry_available.load())
+            ImGui::Text("Proxy GPU: generated %.3f | real %.3f | pair %.3f ms (%llu samples)",
+                g_gpu_proxy_generated_us.load() / 1000.0f, g_gpu_proxy_real_us.load() / 1000.0f,
+                g_gpu_proxy_total_us.load() / 1000.0f, g_proxy_telemetry_samples.load());
+        else
+            ImGui::TextDisabled("Proxy GPU: warming up or timestamp queries unavailable");
+        ImGui::Text("Proxy CPU: mailbox %.3f | fence %.3f | swap %.3f | Present %.3f | worker %.3f ms",
+            g_cpu_proxy_mailbox_us.load() / 1000.0f, g_cpu_proxy_fence_wait_us.load() / 1000.0f,
+            g_cpu_proxy_swap_wait_us.load() / 1000.0f, g_cpu_proxy_present_us.load() / 1000.0f,
+            g_cpu_proxy_worker_us.load() / 1000.0f);
+        ImGui::Text("Proxy flow: requests %llu | completed %llu | coalesced %llu | timeouts %llu",
+            g_proxy_present_requests.load(), g_proxy_present_completed.load(),
+            g_proxy_present_coalesced.load(), g_proxy_present_timeouts.load());
+        ImGui::Text("Neural deferrals: presenter %llu | GPU %llu",
+            g_neural_presenter_deferrals.load(), g_neural_gpu_deferrals.load());
         ImGui::Text("Dropped enhancement work: neural busy %llu | proxy busy %llu",
             g_neural_busy_frame_skips.load(), g_proxy_busy_frame_skips.load());
     }
@@ -4284,6 +4636,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             g_proxy_lists[index].Reset();
             g_proxy_allocators[index].Reset();
         }
+        g_proxy_telemetry_readback.Reset(); g_proxy_telemetry_query_heap.Reset();
         g_proxy_fence.Reset(); g_proxy_swapchain.Reset();
         UpdateProxyCursorClip(false);
         if (g_proxy_window) PostMessageW(g_proxy_window, WM_CLOSE, 0, 0);
@@ -4303,6 +4656,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         g_legacy_fence11.Reset(); g_legacy_fence12.Reset(); g_legacy_context4.Reset();
         g_legacy_context11.Reset(); g_legacy_device11.Reset();
         g_fg_stage.Reset(); g_sr_stage.Reset(); g_nr_stage.Reset(); g_packed_color.Reset();
+        g_guide_telemetry_fence.Reset(); g_guide_telemetry_readback.Reset();
+        g_guide_telemetry_query_heap.Reset();
         g_telemetry_readback.Reset(); g_telemetry_query_heap.Reset();
         g_neural_list.Reset(); g_neural_allocator.Reset(); g_neural_fence.Reset(); g_neural_device.Reset();
         if (g_neural_fence_event) CloseHandle(g_neural_fence_event);
