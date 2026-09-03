@@ -30,7 +30,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.26-windowed-virtualization-prototype"
+#define ADDON_VERSION "1.7.27-windowed-runtime-set-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -971,21 +971,44 @@ static std::vector<std::wstring> RuntimeSearchDirectories()
     return candidates;
 }
 
-static bool FindStandaloneRuntimeFile(const wchar_t *name, wchar_t (&path)[MAX_PATH], bool required)
+static bool RuntimeFileExists(const wchar_t *path)
+{
+    const DWORD attributes = GetFileAttributesW(path);
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+        (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+static bool FindStandaloneRuntimeSet(wchar_t (&nr_path)[MAX_PATH],
+    wchar_t (&dlss_path)[MAX_PATH], wchar_t (&dlssg_path)[MAX_PATH],
+    wchar_t (&bridge_path)[MAX_PATH], bool &have_dlssg)
 {
     for (const std::wstring &directory : RuntimeSearchDirectories())
     {
-        wchar_t candidate[MAX_PATH] = {};
-        BuildRuntimePath(candidate, directory.c_str(), name);
-        Log("runtime search candidate: %ls", candidate);
-        const DWORD attributes = GetFileAttributesW(candidate);
-        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
-        {
-            wcscpy_s(path, candidate);
-            return true;
-        }
+        wchar_t candidate_nr[MAX_PATH] = {}, candidate_dlss[MAX_PATH] = {};
+        wchar_t candidate_dlssg[MAX_PATH] = {}, candidate_bridge[MAX_PATH] = {};
+        BuildRuntimePath(candidate_nr, directory.c_str(), L"nvngx_dlssnr.dll");
+        BuildRuntimePath(candidate_dlss, directory.c_str(), L"nvngx_dlss.dll");
+        BuildRuntimePath(candidate_dlssg, directory.c_str(), L"nvngx_dlssg.dll");
+        BuildRuntimePath(candidate_bridge, directory.c_str(), L"nvngx.dll");
+        const bool nr = RuntimeFileExists(candidate_nr);
+        const bool dlss = RuntimeFileExists(candidate_dlss);
+        const bool dlssg = RuntimeFileExists(candidate_dlssg);
+        const bool bridge = RuntimeFileExists(candidate_bridge);
+        Log("runtime set candidate: %ls [NR=%s SR=%s FG=%s bridge=%s]",
+            directory.c_str(), nr ? "yes" : "no", dlss ? "yes" : "no",
+            dlssg ? "yes" : "no", bridge ? "yes" : "no");
+        if (!nr || !dlss || !bridge)
+            continue;
+
+        wcscpy_s(nr_path, candidate_nr);
+        wcscpy_s(dlss_path, candidate_dlss);
+        wcscpy_s(bridge_path, candidate_bridge);
+        have_dlssg = dlssg;
+        if (dlssg) wcscpy_s(dlssg_path, candidate_dlssg);
+        Log("selected coherent standalone runtime set: %ls", directory.c_str());
+        return true;
     }
-    Log("%s runtime not found: %ls", required ? "required" : "optional", name);
+    Log("no directory contains the complete standalone NR + SR + bridge runtime set");
     return false;
 }
 
@@ -993,11 +1016,8 @@ static bool InitializeNgx()
 {
     if (g_ngx_params != nullptr) return true;
     wchar_t nr_path[MAX_PATH] = {}, dlss_path[MAX_PATH] = {}, dlssg_path[MAX_PATH] = {}, bridge_path[MAX_PATH] = {};
-    const bool have_nr = FindStandaloneRuntimeFile(L"nvngx_dlssnr.dll", nr_path, true);
-    const bool have_dlss = FindStandaloneRuntimeFile(L"nvngx_dlss.dll", dlss_path, true);
-    const bool have_dlssg = FindStandaloneRuntimeFile(L"nvngx_dlssg.dll", dlssg_path, false);
-    const bool have_bridge = FindStandaloneRuntimeFile(L"nvngx.dll", bridge_path, true);
-    if (!have_nr || !have_dlss || !have_bridge)
+    bool have_dlssg = false;
+    if (!FindStandaloneRuntimeSet(nr_path, dlss_path, dlssg_path, bridge_path, have_dlssg))
     {
         Fail("required private runtime dependency missing", ERROR_FILE_NOT_FOUND);
         return false;
