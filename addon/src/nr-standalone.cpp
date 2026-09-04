@@ -32,7 +32,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "2.0.2"
+#define ADDON_VERSION "2.0.3"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -400,8 +400,8 @@ static ColorProfile g_color_profile = ColorProfile::Auto;
 static ColorProfile g_active_color_profile = ColorProfile::Srgb;
 static reshade::api::color_space g_detected_color_space = reshade::api::color_space::unknown;
 static DXGI_FORMAT g_detected_swapchain_format = DXGI_FORMAT_UNKNOWN;
-static DlssRenderPreset g_dlss_render_preset = DlssRenderPreset::Default;
-static DlssRenderPreset g_active_dlss_render_preset = DlssRenderPreset::Default;
+static DlssRenderPreset g_dlss_render_preset = DlssRenderPreset::L;
+static DlssRenderPreset g_active_dlss_render_preset = DlssRenderPreset::L;
 static bool g_dlss_render_preset_hotkey_down;
 static bool g_nr_model_hotkey_down;
 static int g_active_dlss_quality = -1;
@@ -413,6 +413,7 @@ static float g_nr_local_structure = 1.0f;
 static float g_nr_skin_structure = -1.0f;
 static bool g_reset_every_frame = false;
 static bool g_stable_sr_history = false;
+static bool g_vort_guides_enabled = false;
 static bool g_nr_rejection_mask_enabled = false;
 static float g_nr_rejection_mask_strength = 1.0f;
 static bool g_nr_enabled = true;
@@ -441,7 +442,7 @@ static reshade::api::effect_texture_variable g_nr_mask_variable;
 static reshade::api::effect_uniform_variable g_nr_mask_strength_variable;
 struct BackbufferView
 {
-    ID3D12Resource *resource;
+    uint64_t resource;
     reshade::api::resource_view rtv;
 };
 static std::vector<BackbufferView> g_backbuffer_views;
@@ -474,6 +475,15 @@ static Microsoft::WRL::ComPtr<ID3D12Fence> g_legacy_fence12;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> g_legacy_input11;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> g_legacy_post11;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_legacy_post12;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> g_legacy_motion11;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> g_legacy_depth11;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> g_legacy_mask11;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> g_legacy_nr_mask11;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> g_legacy_source_motion11;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> g_legacy_source_depth11;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> g_legacy_source_mask11;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> g_legacy_source_nr_mask11;
+static bool g_legacy_guides_ready;
 static Microsoft::WRL::ComPtr<IDirect3DDevice9> g_legacy_device9;
 static Microsoft::WRL::ComPtr<IDirect3DTexture9> g_legacy_input9;
 static Microsoft::WRL::ComPtr<IDirect3DTexture9> g_legacy_post9;
@@ -627,9 +637,9 @@ static const char *DlssRenderPresetDescription(DlssRenderPreset preset)
     case DlssRenderPreset::J:
         return "Slightly less ghosting than K, but more flickering; useful for testing motion trails.";
     case DlssRenderPreset::K:
-        return "Recommended high-quality preset for DLAA, Quality, and Balanced; stable but relatively expensive.";
+        return "High-quality preset for DLAA, Quality, and Balanced, but testing showed more smearing than L.";
     case DlssRenderPreset::L:
-        return "Sharpest and most stable at extreme scaling with less ghosting, but the highest performance cost.";
+        return "Recommended default: sharpest and most stable at 1080p/1440p reconstruction, with the least observed smearing.";
     case DlssRenderPreset::M:
         return "Performance-oriented modern preset with L-like image improvements at speed closer to J/K.";
     default:
@@ -643,7 +653,7 @@ static const char *DlssRenderPresetRole(DlssRenderPreset preset)
     {
     case DlssRenderPreset::J: return "QUALITY ALTERNATIVE";
     case DlssRenderPreset::K: return "DLAA QUALITY BALANCED";
-    case DlssRenderPreset::L: return "ULTRA PERFORMANCE";
+    case DlssRenderPreset::L: return "RECOMMENDED / LEAST SMEARING";
     case DlssRenderPreset::M: return "PERFORMANCE";
     default: return "NVIDIA AUTO";
     }
@@ -1983,6 +1993,9 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
     g_nr_mask_available = false;
     g_pending_proxy_frame = false;
     g_captured_motion.Reset(); g_captured_depth.Reset(); g_captured_mask.Reset(); g_captured_nr_mask.Reset();
+    g_legacy_source_motion11.Reset(); g_legacy_source_depth11.Reset();
+    g_legacy_source_mask11.Reset(); g_legacy_source_nr_mask11.Reset();
+    g_legacy_guides_ready = false;
     g_fallback_motion.Reset(); g_fallback_depth.Reset();
     ReleaseLegacyFrameResources();
     g_fg_stage.Reset(); g_sr_stage.Reset(); g_nr_stage.Reset();
@@ -2015,6 +2028,11 @@ static void ReleaseLegacyFrameResources()
     g_legacy_input9.Reset(); g_legacy_post9.Reset();
     g_legacy_input9_11.Reset(); g_legacy_post9_11.Reset();
     g_legacy_input11.Reset(); g_legacy_post11.Reset(); g_legacy_post12.Reset();
+    g_legacy_motion11.Reset(); g_legacy_depth11.Reset();
+    g_legacy_mask11.Reset(); g_legacy_nr_mask11.Reset();
+    g_legacy_source_motion11.Reset(); g_legacy_source_depth11.Reset();
+    g_legacy_source_mask11.Reset(); g_legacy_source_nr_mask11.Reset();
+    g_legacy_guides_ready = false;
     g_legacy_width = g_legacy_height = 0;
     g_legacy_format = DXGI_FORMAT_UNKNOWN;
 }
@@ -2426,6 +2444,34 @@ static bool BuildLegacyFrameResources(UINT width, UINT height, DXGI_FORMAT forma
     if (!CreateSharedPair11(width, height, format, g_packed_color, g_legacy_input11) ||
         !CreateSharedPair11(width, height, format, g_legacy_post12, g_legacy_post11))
         return false;
+    if (g_present_api == reshade::api::device_api::d3d11)
+    {
+        // ReShade renders the guide effects on the game's D3D11 device, while
+        // NGX runs on our private D3D12 queue. Keep shared copies with the exact
+        // formats exported by DLSS5_AIO_Feed.fx so D3D11 games can use the same
+        // current-frame VORT contract as native D3D12 games.
+        if (!CreateSharedPair11(width, height, DXGI_FORMAT_R16G16_FLOAT,
+                g_captured_motion, g_legacy_motion11) ||
+            !CreateSharedPair11(width, height, DXGI_FORMAT_R32_FLOAT,
+                g_captured_depth, g_legacy_depth11))
+        {
+            Log("legacy D3D11 guide bridge could not create required motion/depth resources");
+            g_captured_motion.Reset(); g_captured_depth.Reset();
+            g_legacy_motion11.Reset(); g_legacy_depth11.Reset();
+        }
+        if (!CreateSharedPair11(width, height, DXGI_FORMAT_R8_UNORM,
+                g_captured_mask, g_legacy_mask11))
+        {
+            g_captured_mask.Reset(); g_legacy_mask11.Reset();
+            Log("legacy D3D11 guide bridge continuing without optional DLSS history mask");
+        }
+        if (!CreateSharedPair11(width, height, DXGI_FORMAT_R8_UNORM,
+                g_captured_nr_mask, g_legacy_nr_mask11))
+        {
+            g_captured_nr_mask.Reset(); g_legacy_nr_mask11.Reset();
+            Log("legacy D3D11 guide bridge continuing without optional NR control mask");
+        }
+    }
     if (g_present_api == reshade::api::device_api::d3d9)
     {
         if (!CreateD3D9SharedStage(width, height, format, g_legacy_input9, g_legacy_input9_11) ||
@@ -2931,8 +2977,7 @@ static void OnRenderTechnique(reshade::api::effect_runtime *runtime, reshade::ap
 {
     using namespace reshade::api;
     if (!g_enabled || g_neural_failed || runtime != g_runtime || !g_feed_technique.handle ||
-        technique.handle != g_feed_technique.handle ||
-        runtime->get_device()->get_api() != device_api::d3d12) return;
+        technique.handle != g_feed_technique.handle) return;
     resource_view mv_srv = {}, mv_srgb = {}, depth_srv = {}, depth_srgb = {}, mask_srv = {}, mask_srgb = {};
     resource_view nr_mask_srv = {}, nr_mask_srgb = {};
     runtime->get_texture_binding(g_mv_variable, &mv_srv, &mv_srgb);
@@ -2941,6 +2986,53 @@ static void OnRenderTechnique(reshade::api::effect_runtime *runtime, reshade::ap
     if (g_nr_mask_variable.handle) runtime->get_texture_binding(g_nr_mask_variable, &nr_mask_srv, &nr_mask_srgb);
     auto *device = runtime->get_device();
     const resource backbuffer_resource = device->get_resource_from_view(rtv);
+    const device_api api = device->get_api();
+    if (api == device_api::d3d11)
+    {
+        const auto get_texture11 = [device](resource_view view) {
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+            const resource native = view.handle ? device->get_resource_from_view(view) : resource {};
+            if (native.handle)
+                reinterpret_cast<IUnknown *>(native.handle)->QueryInterface(IID_PPV_ARGS(&texture));
+            return texture;
+        };
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> backbuffer;
+        if (backbuffer_resource.handle)
+            reinterpret_cast<IUnknown *>(backbuffer_resource.handle)->QueryInterface(IID_PPV_ARGS(&backbuffer));
+        auto motion = get_texture11(mv_srv);
+        auto depth = get_texture11(depth_srv);
+        auto mask = get_texture11(mask_srv);
+        auto nr_mask = get_texture11(nr_mask_srv);
+        if (!backbuffer || !motion || !depth) return;
+        D3D11_TEXTURE2D_DESC color_desc = {}, mv_desc = {}, depth_desc = {};
+        backbuffer->GetDesc(&color_desc); motion->GetDesc(&mv_desc); depth->GetDesc(&depth_desc);
+        if (color_desc.SampleDesc.Count != 1 || mv_desc.Width != color_desc.Width ||
+            mv_desc.Height != color_desc.Height || depth_desc.Width != color_desc.Width ||
+            depth_desc.Height != color_desc.Height || mv_desc.Format != DXGI_FORMAT_R16G16_FLOAT ||
+            depth_desc.Format != DXGI_FORMAT_R32_FLOAT)
+        {
+            static bool logged11 = false;
+            if (!logged11)
+            {
+                logged11 = true;
+                Log("D3D11 guide mismatch: color=%ux%u fmt=%u samples=%u mv=%ux%u fmt=%u depth=%ux%u fmt=%u",
+                    color_desc.Width, color_desc.Height, static_cast<unsigned int>(color_desc.Format), color_desc.SampleDesc.Count,
+                    mv_desc.Width, mv_desc.Height, static_cast<unsigned int>(mv_desc.Format),
+                    depth_desc.Width, depth_desc.Height, static_cast<unsigned int>(depth_desc.Format));
+            }
+            return;
+        }
+        const bool first_capture = !g_legacy_source_motion11 || !g_legacy_source_depth11;
+        g_legacy_source_motion11 = motion;
+        g_legacy_source_depth11 = depth;
+        g_legacy_source_mask11 = mask;
+        g_legacy_source_nr_mask11 = nr_mask;
+        if (first_capture)
+            Log("captured D3D11 DLSS5_AIO_Feed sources for shared guide bridge: %ux%u; masks=%s/%s",
+                color_desc.Width, color_desc.Height, mask ? "DLSS" : "missing", nr_mask ? "NR" : "missing");
+        return;
+    }
+    if (api != device_api::d3d12) return;
     auto *backbuffer = reinterpret_cast<ID3D12Resource *>(backbuffer_resource.handle);
     auto *motion = reinterpret_cast<ID3D12Resource *>(device->get_resource_from_view(mv_srv).handle);
     auto *depth = reinterpret_cast<ID3D12Resource *>(device->get_resource_from_view(depth_srv).handle);
@@ -2980,13 +3072,13 @@ static void OnRenderTechnique(reshade::api::effect_runtime *runtime, reshade::ap
             g_mask_available ? "active" : "missing", g_nr_mask_available ? "active" : "missing");
 }
 
-static reshade::api::resource_view GetBackbufferRtv(ID3D12Resource *backbuffer)
+static reshade::api::resource_view GetBackbufferRtv(uint64_t backbuffer)
 {
     for (const BackbufferView &entry : g_backbuffer_views)
         if (entry.resource == backbuffer) return entry.rtv;
     if (!g_runtime) return {};
     reshade::api::resource_view rtv = {};
-    const reshade::api::resource resource = {reinterpret_cast<uint64_t>(backbuffer)};
+    const reshade::api::resource resource = {backbuffer};
     if (!g_runtime->get_device()->create_resource_view(resource, reshade::api::resource_usage::render_target,
             reshade::api::resource_view_desc {}, &rtv))
     {
@@ -2999,15 +3091,16 @@ static reshade::api::resource_view GetBackbufferRtv(ID3D12Resource *backbuffer)
 }
 
 static bool CapturedGuidesMatchInput();
+static bool CopyLegacyGuidesToD3D12();
 
 static bool RenderCurrentFrameGuides(ID3D12Resource *backbuffer)
 {
-    if (!g_runtime || !g_motion_technique.handle || !g_feed_technique.handle ||
+    if (!g_vort_guides_enabled || !g_runtime || !g_motion_technique.handle || !g_feed_technique.handle ||
         !g_mv_variable.handle || !g_depth_variable.handle) return false;
     reshade::api::command_queue *queue = g_runtime->get_command_queue();
     if (!queue) return false;
     reshade::api::command_list *commands = queue->get_immediate_command_list();
-    const reshade::api::resource_view rtv = GetBackbufferRtv(backbuffer);
+    const reshade::api::resource_view rtv = GetBackbufferRtv(reinterpret_cast<uint64_t>(backbuffer));
     if (!commands || !rtv.handle) return false;
     auto *native_queue = reinterpret_cast<ID3D12CommandQueue *>(queue->get_native());
     auto *native_commands = reinterpret_cast<ID3D12GraphicsCommandList *>(commands->get_native());
@@ -3083,6 +3176,38 @@ static bool RenderCurrentFrameGuides(ID3D12Resource *backbuffer)
     return CapturedGuidesMatchInput();
 }
 
+static bool RenderLegacyCurrentFrameGuides(reshade::api::resource backbuffer)
+{
+    using namespace reshade::api;
+    if (!g_vort_guides_enabled || !backbuffer.handle || !g_runtime ||
+        g_runtime->get_device()->get_api() != device_api::d3d11 ||
+        !g_motion_technique.handle || !g_feed_technique.handle ||
+        !g_mv_variable.handle || !g_depth_variable.handle)
+        return false;
+    command_queue *queue = g_runtime->get_command_queue();
+    command_list *commands = queue ? queue->get_immediate_command_list() : nullptr;
+    const resource_view rtv = GetBackbufferRtv(backbuffer.handle);
+    if (!queue || !commands || !rtv.handle) return false;
+
+    // Match the native-D3D12 ordering: estimate optical flow from the current
+    // game frame, pack the guides, submit that D3D11 work, then copy the guide
+    // textures through the shared bridge before NGX evaluates on D3D12.
+    commands->barrier(backbuffer, resource_usage::present, resource_usage::render_target);
+    g_runtime->render_technique(g_motion_technique, commands, rtv);
+    if (g_nr_mask_strength_variable.handle)
+        g_runtime->set_uniform_value_float(g_nr_mask_strength_variable, g_nr_rejection_mask_strength);
+    g_runtime->render_technique(g_feed_technique, commands, rtv);
+    commands->barrier(backbuffer, resource_usage::render_target, resource_usage::present);
+    queue->flush_immediate_command_list();
+    if (!CopyLegacyGuidesToD3D12()) return false;
+
+    const unsigned long long frame = ++g_current_guide_frames;
+    if (frame <= 4 || frame % 1800 == 0)
+        Log("same-frame D3D11 VORT optical flow copied to D3D12 before NGX: frame=%llu masks=%s/%s",
+            frame, g_mask_available ? "DLSS" : "none", g_nr_mask_available ? "NR" : "none");
+    return true;
+}
+
 static bool CapturedGuidesMatchInput()
 {
     if (!g_captured_motion || !g_captured_depth) return false;
@@ -3147,7 +3272,14 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     }
     const bool evaluate_nr = g_nr_enabled && g_nr_feature != nullptr;
 
-    const bool use_external_guides = !legacy_input && RenderCurrentFrameGuides(backbuffer);
+    bool use_external_guides = false;
+    if (!legacy_input)
+        use_external_guides = RenderCurrentFrameGuides(backbuffer);
+    else if (g_present_api == reshade::api::device_api::d3d11)
+    {
+        use_external_guides = g_legacy_guides_ready && CapturedGuidesMatchInput();
+        g_legacy_guides_ready = false;
+    }
     if (use_external_guides != g_using_external_guides)
     {
         g_using_external_guides = use_external_guides;
@@ -3193,6 +3325,23 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         D3D12_RESOURCE_BARRIER input_to_srv = Transition(g_packed_color.Get(),
             D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         g_neural_list->ResourceBarrier(1, &input_to_srv);
+    }
+
+    if (legacy_input && use_external_guides)
+    {
+        D3D12_RESOURCE_BARRIER guide_barriers[4] = {};
+        UINT guide_count = 0;
+        guide_barriers[guide_count++] = Transition(motion,
+            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        guide_barriers[guide_count++] = Transition(depth,
+            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (g_mask_available)
+            guide_barriers[guide_count++] = Transition(g_captured_mask.Get(),
+                D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (g_nr_mask_available)
+            guide_barriers[guide_count++] = Transition(g_captured_nr_mask.Get(),
+                D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        g_neural_list->ResourceBarrier(guide_count, guide_barriers);
     }
 
     if (!use_external_guides)
@@ -3306,7 +3455,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     }
     timestamp(4);
 
-    D3D12_RESOURCE_BARRIER restore[4] = {};
+    D3D12_RESOURCE_BARRIER restore[8] = {};
     UINT restore_count = 0;
     if (evaluate_nr)
         restore[restore_count++] = Transition(g_nr_stage.Get(),
@@ -3324,6 +3473,19 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     if (legacy_input)
         restore[restore_count++] = Transition(g_packed_color.Get(),
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    if (legacy_input && use_external_guides)
+    {
+        restore[restore_count++] = Transition(motion,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        restore[restore_count++] = Transition(depth,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        if (g_mask_available)
+            restore[restore_count++] = Transition(g_captured_mask.Get(),
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        if (g_nr_mask_available)
+            restore[restore_count++] = Transition(g_captured_nr_mask.Get(),
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    }
     g_neural_list->ResourceBarrier(restore_count, restore);
     timestamp(5);
     if (record_gpu_telemetry)
@@ -3533,6 +3695,53 @@ static bool MapPhysicalScreenToLogicalScreen(HWND hwnd, POINT &point)
         static_cast<int>(logical_width), physical.right - physical.left);
     point.y = origin.y + MulDiv(point.y - origin.y,
         static_cast<int>(logical_height), physical.bottom - physical.top);
+    return true;
+}
+
+static bool CopyLegacyGuidesToD3D12()
+{
+    g_legacy_guides_ready = false;
+    if (g_present_api != reshade::api::device_api::d3d11 ||
+        !g_legacy_context11 || !g_legacy_context4 || !g_legacy_fence11 ||
+        !g_legacy_fence12 || !g_command_queue ||
+        !g_legacy_source_motion11 || !g_legacy_source_depth11 ||
+        !g_legacy_motion11 || !g_legacy_depth11 ||
+        !g_captured_motion || !g_captured_depth)
+        return false;
+
+    const auto matches = [](ID3D11Texture2D *texture, UINT width, UINT height, DXGI_FORMAT format) {
+        if (!texture) return false;
+        D3D11_TEXTURE2D_DESC desc = {};
+        texture->GetDesc(&desc);
+        return desc.Width == width && desc.Height == height && desc.Format == format &&
+            desc.SampleDesc.Count == 1;
+    };
+    if (!matches(g_legacy_source_motion11.Get(), g_legacy_width, g_legacy_height,
+            DXGI_FORMAT_R16G16_FLOAT) ||
+        !matches(g_legacy_source_depth11.Get(), g_legacy_width, g_legacy_height,
+            DXGI_FORMAT_R32_FLOAT))
+        return false;
+
+    if (g_legacy_d3d12_done_value != 0 &&
+        FAILED(g_legacy_context4->Wait(g_legacy_fence11.Get(), g_legacy_d3d12_done_value)))
+        return false;
+    g_legacy_context11->CopyResource(g_legacy_motion11.Get(), g_legacy_source_motion11.Get());
+    g_legacy_context11->CopyResource(g_legacy_depth11.Get(), g_legacy_source_depth11.Get());
+
+    g_mask_available = g_legacy_mask11 && g_captured_mask &&
+        matches(g_legacy_source_mask11.Get(), g_legacy_width, g_legacy_height, DXGI_FORMAT_R8_UNORM);
+    g_nr_mask_available = g_legacy_nr_mask11 && g_captured_nr_mask &&
+        matches(g_legacy_source_nr_mask11.Get(), g_legacy_width, g_legacy_height, DXGI_FORMAT_R8_UNORM);
+    if (g_mask_available)
+        g_legacy_context11->CopyResource(g_legacy_mask11.Get(), g_legacy_source_mask11.Get());
+    if (g_nr_mask_available)
+        g_legacy_context11->CopyResource(g_legacy_nr_mask11.Get(), g_legacy_source_nr_mask11.Get());
+
+    const UINT64 value = ++g_legacy_fence_value;
+    if (FAILED(g_legacy_context4->Signal(g_legacy_fence11.Get(), value))) return false;
+    g_legacy_context11->Flush();
+    if (FAILED(g_command_queue->Wait(g_legacy_fence12.Get(), value))) return false;
+    g_legacy_guides_ready = true;
     return true;
 }
 
@@ -6228,6 +6437,8 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         const DXGI_FORMAT format = static_cast<DXGI_FORMAT>(desc.texture.format);
         g_input_width = width; g_input_height = height;
         if (!EnsureStandaloneResources(width, height, format)) return;
+        if (api == reshade::api::device_api::d3d11)
+            RenderLegacyCurrentFrameGuides(backbuffer_resource);
         if (!CopyLegacyFrameToD3D12(reinterpret_cast<void *>(backbuffer_resource.handle), false) ||
             !ExecuteOnPresentPipeline(nullptr))
         {
@@ -6717,7 +6928,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     for (int index = 0; index < static_cast<int>(std::size(preset_values)); ++index)
         if (preset_values[index] == g_dlss_render_preset) preset_index = index;
     if (ImGui::Combo("DLSS render preset", &preset_index,
-        "Default (NVIDIA)\0Preset J\0Preset K\0Preset L\0Preset M\0"))
+        "Default (NVIDIA)\0Preset J\0Preset K\0Preset L (Recommended default)\0Preset M\0"))
     {
         SelectDlssRenderPreset(preset_values[preset_index], "ReShade menu");
     }
@@ -6728,6 +6939,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::TextWrapped("%s", DlssRenderPresetDescription(g_dlss_render_preset));
     ImGui::TextDisabled("Ctrl+Alt+P cycles J -> K -> L -> M. Default remains available from this menu.");
     ImGui::TextDisabled("Render presets tune reconstruction behavior; they do not change the game's input resolution.");
+    ImGui::TextDisabled("Preset L is the recommended default; testing found noticeably less smearing at both 1080p and 1440p inputs.");
     if (ImGui::Checkbox("Enable Neural Rendering", &g_nr_enabled))
     {
         reshade::set_config_value(nullptr, section, "NeuralRendering", g_nr_enabled ? "1" : "0");
@@ -6768,6 +6980,17 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     if (ImGui::SliderFloat("Local tone strength", &g_nr_local_tone, 0.0f, 2.0f, "%.2f")) save_float("LocalTone", g_nr_local_tone);
     if (ImGui::SliderFloat("Local structure strength", &g_nr_local_structure, 0.0f, 2.0f, "%.2f")) save_float("LocalStructure", g_nr_local_structure);
     if (ImGui::SliderFloat("Skin / character structure", &g_nr_skin_structure, -1.0f, 1.0f, "%.2f")) save_float("SkinStructure", g_nr_skin_structure);
+    if (ImGui::Checkbox("Enable VORT motion integration (experimental)", &g_vort_guides_enabled))
+    {
+        reshade::set_config_value(nullptr, section, "VortGuides",
+            g_vort_guides_enabled ? "1" : "0");
+        g_legacy_guides_ready = false;
+        g_need_history_reset = true;
+        Log("VORT motion integration changed to %s",
+            g_vort_guides_enabled ? "enabled" : "disabled");
+    }
+    ImGui::TextDisabled("Off by default. Enabling runs VORT optical flow and guide conversion every frame and may have a large performance cost.");
+    ImGui::TextDisabled("Try it only as a temporal-quality experiment; zero-motion fallback remains the normal path.");
     if (ImGui::Checkbox("VORT NR rejection mask (experimental)", &g_nr_rejection_mask_enabled))
     {
         reshade::set_config_value(nullptr, section, "NrRejectionMask",
@@ -6780,7 +7003,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         save_float("NrRejectionStrength", g_nr_rejection_mask_strength);
         g_need_history_reset = true;
     }
-    ImGui::TextDisabled("Only active with same-frame VORT guides. Higher values bypass NR at unreliable motion/depth edges.");
+    ImGui::TextDisabled("Only active when VORT motion integration is enabled. Higher values bypass NR at unreliable motion/depth edges.");
     if (ImGui::Checkbox("Reset temporal history every frame", &g_reset_every_frame))
         reshade::set_config_value(nullptr, section, "ResetEveryFrame", g_reset_every_frame ? "1" : "0");
     ImGui::SameLine();
@@ -6841,10 +7064,13 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g_active_nr_model);
     ImGui::Text("Contract: %ux%u -> %ux%u", g_input_width.load(), g_input_height.load(), g_output_width.load(), g_output_height.load());
     ImGui::Text("NR guides: %s; DLSS SR history: %s; validation mask=%s",
-        g_using_external_guides ? "same-frame VORT optical flow" : "internal zero-motion fallback",
-        g_stable_sr_history ? "per-frame reset / zero motion" : "experimental temporal VORT",
+        !g_vort_guides_enabled ? "VORT disabled / zero-motion default" :
+            g_using_external_guides ? "same-frame VORT optical flow" : "VORT requested / zero-motion fallback",
+        g_stable_sr_history ? "per-frame reset / zero motion" :
+            g_vort_guides_enabled && g_using_external_guides ? "experimental temporal VORT" : "temporal zero motion",
         g_mask_available ? "valid" : "automatic mask");
     ImGui::Text("NR rejection mask: %s (strength %.2f)",
+        !g_vort_guides_enabled ? "inactive (VORT integration off)" :
         !g_nr_rejection_mask_enabled ? "disabled" :
         g_nr_rejection_mask_strength <= 0.0001f ? "bypassed at zero / NVIDIA automatic mask" :
         g_using_external_guides && g_nr_mask_available ? "active" : "waiting for VORT/guide texture",
@@ -7022,7 +7248,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         // ColorProfile to HDR10 globally, so importing that value would retain
         // the cross-game color bug instead of migrating installations to Auto.
         read_setting("InputColorProfile", "0", value, sizeof(value)); g_color_profile = static_cast<ColorProfile>(std::clamp(atoi(value), 0, 4));
-        read_setting("DlssRenderPreset", "0", value, sizeof(value));
+        read_setting("DlssRenderPreset", "12", value, sizeof(value));
         switch (atoi(value))
         {
         case 10: g_dlss_render_preset = DlssRenderPreset::J; break;
@@ -7040,6 +7266,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("NrRejectionStrength", "1.0", value, sizeof(value)); g_nr_rejection_mask_strength = std::clamp(static_cast<float>(atof(value)), 0.0f, 1.0f);
         read_setting("ResetEveryFrame", "0", value, sizeof(value)); g_reset_every_frame = strcmp(value, "0") != 0;
         read_setting("StableSrHistory", "0", value, sizeof(value)); g_stable_sr_history = strcmp(value, "0") != 0;
+        read_setting("VortGuides", "0", value, sizeof(value)); g_vort_guides_enabled = strcmp(value, "0") != 0;
         read_setting("NeuralRendering", "1", value, sizeof(value)); g_nr_enabled = strcmp(value, "0") != 0;
         read_setting("FrameGeneration", "1", value, sizeof(value)); g_framegen_enabled = strcmp(value, "0") != 0;
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
@@ -7065,10 +7292,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             reshade::set_config_value(nullptr, section, "SynchronousProxyPresentation", "1");
         }
         g_requested_synchronous_proxy_presentation = g_synchronous_proxy_presentation;
-        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s DLSS_render_preset=%s model=%d style=%u NR=%s NR-mask=%s strength=%.2f early_proxy=%s auto_presentation=%s windowed_virtualization=%s logical_client=%s input_coordinates=%s detached_output=%s detached_cursor=%s opaque_composition=%s presenter=%s telemetry=%s",
+        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s DLSS_render_preset=%s model=%d style=%u NR=%s NR-mask=%s strength=%.2f VORT=%s early_proxy=%s auto_presentation=%s windowed_virtualization=%s logical_client=%s input_coordinates=%s detached_output=%s detached_cursor=%s opaque_composition=%s presenter=%s telemetry=%s",
             ADDON_VERSION, ProfileName(g_color_profile), DlssRenderPresetName(g_dlss_render_preset),
             g_nr_model, NrStyle(), g_nr_enabled ? "enabled" : "disabled",
             g_nr_rejection_mask_enabled ? "enabled" : "disabled", g_nr_rejection_mask_strength,
+            g_vort_guides_enabled ? "enabled" : "disabled",
             g_early_proxy_initialization ? "enabled" : "disabled",
             g_auto_windowed_virtualization ? "enabled" : "disabled",
             g_windowed_virtualization_enabled ? "enabled" : "disabled",

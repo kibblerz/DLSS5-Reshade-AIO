@@ -46,11 +46,17 @@ Reduced-resolution DLSS SR can provide major performance improvements. Native-re
 
 These presets tune reconstruction behavior; they do not change the input resolution selected in the game.
 
-- **Default:** Lets the NVIDIA runtime select a preset for the active DLAA/DLSS mode.
+- **L (recommended default):** The tested default for both 1080p and 1440p reconstruction; produced the least visible smearing in current game tests.
+- **Default (NVIDIA):** Lets the NVIDIA runtime select a preset for the active DLAA/DLSS mode.
 - **J:** May reduce some ghosting versus K, but can introduce more flickering.
-- **K:** Recommended high-quality choice for DLAA, Quality, and Balanced; relatively demanding.
-- **L:** Sharp and temporally stable for extreme scaling with reduced ghosting; highest performance cost.
+- **K:** High-quality option for DLAA, Quality, and Balanced, but showed more smearing than L in current tests.
 - **M:** Performance-oriented modern preset with much of L's image-quality behavior at speed closer to J/K.
+
+### Experimental VORT motion integration
+
+VORT motion integration is **disabled by default** because its optical-flow and guide-conversion passes can have a substantial performance cost. The addon normally uses its zero-motion fallback and does not require VORT.
+
+To experiment with motion guidance, install VORT Motion and `DLSS5_AIO_Feed.fx` in the same ReShade shader search path, then enable **Enable VORT motion integration (experimental)** under the addon's Neural Rendering controls. The addon schedules both effects itself; leave their ordinary ReShade technique checkboxes disabled. Turn the option back off if performance drops or image quality does not improve. The option now supports both native D3D12 and the addon's D3D11-to-D3D12 transport.
 
 ## Troubleshooting — start here
 
@@ -70,7 +76,7 @@ Open **ReShade > Add-ons > Standalone DLSS-NR + SR**, then expand **Compatibilit
 | **The processed preview does not appear while ReShade is open** | Use windowed mode at a resolution below the monitor's native resolution. Fullscreen and borderless windows may leave no separate desktop area for the preview. Closing ReShade should still restore the native-size processed output. |
 | **The addon is missing from ReShade** | Confirm the game is 64-bit, ReShade was installed with addon support, and `standalone-dlssnr.addon64` is beside the real game executable and ReShade DLL. |
 | **The log says `required private runtime dependency missing`** | Install `nvngx.dll` beside the addon. Also supply `nvngx_dlssnr.dll` and `nvngx_dlss.dll`; `nvngx_dlssg.dll` is required for Frame Generation. |
-| **The overlay reports fallback or zero-motion guides** | Install `DLSS5_AIO_Feed.fx` under `reshade-shaders\Shaders` and install VORT Motion in the same shader search path. The addon still works without them, but temporal guidance is reduced. |
+| **The overlay reports fallback or zero-motion guides** | This is the normal default. VORT motion integration is optional and disabled by default because it may significantly reduce performance. To test it, install `DLSS5_AIO_Feed.fx` and VORT Motion under the configured ReShade shader path, then enable **Enable VORT motion integration (experimental)**. |
 | **Vulkan waits for a shared frame** | Confirm ReShade's Vulkan layer is active. If no other ReShade effect is loaded, install `StandaloneBoundary.fx` so the required effects boundary runs. |
 | **A game worked in 1.x but not in 2.0** | Remove the 2.0 `standalone-dlssnr.addon64` and use [v1.7.24, the latest 1.x release](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/tag/v1.7.24). Please include the game, API, display mode, and `standalone-dlssnr.log` when reporting the 2.0 regression. |
 
@@ -108,6 +114,10 @@ Because presentation behavior varies substantially between engines, 2.0 may work
 ### Version 2.0.2
 
 The DLSS Super Resolution stage now exposes NVIDIA's modern render presets **J, K, L, and M**, while legacy and deprecated presets remain hidden. **Ctrl+Alt+P** cycles the DLSS presets and **Ctrl+Alt+N** cycles Neural Rendering models 1–3 without opening ReShade. Three-second native-output notices confirm each selection; DLSS notices also identify the preset's intended role. The active DLAA/DLSS quality contract is still selected automatically from the game's input resolution and is reported separately in ReShade.
+
+### Version 2.0.3
+
+VORT motion guidance is now an explicit experimental option and defaults to disabled, avoiding its potentially large per-frame performance cost unless the user chooses to test it. The guide bridge now supports D3D11 games in addition to native D3D12. DLSS Preset L is the new recommended default because current 1080p and 1440p game testing showed substantially less smearing than the other modern presets. This release does not include the later San Andreas submission-ring or window-resize experiments.
 
 ### Version 2.0.1
 
