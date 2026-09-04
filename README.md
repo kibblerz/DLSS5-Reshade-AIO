@@ -2,6 +2,9 @@
 
 Bring Neural Rendering, DLAA/DLSS Super Resolution, and Frame Generation to supported 64-bit Windows games even when the game does not include those features. This is experimental software and currently supports D3D9, D3D11, D3D12, and Vulkan through ReShade.
 
+> [!IMPORTANT]
+> **Version 2.0 uses a new presentation and window-compatibility system.** It fixes input and reduced-window behavior in many games, but game compatibility can differ from the 1.x series. If a game has problems in 2.0 that it did not have before, install the [latest 1.x release (v1.7.24)](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/tag/v1.7.24). Do not mix the 1.x and 2.0 addon binaries.
+
 ## Quick install
 
 > [!IMPORTANT]
@@ -33,23 +36,27 @@ Reduced-resolution DLSS SR can provide major performance improvements. Native-re
 - The addon draws its own FPS counter because third-party overlays may not appear through its presentation proxy.
 - Logs are written to `%LOCALAPPDATA%\RHI\Logs\standalone-dlssnr.log`.
 
-## Quick troubleshooting
+## Troubleshooting — start here
 
-| Symptom | First things to try |
+Open **ReShade > Add-ons > Standalone DLSS-NR + SR**, then expand **Compatibility / troubleshooting**. Leave the automatic option enabled and change only the setting that matches your problem. Restart the game after changing any option marked as requiring a restart.
+
+| What you see | Setting or action to use |
 | --- | --- |
-| Addon is missing from ReShade | Confirm ReShade has addon support, the game is 64-bit, and `standalone-dlssnr.addon64` is beside the actual game executable/ReShade DLL. |
-| `required private runtime dependency missing` | Install `nvngx.dll` **as well as** the addon. Also place `nvngx_dlssnr.dll` and `nvngx_dlss.dll` beside them. `nvngx_dlssg.dll` is needed for Frame Generation. |
-| Overlay reports fallback or zero-motion guides | Install `DLSS5_AIO_Feed.fx` under `reshade-shaders\Shaders` and install VORT Motion under the same shader search path. The addon remains usable without them, but temporal guidance is reduced. |
-| Lower resolution still says DLAA | Switch between fullscreen, borderless, and windowed. The game must create a genuinely smaller backbuffer before DLSS SR can activate. Restart the game after changing resolution or display mode. |
-| Processed image occupies only part of the screen, is confined to a corner, or remains game-window sized | Open **ReShade > Add-ons > Standalone DLSS-NR + SR**, expand **Compatibility / troubleshooting**, and enable **Force reduced-window virtualization**. This physically expands the reduced game window while preserving its lower rendering resolution. Restart if the game does not settle immediately. |
-| Mouse hover/click position is offset, clicks only work in part of the screen, or the game detects the pointer somewhere else | Under **Compatibility / troubleshooting**, enable **Scale window input coordinates to render resolution**. It automatically enables the required **Force reduced-window virtualization** option. Disabling forced virtualization also disables its dependent input scaling. |
-| Detached gameplay cursor remains visible and limits camera rotation at the screen edge | Current builds mirror the cursor state requested by the game, hiding it during relative camera control and restoring it for menus. If a game does not report that state correctly, try **Hide detached Windows cursor** under **Compatibility / troubleshooting** as a last resort. |
-| Image is smeared or changes size after changing display settings | Restart the game. Set the resolution and display mode before loading gameplay. Press F10 once to confirm whether the presentation proxy is active. |
-| ReShade menu temporarily makes the image smaller | Close the ReShade menu; the native-size processed output should return. This is a known proxy-input workaround in some games. |
-| Black screen | Close the game, restore native resolution, and try another display mode. Do not repeatedly change resolution while the pipeline is active. Check the persistent log before trying again. |
-| D3D12/D3D11On12 game hangs, freezes, or remains waiting for Present while starting | Try **Early proxy initialization (D3D11On12 compatibility)** using the instructions below. Leave it off for games that already start normally. |
-| Native Streamline is detected | Disable the game's built-in DLSS Frame Generation. The addon no longer blocks its own FG stage merely because `sl.interposer` is loaded; running two FG implementations together is unsupported. |
-| Vulkan says it is waiting for a shared frame | Make sure ReShade's Vulkan layer is active. Install `StandaloneBoundary.fx` when no other ReShade effect is loaded; Vulkan needs an effects boundary for the frame handoff. |
+| **The image is small, stuck in a corner, or only occupies part of the screen** | Enable **Force reduced-window virtualization**. This is the first option to try for a wrongly sized image. Restart if the image does not settle immediately. |
+| **The picture is correct, but mouse clicks land in the wrong place or only part of the screen is clickable** | Enable **Scale window input coordinates to render resolution**. It automatically enables **Force reduced-window virtualization**, which it requires. |
+| **The game does not capture the mouse, the pointer escapes, or camera rotation stops at a screen edge** | Enable **Hide detached Windows cursor**. Turn it back off if the game needs the normal Windows cursor for its menus; automatic cursor handling works in most games. |
+| **The addon initializes, but the processed picture stays in the original window, is missing, or is black** | Try **Detached native output (Vulkan compatibility)** and restart. This is most often needed by Vulkan or unusual windowed games. |
+| **The original and processed pictures appear together, or the output looks transparent** | Enable **Opaque attached composition** and restart. |
+| **The game crashes, freezes, or goes black when processed output begins or after a resolution change** | Enable **Serialized presentation (crash workaround)** and restart. If the game crashes before you can reach ReShade, hold **F8 while launching** to start in serialized safe mode. |
+| **The addon stays on “waiting for Present” during D3D12 startup** | Try **Early proxy initialization (D3D11On12 compatibility)** and restart. Leave this disabled in games that already launch normally. |
+| **A lower game resolution still reports DLAA instead of DLSS SR** | Switch between fullscreen, borderless, and windowed. DLSS SR activates only when the game creates a genuinely lower-resolution backbuffer. Restart after changing mode if needed. |
+| **The image becomes smeared, stretched, or wrongly sized after changing resolution** | Restart the game and set the desired resolution/display mode before loading gameplay. Live resolution changes remain game-dependent. |
+| **The ReShade menu makes the image temporarily become small** | Close the ReShade menu; native-size processed output should return. This remains a known input workaround in some games. |
+| **The addon is missing from ReShade** | Confirm the game is 64-bit, ReShade was installed with addon support, and `standalone-dlssnr.addon64` is beside the real game executable and ReShade DLL. |
+| **The log says `required private runtime dependency missing`** | Install `nvngx.dll` beside the addon. Also supply `nvngx_dlssnr.dll` and `nvngx_dlss.dll`; `nvngx_dlssg.dll` is required for Frame Generation. |
+| **The overlay reports fallback or zero-motion guides** | Install `DLSS5_AIO_Feed.fx` under `reshade-shaders\Shaders` and install VORT Motion in the same shader search path. The addon still works without them, but temporal guidance is reduced. |
+| **Vulkan waits for a shared frame** | Confirm ReShade's Vulkan layer is active. If no other ReShade effect is loaded, install `StandaloneBoundary.fx` so the required effects boundary runs. |
+| **A game worked in 1.x but not in 2.0** | Remove the 2.0 `standalone-dlssnr.addon64` and use [v1.7.24, the latest 1.x release](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/tag/v1.7.24). Please include the game, API, display mode, and `standalone-dlssnr.log` when reporting the 2.0 regression. |
 
 ### Early proxy initialization
 
@@ -71,6 +78,16 @@ The persistent log records `early_proxy=enabled` at startup when the saved setti
 - No Man's Sky and potentially other Vulkan games may not display the ReShade menu correctly.
 - Additional game-specific and Vulkan issues are expected.
 - The experimental VORT NR rejection mask currently behaves more like a hard gate than a gradual blend at nonzero strength. Leave it disabled unless testing this feature; strength zero is an exact bypass that restores NVIDIA automatic masking.
+
+## What changed in 2.0
+
+Version 2.0 replaces the older always-detached presentation behavior with a compatibility-aware compositor. It attaches the finished native-resolution image directly to the game window when that is safe and automatically uses a detached native-size output for genuinely reduced windows and Vulkan cases. The game window is left untouched by default.
+
+The new **Compatibility / troubleshooting** panel provides opt-in fixes for games with unusual window or input behavior: reduced-window virtualization, logical client virtualization, scaled input coordinates, detached output and cursor handling, opaque composition, serialized presentation, and early D3D11On12 proxy initialization. Automatic presentation remains the recommended default.
+
+Resolution transitions are serialized outside the game's DXGI callback, failed sessions can recover into serialized mode by holding **F8** during launch, and startup contract changes hold the last completed native frame instead of repeatedly exposing the low-resolution game surface.
+
+Because presentation behavior varies substantially between engines, 2.0 may work better or worse than 1.x in a particular game. Keep [v1.7.24](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/tag/v1.7.24) available as the stable 1.x fallback and report regressions with the game name, graphics API, display mode, and persistent addon log.
 
 ## Companion guide shader
 

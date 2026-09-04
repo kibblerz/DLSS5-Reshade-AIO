@@ -32,7 +32,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.52-serialized-window-transition-prototype"
+#define ADDON_VERSION "2.0.0"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -106,6 +106,9 @@ static bool g_proxy_early_pending_activation;
 static bool g_early_proxy_restart_required;
 static bool g_proxy_window_start_hidden;
 static std::atomic<bool> g_proxy_hidden{false};
+static std::atomic<bool> g_proxy_transition_hold{false};
+static std::atomic<unsigned int> g_proxy_activation_frames{0};
+static constexpr unsigned int kProxyActivationStableFrames = 3;
 static bool g_show_neural_output = true;
 static bool g_pending_proxy_frame;
 static bool g_composite_reshade_output = true;
@@ -2290,6 +2293,12 @@ static bool ResourceContractIsStable(UINT iw, UINT ih, UINT ow, UINT oh, DXGI_FO
         ow == g_resource_output_width && oh == g_resource_output_height && format == g_resource_input_format)
     {
         ResetContractCandidate();
+        if (g_proxy_transition_hold.exchange(false) && g_proxy_swapchain != nullptr &&
+            !g_proxy_hidden && !g_proxy_failed && !g_proxy_early_pending_activation)
+        {
+            RequestProxyVisibility(!g_proxy_overlay_bypass);
+            Log("transient presentation contract reverted; last native frame released without exposing the reduced surface");
+        }
         return true;
     }
 
@@ -2305,8 +2314,21 @@ static bool ResourceContractIsStable(UINT iw, UINT ih, UINT ow, UINT oh, DXGI_FO
         g_candidate_contract_frames = 1;
         if (g_proxy_swapchain != nullptr)
         {
-            g_proxy_hidden = true;
-            RequestProxyVisibility(false);
+            if (g_frames_presented.load() != 0 && !g_proxy_failed)
+            {
+                // Startup movies and menus often cycle through temporary
+                // swapchain sizes/formats. Keep the last completed native-size
+                // compositor buffer on screen while the replacement contract
+                // settles. Hiding the visual here exposed the reduced game
+                // surface in the upper-left and caused the startup flashing.
+                g_proxy_transition_hold = true;
+                Log("native presentation holding its last completed frame during contract transition");
+            }
+            else
+            {
+                g_proxy_hidden = true;
+                RequestProxyVisibility(false);
+            }
         }
         Log("presentation contract candidate: %ux%u -> %ux%u fmt=%u; waiting for stability",
             iw, ih, ow, oh, static_cast<unsigned int>(format));
@@ -2397,6 +2419,7 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
     g_neural_ready = true;
     if (g_proxy_swapchain && !g_proxy_failed)
     {
+        g_proxy_transition_hold = false;
         g_proxy_hidden = false;
         if (!g_proxy_early_pending_activation)
             RequestProxyVisibility(!g_proxy_overlay_bypass);
@@ -4922,6 +4945,7 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
         g_proxy_swapchain.Reset(); return false;
     }
     g_proxy_present_format = present_format;
+    g_proxy_activation_frames = 0;
     g_proxy_early_pending_activation = true;
     Log("%s compositor ready: %ux%u source_format=%u present_format=%u game_hwnd=%p target_hwnd=%p ownership=%s alpha=%s input_owner=%s DWM_paced=yes presenter=%s buffers=3 max_latency=2",
         DetachedPresentationEnabled() ? "detached" : "same-window", width, height,
@@ -4992,7 +5016,7 @@ static bool PresentProxyFrameOnWorker()
 {
     ID3D12Resource *real_source = g_nr_output;
     ID3D12Resource *original_source = g_packed_color.Get();
-    if (g_proxy_hidden || g_sr_frames.load() == 0 || real_source == nullptr ||
+    if (g_proxy_hidden || g_proxy_transition_hold || g_sr_frames.load() == 0 || real_source == nullptr ||
         original_source == nullptr || g_proxy_swapchain == nullptr) return false;
 
     const bool use_framegen = EffectiveFramegenEnabled() && !g_framegen_failed &&
@@ -5186,10 +5210,14 @@ static bool PresentProxyFrameOnWorker()
             g_proxy_allow_tearing ? "enabled" : "unavailable");
     if (g_proxy_early_pending_activation && !g_proxy_failed)
     {
-        g_proxy_early_pending_activation = false;
-        if (!g_proxy_hidden && !g_proxy_overlay_bypass)
-            RequestProxyVisibility(true);
-        Log("early native proxy activated after its first completed frame");
+        const unsigned int stable_frames = ++g_proxy_activation_frames;
+        if (stable_frames >= kProxyActivationStableFrames)
+        {
+            g_proxy_early_pending_activation = false;
+            if (!g_proxy_hidden && !g_proxy_overlay_bypass)
+                RequestProxyVisibility(true);
+            Log("native proxy activated after %u consecutive completed frames", stable_frames);
+        }
     }
     return true;
 }
@@ -5248,7 +5276,7 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
 {
     ID3D12Resource *real_source = g_nr_output;
     ID3D12Resource *original_source = g_packed_color.Get();
-    if (g_proxy_hidden || g_sr_frames.load() == 0 || real_source == nullptr ||
+    if (g_proxy_hidden || g_proxy_transition_hold || g_sr_frames.load() == 0 || real_source == nullptr ||
         original_source == nullptr || backbuffer == nullptr || !EnsureProxy(real_source) ||
         g_proxy_present_event == nullptr || g_proxy_present_thread == nullptr)
         return false;
@@ -5731,7 +5759,7 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
             // A busy neural queue is a dropped enhancement frame, not a reason
             // to stall the game's Present thread. Re-present the last completed
             // output when it is safe and otherwise leave the game surface alone.
-            if (!g_neural_failed && !g_proxy_hidden && g_neural_ready &&
+            if (!g_neural_failed && !g_proxy_hidden && !g_proxy_transition_hold && g_neural_ready &&
                 g_nr_output != nullptr && EnsureProxy(g_nr_output))
                 g_pending_proxy_frame = true;
             return;
