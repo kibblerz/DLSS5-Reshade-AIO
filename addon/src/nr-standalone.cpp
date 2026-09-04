@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <intrin.h>
 #include <d3d9.h>
 #include <d3d11_4.h>
 #include <d3d12.h>
@@ -15,6 +16,7 @@
 #include <cstdarg>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -30,7 +32,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "1.7.28-serialized-present-prototype"
+#define ADDON_VERSION "1.7.52-serialized-window-transition-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -39,7 +41,11 @@ extern "C" __declspec(dllexport) const char *DESCRIPTION =
 static HMODULE g_self;
 static wchar_t g_addon_directory[MAX_PATH];
 static char g_log_path[MAX_PATH];
+static char g_startup_recovery_path[MAX_PATH];
 static CRITICAL_SECTION g_log_lock;
+static bool g_startup_recovery_detected;
+static bool g_startup_recovery_forced;
+static std::atomic<bool> g_startup_recovery_marker_cleared{false};
 static std::atomic<unsigned int> g_output_width{0};
 static std::atomic<unsigned int> g_output_height{0};
 static std::atomic<unsigned int> g_input_width{0};
@@ -60,6 +66,12 @@ static Microsoft::WRL::ComPtr<IDCompositionTarget> g_composition_target;
 static Microsoft::WRL::ComPtr<IDCompositionVisual> g_composition_visual;
 static Microsoft::WRL::ComPtr<IDCompositionEffectGroup> g_composition_effect;
 static bool g_same_window_compositor;
+static bool g_opaque_composition;
+static std::atomic<HWND> g_composition_target_window{nullptr};
+static std::atomic<HWND> g_composition_retarget_pending{nullptr};
+static std::atomic<unsigned long long> g_composition_last_retarget_check{0};
+static bool g_detached_binding_refresh_queued;
+static bool g_detached_binding_refreshed;
 static Microsoft::WRL::ComPtr<ID3D12CommandAllocator> g_proxy_allocators[2];
 static Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> g_proxy_lists[2];
 static Microsoft::WRL::ComPtr<ID3D12Fence> g_proxy_fence;
@@ -78,6 +90,7 @@ static HANDLE g_proxy_present_event;
 static HANDLE g_proxy_present_stop_event;
 static HANDLE g_proxy_present_thread;
 static bool g_synchronous_proxy_presentation;
+static bool g_requested_synchronous_proxy_presentation;
 // 0 = idle, 1 = a completed pipeline frame is waiting, 2 = the presenter is
 // recording/submitting that frame. The game thread never waits on this state.
 static std::atomic<unsigned int> g_proxy_present_request_state{0};
@@ -190,6 +203,7 @@ static constexpr UINT kProxyOverlayInputModeMessage = WM_APP + 0x51;
 static constexpr UINT kProxyVirtualizeFullscreenMessage = WM_APP + 0x52;
 static constexpr UINT kProxyVisibilityMessage = WM_APP + 0x53;
 static constexpr UINT kProxyResizeToMonitorMessage = WM_APP + 0x54;
+static constexpr UINT kProxyRetargetCompositionMessage = WM_APP + 0x55;
 static constexpr DWORD kInitializationGpuWaitMs = 2000;
 static constexpr DWORD kTransitionGpuWaitMs = 250;
 static constexpr DWORD kProxyWindowStartupWaitMs = 1000;
@@ -208,6 +222,19 @@ static std::atomic<unsigned long long> g_proxy_busy_frame_skips{0};
 static bool g_native_streamline_present_hook;
 static std::atomic<bool> g_fullscreen_virtualization_pending{false};
 static bool g_windowed_virtualization_enabled;
+static bool g_auto_windowed_virtualization = true;
+static std::atomic<bool> g_auto_windowed_virtualization_active{false};
+static std::atomic<bool> g_auto_windowed_logical_suppressed{false};
+static std::atomic<bool> g_auto_windowed_transpose_seen{false};
+static std::atomic<unsigned int> g_auto_windowed_host_drift_count{0};
+static std::atomic<unsigned long long> g_auto_windowed_activation_tick{0};
+static bool g_windowed_logical_size_messages;
+static bool g_windowed_input_scaling;
+static bool g_detached_presentation;
+static std::atomic<bool> g_auto_detached_presentation_active{false};
+static bool g_hide_detached_system_cursor;
+static std::atomic<unsigned int> g_auto_detached_center_warps{0};
+static std::atomic<unsigned long long> g_auto_detached_last_center_warp_tick{0};
 static std::atomic<bool> g_windowed_virtualization_pending{false};
 static std::atomic<bool> g_windowed_virtualization_active{false};
 static std::atomic<HWND> g_windowed_virtualization_window{nullptr};
@@ -219,6 +246,114 @@ static LONG_PTR g_windowed_original_ex_style;
 static HWND g_windowed_original_window;
 static bool g_windowed_original_state_saved;
 static std::atomic<unsigned long long> g_windowed_resize_overrides{0};
+static WNDPROC g_windowed_original_wndproc;
+static HWND g_windowed_subclassed_window;
+static std::atomic<unsigned long long> g_windowed_logical_size_overrides{0};
+static std::atomic<unsigned long long> g_windowed_client_query_overrides{0};
+static std::atomic<unsigned long long> g_windowed_coordinate_overrides{0};
+static std::atomic<unsigned long long> g_windowed_mouse_message_overrides{0};
+static std::atomic<unsigned long long> g_windowed_cursor_query_overrides{0};
+static std::atomic<unsigned long long> g_windowed_cursor_warp_overrides{0};
+static std::atomic<unsigned long long> g_windowed_cursor_clip_overrides{0};
+static std::atomic<bool> g_windowed_cursor_clip_virtualized{false};
+using GetClientRectFn = BOOL (WINAPI *)(HWND, LPRECT);
+using ScreenToClientFn = BOOL (WINAPI *)(HWND, LPPOINT);
+using ClientToScreenFn = BOOL (WINAPI *)(HWND, LPPOINT);
+using SetCursorFn = HCURSOR (WINAPI *)(HCURSOR);
+using GetCursorPosFn = BOOL (WINAPI *)(LPPOINT);
+using SetCursorPosFn = BOOL (WINAPI *)(int, int);
+using ClipCursorFn = BOOL (WINAPI *)(const RECT *);
+using GetClipCursorFn = BOOL (WINAPI *)(LPRECT);
+using SetWindowPosFn = BOOL (WINAPI *)(HWND, HWND, int, int, int, int, UINT);
+using MoveWindowFn = BOOL (WINAPI *)(HWND, int, int, int, int, BOOL);
+static GetClientRectFn g_original_get_client_rect;
+static ScreenToClientFn g_original_screen_to_client;
+static ClientToScreenFn g_original_client_to_screen;
+static SetCursorFn g_original_set_cursor;
+static GetCursorPosFn g_original_get_cursor_pos;
+static SetCursorPosFn g_original_set_cursor_pos;
+static ClipCursorFn g_original_clip_cursor;
+static GetClipCursorFn g_original_get_clip_cursor;
+static SetWindowPosFn g_original_set_window_pos;
+static MoveWindowFn g_original_move_window;
+static void *g_get_client_rect_target;
+static void *g_screen_to_client_target;
+static void *g_client_to_screen_target;
+static void *g_set_cursor_target;
+static void *g_get_cursor_pos_target;
+static void *g_set_cursor_pos_target;
+static void *g_clip_cursor_target;
+static void *g_get_clip_cursor_target;
+static void *g_set_window_pos_target;
+static void *g_move_window_target;
+static bool g_window_query_hooks_installed;
+static std::atomic<unsigned long long> g_windowed_resolution_intents{0};
+static std::atomic<unsigned long long> g_windowed_last_reassert_tick{0};
+static std::atomic<HWND> g_windowed_reapply_window{nullptr};
+static std::atomic<unsigned long long> g_windowed_reapply_after_tick{0};
+static std::atomic<bool> g_detached_window_repair_pending{false};
+static std::atomic<unsigned long long> g_detached_window_repairs{0};
+static std::atomic<uintptr_t> g_detached_game_cursor{0};
+static std::atomic<bool> g_detached_game_cursor_observed{false};
+
+static bool WindowedVirtualizationEnabled()
+{
+    return g_windowed_virtualization_enabled || g_auto_windowed_virtualization_active.load();
+}
+
+static bool WindowedLogicalSizeEnabled()
+{
+    return g_windowed_logical_size_messages ||
+        (g_auto_windowed_virtualization_active.load() && !g_auto_windowed_logical_suppressed.load());
+}
+
+static bool WindowedInputScalingEnabled()
+{
+    // Input mapping is safe independently of logical-size spoofing and is
+    // required whenever a reduced game client is expanded to the monitor. It
+    // keeps mouse messages in the coordinate space the game originally used.
+    return g_windowed_input_scaling || g_auto_windowed_virtualization_active.load();
+}
+
+static bool DetachedPresentationEnabled()
+{
+    return g_detached_presentation || g_auto_detached_presentation_active.load();
+}
+
+static bool DetachedCursorHidden()
+{
+    // Relative-look Vulkan games commonly pin the OS cursor to the client
+    // center and draw their own pointer. Suppress that duplicate only while
+    // repeated center warps are actively observed; ordinary OS-cursor menus
+    // become visible again when the recentering stops.
+    const ULONGLONG last_warp = g_auto_detached_last_center_warp_tick.load();
+    const bool automatic = g_auto_detached_center_warps.load() >= 3 &&
+        last_warp != 0 && GetTickCount64() - last_warp < 750;
+    return g_hide_detached_system_cursor || automatic;
+}
+
+static HCURSOR DetachedProxyCursor(bool overlay_input)
+{
+    if (overlay_input)
+        return LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+    if (DetachedCursorHidden())
+        return nullptr;
+    if (g_detached_game_cursor_observed.load())
+        return reinterpret_cast<HCURSOR>(g_detached_game_cursor.load());
+    if (g_game_window != nullptr)
+    {
+        const HCURSOR class_cursor = reinterpret_cast<HCURSOR>(
+            GetClassLongPtrW(g_game_window, GCLP_HCURSOR));
+        if (class_cursor != nullptr)
+            return class_cursor;
+    }
+    return LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+}
+
+static bool OpaqueCompositionEnabled()
+{
+    return g_opaque_composition || g_auto_windowed_virtualization_active.load();
+}
 
 static void RequestProxyOverlayInputMode()
 {
@@ -447,6 +582,82 @@ static void Log(const char *format, ...)
     }
     LeaveCriticalSection(&g_log_lock);
     reshade::log::message(reshade::log::level::info, message);
+}
+
+static bool IsProcessStillRunning(DWORD process_id)
+{
+    if (process_id == 0 || process_id == GetCurrentProcessId())
+        return process_id == GetCurrentProcessId();
+    HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, process_id);
+    if (process == nullptr)
+        return false;
+    const bool running = WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
+    CloseHandle(process);
+    return running;
+}
+
+static bool BeginStartupRecoveryTracking(const char *local_app_data)
+{
+    if (local_app_data == nullptr || local_app_data[0] == '\0')
+        return false;
+
+    char rhi_directory[MAX_PATH] = {};
+    char state_directory[MAX_PATH] = {};
+    sprintf_s(rhi_directory, "%s\\RHI", local_app_data);
+    sprintf_s(state_directory, "%s\\State", rhi_directory);
+    CreateDirectoryA(rhi_directory, nullptr);
+    CreateDirectoryA(state_directory, nullptr);
+
+    char executable[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, executable, MAX_PATH);
+    unsigned long long executable_hash = 1469598103934665603ull;
+    for (const unsigned char *cursor = reinterpret_cast<const unsigned char *>(executable); *cursor != 0; ++cursor)
+    {
+        unsigned char character = *cursor;
+        if (character >= 'A' && character <= 'Z') character = static_cast<unsigned char>(character - 'A' + 'a');
+        executable_hash ^= character;
+        executable_hash *= 1099511628211ull;
+    }
+    sprintf_s(g_startup_recovery_path, "%s\\dlssnr-%016llX.pending",
+        state_directory, executable_hash);
+
+    bool previous_unclean = false;
+    FILE *previous = nullptr;
+    if (fopen_s(&previous, g_startup_recovery_path, "rb") == 0 && previous != nullptr)
+    {
+        unsigned long previous_process = 0;
+        const int parsed = fscanf_s(previous, "%lu", &previous_process);
+        fclose(previous);
+        previous_unclean = parsed != 1 ||
+            (previous_process != GetCurrentProcessId() && !IsProcessStillRunning(previous_process));
+    }
+
+    FILE *current = nullptr;
+    if (fopen_s(&current, g_startup_recovery_path, "wb") == 0 && current != nullptr)
+    {
+        fprintf(current, "%lu\n%s\n%s\n", GetCurrentProcessId(), ADDON_VERSION, executable);
+        fflush(current);
+        fclose(current);
+    }
+    else
+    {
+        g_startup_recovery_path[0] = '\0';
+    }
+    return previous_unclean;
+}
+
+static void ClearStartupRecoveryMarker(const char *reason)
+{
+    if (g_startup_recovery_path[0] == '\0' || g_startup_recovery_marker_cleared.exchange(true))
+        return;
+    if (DeleteFileA(g_startup_recovery_path) || GetLastError() == ERROR_FILE_NOT_FOUND)
+        Log("startup recovery marker cleared: %s", reason);
+    else
+    {
+        Log("startup recovery marker could not be cleared: error=%lu reason=%s",
+            GetLastError(), reason);
+        g_startup_recovery_marker_cleared = false;
+    }
 }
 
 static void SetStatus(const char *format, ...)
@@ -2989,6 +3200,28 @@ static bool MapProxyScreenPointToGame(POINT screen_point, POINT &game_client, PO
     return ClientToScreen(g_game_window, &game_screen) != FALSE;
 }
 
+static bool MapGameScreenPointToProxy(POINT game_screen, POINT &proxy_screen)
+{
+    if (!g_proxy_window || !g_game_window) return false;
+    RECT proxy_client = {}, game_client_rect = {};
+    if (!GetClientRect(g_proxy_window, &proxy_client) ||
+        !GetClientRect(g_game_window, &game_client_rect))
+        return false;
+    const LONG proxy_width = proxy_client.right - proxy_client.left;
+    const LONG proxy_height = proxy_client.bottom - proxy_client.top;
+    const LONG game_width = game_client_rect.right - game_client_rect.left;
+    const LONG game_height = game_client_rect.bottom - game_client_rect.top;
+    if (proxy_width <= 0 || proxy_height <= 0 || game_width <= 0 || game_height <= 0)
+        return false;
+    POINT game_client = game_screen;
+    if (!ScreenToClient(g_game_window, &game_client)) return false;
+    POINT proxy_client_point = {
+        MulDiv(game_client.x, proxy_width, game_width),
+        MulDiv(game_client.y, proxy_height, game_height)};
+    proxy_screen = proxy_client_point;
+    return ClientToScreen(g_proxy_window, &proxy_screen) != FALSE;
+}
+
 static void UpdateProxyCursorClip(bool active)
 {
     if (active && g_proxy_window != nullptr && IsWindow(g_proxy_window))
@@ -3020,6 +3253,635 @@ static LRESULT CALLBACK ProxyLowLevelMouseProc(int code, WPARAM wparam, LPARAM l
     return CallNextHookEx(g_proxy_mouse_hook, code, wparam, lparam);
 }
 
+static bool WindowQueryComesFromGameExecutable(void *return_address)
+{
+    HMODULE caller = nullptr;
+    if (return_address == nullptr || !GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(return_address), &caller))
+        return false;
+    return caller == GetModuleHandleW(nullptr);
+}
+
+static bool ShouldVirtualizeWindowQuery(HWND hwnd, void *return_address)
+{
+    return WindowedLogicalSizeEnabled() && g_windowed_virtualization_active.load() &&
+        hwnd != nullptr && hwnd == g_windowed_virtualization_window.load() &&
+        WindowQueryComesFromGameExecutable(return_address);
+}
+
+static bool ShouldScaleWindowInput(HWND hwnd, void *return_address)
+{
+    return WindowedInputScalingEnabled() && g_windowed_virtualization_active.load() &&
+        hwnd != nullptr && hwnd == g_windowed_virtualization_window.load() &&
+        WindowQueryComesFromGameExecutable(return_address);
+}
+
+static bool ShouldScaleDetachedInput(void *return_address)
+{
+    return DetachedPresentationEnabled() && !g_same_window_compositor &&
+        g_proxy_window != nullptr && g_game_window != nullptr &&
+        g_composition_target_window.load() == g_proxy_window &&
+        WindowQueryComesFromGameExecutable(return_address);
+}
+
+static bool MapPhysicalScreenToLogicalScreen(HWND hwnd, POINT &point)
+{
+    RECT physical = {};
+    POINT origin = {};
+    const UINT logical_width = g_windowed_render_width.load();
+    const UINT logical_height = g_windowed_render_height.load();
+    if (g_original_get_client_rect == nullptr || g_original_client_to_screen == nullptr ||
+        !g_original_get_client_rect(hwnd, &physical) ||
+        !g_original_client_to_screen(hwnd, &origin) ||
+        physical.right <= physical.left || physical.bottom <= physical.top ||
+        logical_width == 0 || logical_height == 0)
+        return false;
+    point.x = origin.x + MulDiv(point.x - origin.x,
+        static_cast<int>(logical_width), physical.right - physical.left);
+    point.y = origin.y + MulDiv(point.y - origin.y,
+        static_cast<int>(logical_height), physical.bottom - physical.top);
+    return true;
+}
+
+static bool MapLogicalScreenToPhysicalScreen(HWND hwnd, POINT &point)
+{
+    RECT physical = {};
+    POINT origin = {};
+    const UINT logical_width = g_windowed_render_width.load();
+    const UINT logical_height = g_windowed_render_height.load();
+    if (g_original_get_client_rect == nullptr || g_original_client_to_screen == nullptr ||
+        !g_original_get_client_rect(hwnd, &physical) ||
+        !g_original_client_to_screen(hwnd, &origin) ||
+        physical.right <= physical.left || physical.bottom <= physical.top ||
+        logical_width == 0 || logical_height == 0)
+        return false;
+    point.x = origin.x + MulDiv(point.x - origin.x,
+        physical.right - physical.left, static_cast<int>(logical_width));
+    point.y = origin.y + MulDiv(point.y - origin.y,
+        physical.bottom - physical.top, static_cast<int>(logical_height));
+    return true;
+}
+
+static HCURSOR WINAPI VirtualizedSetCursor(HCURSOR cursor)
+{
+    if (g_original_set_cursor == nullptr)
+        return nullptr;
+
+    const HWND game_window = g_game_window;
+    DWORD game_thread = 0;
+    if (game_window != nullptr)
+        game_thread = GetWindowThreadProcessId(game_window, nullptr);
+    if (DetachedPresentationEnabled() && game_thread != 0 &&
+        GetCurrentThreadId() == game_thread &&
+        !g_reshade_overlay_open.load() && !g_proxy_overlay_open.load())
+    {
+        const uintptr_t previous = g_detached_game_cursor.exchange(
+            reinterpret_cast<uintptr_t>(cursor));
+        const bool observed = g_detached_game_cursor_observed.exchange(true);
+        if (!observed || previous != reinterpret_cast<uintptr_t>(cursor))
+        {
+            if (g_proxy_window != nullptr)
+                PostMessageW(g_proxy_window, WM_SETCURSOR, 0, 0);
+            Log("detached cursor mirrored game request: cursor=%p", cursor);
+        }
+    }
+    return g_original_set_cursor(cursor);
+}
+
+static BOOL WINAPI VirtualizedGetClientRect(HWND hwnd, LPRECT rect)
+{
+    const BOOL result = g_original_get_client_rect != nullptr ?
+        g_original_get_client_rect(hwnd, rect) : FALSE;
+    if (result && rect != nullptr && ShouldVirtualizeWindowQuery(hwnd, _ReturnAddress()))
+    {
+        const UINT width = g_windowed_render_width.load();
+        const UINT height = g_windowed_render_height.load();
+        if (width != 0 && height != 0)
+        {
+            rect->left = 0;
+            rect->top = 0;
+            rect->right = static_cast<LONG>(width);
+            rect->bottom = static_cast<LONG>(height);
+            ++g_windowed_client_query_overrides;
+        }
+    }
+    return result;
+}
+
+static BOOL WINAPI VirtualizedScreenToClient(HWND hwnd, LPPOINT point)
+{
+    // GetCursorPos is virtualized into the logical screen coordinate space.
+    // Applying another scale here would shrink the same point twice.
+    return g_original_screen_to_client != nullptr ?
+        g_original_screen_to_client(hwnd, point) : FALSE;
+}
+
+static BOOL WINAPI VirtualizedClientToScreen(HWND hwnd, LPPOINT point)
+{
+    // Keep ClientToScreen in the same logical coordinate space that the game
+    // receives from messages and GetCursorPos. SetCursorPos performs the one
+    // required logical-to-physical conversion at the OS boundary.
+    return g_original_client_to_screen != nullptr ? g_original_client_to_screen(hwnd, point) : FALSE;
+}
+
+static BOOL WINAPI VirtualizedGetCursorPos(LPPOINT point)
+{
+    if (g_original_get_cursor_pos == nullptr)
+        return FALSE;
+    const void *return_address = _ReturnAddress();
+    const BOOL result = g_original_get_cursor_pos(point);
+    if (result && point != nullptr &&
+        ShouldScaleDetachedInput(const_cast<void *>(return_address)))
+    {
+        POINT game_client = {}, game_screen = {};
+        if (MapProxyScreenPointToGame(*point, game_client, game_screen))
+        {
+            *point = game_screen;
+            ++g_windowed_cursor_query_overrides;
+            return result;
+        }
+    }
+    const HWND hwnd = g_windowed_virtualization_window.load();
+    if (result && point != nullptr && ShouldScaleWindowInput(
+        hwnd, const_cast<void *>(return_address)) &&
+        MapPhysicalScreenToLogicalScreen(hwnd, *point))
+        ++g_windowed_cursor_query_overrides;
+    return result;
+}
+
+static BOOL WINAPI VirtualizedSetCursorPos(int x, int y)
+{
+    if (g_original_set_cursor_pos == nullptr)
+        return FALSE;
+    const void *return_address = _ReturnAddress();
+    POINT point = {x, y};
+    if (ShouldScaleDetachedInput(const_cast<void *>(return_address)))
+    {
+        if (g_auto_detached_presentation_active.load() &&
+            !g_reshade_overlay_open.load() && g_game_window != nullptr)
+        {
+            RECT client = {};
+            POINT origin = {};
+            if (g_original_get_client_rect != nullptr && g_original_client_to_screen != nullptr &&
+                g_original_get_client_rect(g_game_window, &client) &&
+                g_original_client_to_screen(g_game_window, &origin))
+            {
+                const POINT center = {origin.x + (client.right - client.left) / 2,
+                    origin.y + (client.bottom - client.top) / 2};
+                if (std::abs(point.x - center.x) <= 16 && std::abs(point.y - center.y) <= 16)
+                {
+                    const ULONGLONG now = GetTickCount64();
+                    const ULONGLONG previous = g_auto_detached_last_center_warp_tick.exchange(now);
+                    if (previous != 0 && now - previous <= 250)
+                        ++g_auto_detached_center_warps;
+                    else
+                        g_auto_detached_center_warps = 1;
+                    if (g_auto_detached_center_warps.load() == 3 && g_proxy_window != nullptr)
+                    {
+                        PostMessageW(g_proxy_window, WM_SETCURSOR, 0, 0);
+                        Log("automatic detached cursor suppression activated after repeated center warps");
+                    }
+                }
+            }
+        }
+        POINT proxy_screen = {};
+        if (MapGameScreenPointToProxy(point, proxy_screen))
+        {
+            ++g_windowed_cursor_warp_overrides;
+            return g_original_set_cursor_pos(proxy_screen.x, proxy_screen.y);
+        }
+    }
+    const HWND hwnd = g_windowed_virtualization_window.load();
+    if (ShouldScaleWindowInput(hwnd, const_cast<void *>(return_address)) &&
+        MapLogicalScreenToPhysicalScreen(hwnd, point))
+    {
+        ++g_windowed_cursor_warp_overrides;
+        x = point.x;
+        y = point.y;
+    }
+    return g_original_set_cursor_pos(x, y);
+}
+
+static BOOL WINAPI VirtualizedClipCursor(const RECT *rect)
+{
+    if (g_original_clip_cursor == nullptr)
+        return FALSE;
+    if (rect == nullptr)
+    {
+        g_windowed_cursor_clip_virtualized = false;
+        return g_original_clip_cursor(nullptr);
+    }
+
+    const void *return_address = _ReturnAddress();
+    if (ShouldScaleDetachedInput(const_cast<void *>(return_address)))
+    {
+        RECT game_client_rect = {};
+        const LONG requested_width = rect->right - rect->left;
+        const LONG requested_height = rect->bottom - rect->top;
+        POINT top_left = {rect->left, rect->top};
+        POINT bottom_right = {rect->right, rect->bottom};
+        POINT proxy_top_left = {}, proxy_bottom_right = {};
+        if (GetClientRect(g_game_window, &game_client_rect) &&
+            requested_width > 0 && requested_height > 0 &&
+            requested_width <= game_client_rect.right - game_client_rect.left + 64 &&
+            requested_height <= game_client_rect.bottom - game_client_rect.top + 64 &&
+            MapGameScreenPointToProxy(top_left, proxy_top_left) &&
+            MapGameScreenPointToProxy(bottom_right, proxy_bottom_right))
+        {
+            const RECT physical = {proxy_top_left.x, proxy_top_left.y,
+                proxy_bottom_right.x, proxy_bottom_right.y};
+            g_windowed_cursor_clip_virtualized = true;
+            ++g_windowed_cursor_clip_overrides;
+            return g_original_clip_cursor(&physical);
+        }
+    }
+    const HWND hwnd = g_windowed_virtualization_window.load();
+    const LONG width = rect->right - rect->left;
+    const LONG height = rect->bottom - rect->top;
+    const UINT logical_width = g_windowed_render_width.load();
+    const UINT logical_height = g_windowed_render_height.load();
+    // Only expand a rectangle which can plausibly be the logical game client.
+    // A game may also pass a physical monitor/virtual-desktop rectangle, which
+    // must not be enlarged a second time.
+    if (ShouldScaleWindowInput(hwnd, const_cast<void *>(return_address)) &&
+        width > 0 && height > 0 && logical_width != 0 && logical_height != 0 &&
+        width <= static_cast<LONG>(logical_width) + 64 &&
+        height <= static_cast<LONG>(logical_height) + 64)
+    {
+        POINT top_left = {rect->left, rect->top};
+        POINT bottom_right = {rect->right, rect->bottom};
+        if (MapLogicalScreenToPhysicalScreen(hwnd, top_left) &&
+            MapLogicalScreenToPhysicalScreen(hwnd, bottom_right))
+        {
+            const RECT physical = {top_left.x, top_left.y, bottom_right.x, bottom_right.y};
+            g_windowed_cursor_clip_virtualized = true;
+            ++g_windowed_cursor_clip_overrides;
+            return g_original_clip_cursor(&physical);
+        }
+    }
+    g_windowed_cursor_clip_virtualized = false;
+    return g_original_clip_cursor(rect);
+}
+
+static BOOL WINAPI VirtualizedGetClipCursor(LPRECT rect)
+{
+    if (g_original_get_clip_cursor == nullptr)
+        return FALSE;
+    const BOOL result = g_original_get_clip_cursor(rect);
+    if (result && rect != nullptr && g_windowed_cursor_clip_virtualized.load() &&
+        ShouldScaleDetachedInput(_ReturnAddress()))
+    {
+        POINT client = {}, logical_top_left = {}, logical_bottom_right = {};
+        if (MapProxyScreenPointToGame({rect->left, rect->top}, client, logical_top_left) &&
+            MapProxyScreenPointToGame({rect->right, rect->bottom}, client, logical_bottom_right))
+        {
+            rect->left = logical_top_left.x;
+            rect->top = logical_top_left.y;
+            rect->right = logical_bottom_right.x;
+            rect->bottom = logical_bottom_right.y;
+            return result;
+        }
+    }
+    const HWND hwnd = g_windowed_virtualization_window.load();
+    if (result && rect != nullptr && g_windowed_cursor_clip_virtualized.load() &&
+        ShouldScaleWindowInput(hwnd, _ReturnAddress()))
+    {
+        POINT top_left = {rect->left, rect->top};
+        POINT bottom_right = {rect->right, rect->bottom};
+        if (MapPhysicalScreenToLogicalScreen(hwnd, top_left) &&
+            MapPhysicalScreenToLogicalScreen(hwnd, bottom_right))
+        {
+            rect->left = top_left.x;
+            rect->top = top_left.y;
+            rect->right = bottom_right.x;
+            rect->bottom = bottom_right.y;
+        }
+    }
+    return result;
+}
+
+static bool AdoptWindowResolutionIntent(HWND hwnd, int requested_width, int requested_height,
+    int &native_x, int &native_y, int &native_width, int &native_height, void *return_address)
+{
+    if (!ShouldVirtualizeWindowQuery(hwnd, return_address) ||
+        requested_width < 640 || requested_height < 360)
+        return false;
+
+    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info = {sizeof(info)};
+    if (!GetMonitorInfoW(monitor, &info))
+        return false;
+    native_x = info.rcMonitor.left;
+    native_y = info.rcMonitor.top;
+    native_width = info.rcMonitor.right - info.rcMonitor.left;
+    native_height = info.rcMonitor.bottom - info.rcMonitor.top;
+
+    // SetWindowPos and MoveWindow normally specify the outer dimensions. Work
+    // backwards from the window frame so a conventional decorated 2560x1440
+    // request is still recognized as a 2560x1440 logical client request.
+    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    LONG_PTR ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    RECT frame = {};
+    AdjustWindowRectEx(&frame, static_cast<DWORD>(style), FALSE, static_cast<DWORD>(ex_style));
+    const int frame_width = (frame.right - frame.left);
+    const int frame_height = (frame.bottom - frame.top);
+    int logical_width = std::max(1, requested_width - frame_width);
+    int logical_height = std::max(1, requested_height - frame_height);
+
+    // When the addon has already made the window popup/borderless, the request
+    // is the client size directly. Reject monitor-sized operations because
+    // those are placement maintenance, not an in-game resolution selection.
+    if (logical_width >= native_width && logical_height >= native_height)
+        return false;
+    if (logical_width > native_width || logical_height > native_height)
+        return false;
+
+    // Avoid treating tool-window or transient layout changes as render modes.
+    // Common game resolution changes preserve the monitor aspect ratio.
+    const long long aspect_error = std::llabs(
+        static_cast<long long>(logical_width) * native_height -
+        static_cast<long long>(logical_height) * native_width);
+    const long long aspect_scale = static_cast<long long>(logical_width) * native_height;
+    if (aspect_scale == 0 || aspect_error * 100 > aspect_scale * 3)
+        return false;
+
+    const UINT previous_width = g_windowed_render_width.exchange(static_cast<UINT>(logical_width));
+    const UINT previous_height = g_windowed_render_height.exchange(static_cast<UINT>(logical_height));
+    const unsigned long long intents = ++g_windowed_resolution_intents;
+    if (logical_width != static_cast<int>(previous_width) ||
+        logical_height != static_cast<int>(previous_height) || intents <= 4)
+        Log("logical-client resolution intent adopted: requested_outer=%dx%d logical=%dx%d previous=%ux%u native_host=%dx%d count=%llu",
+            requested_width, requested_height, logical_width, logical_height,
+            previous_width, previous_height, native_width, native_height, intents);
+    return true;
+}
+
+static BOOL WINAPI VirtualizedSetWindowPos(HWND hwnd, HWND insert_after, int x, int y,
+    int width, int height, UINT flags)
+{
+    if (g_original_set_window_pos == nullptr)
+        return FALSE;
+    int native_x = 0, native_y = 0, native_width = 0, native_height = 0;
+    if ((flags & SWP_NOSIZE) == 0 && AdoptWindowResolutionIntent(hwnd, width, height,
+        native_x, native_y, native_width, native_height, _ReturnAddress()))
+    {
+        x = native_x;
+        y = native_y;
+        width = native_width;
+        height = native_height;
+        flags &= ~(SWP_NOMOVE | SWP_NOSIZE);
+        flags |= SWP_NOACTIVATE;
+    }
+    return g_original_set_window_pos(hwnd, insert_after, x, y, width, height, flags);
+}
+
+static BOOL WINAPI VirtualizedMoveWindow(HWND hwnd, int x, int y, int width, int height, BOOL repaint)
+{
+    if (g_original_move_window == nullptr)
+        return FALSE;
+    int native_x = 0, native_y = 0, native_width = 0, native_height = 0;
+    if (AdoptWindowResolutionIntent(hwnd, width, height,
+        native_x, native_y, native_width, native_height, _ReturnAddress()))
+        return g_original_move_window(hwnd, native_x, native_y, native_width, native_height, repaint);
+    return g_original_move_window(hwnd, x, y, width, height, repaint);
+}
+
+static void RemoveWindowQueryHooks()
+{
+    if (!g_window_query_hooks_installed)
+        return;
+    for (void *target : {g_get_client_rect_target, g_screen_to_client_target, g_client_to_screen_target,
+        g_set_cursor_target,
+        g_get_cursor_pos_target, g_set_cursor_pos_target, g_clip_cursor_target, g_get_clip_cursor_target,
+        g_set_window_pos_target, g_move_window_target})
+    {
+        if (target != nullptr)
+        {
+            MH_DisableHook(target);
+            MH_RemoveHook(target);
+        }
+    }
+    g_get_client_rect_target = nullptr;
+    g_screen_to_client_target = nullptr;
+    g_client_to_screen_target = nullptr;
+    g_set_cursor_target = nullptr;
+    g_get_cursor_pos_target = nullptr;
+    g_set_cursor_pos_target = nullptr;
+    g_clip_cursor_target = nullptr;
+    g_get_clip_cursor_target = nullptr;
+    g_set_window_pos_target = nullptr;
+    g_move_window_target = nullptr;
+    g_original_get_client_rect = nullptr;
+    g_original_screen_to_client = nullptr;
+    g_original_client_to_screen = nullptr;
+    g_original_set_cursor = nullptr;
+    g_original_get_cursor_pos = nullptr;
+    g_original_set_cursor_pos = nullptr;
+    g_original_clip_cursor = nullptr;
+    g_original_get_clip_cursor = nullptr;
+    g_original_set_window_pos = nullptr;
+    g_original_move_window = nullptr;
+    g_windowed_cursor_clip_virtualized = false;
+    g_window_query_hooks_installed = false;
+}
+
+static bool InstallWindowQueryHooks()
+{
+    if (g_window_query_hooks_installed)
+        return true;
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32 == nullptr)
+        return false;
+    g_get_client_rect_target = GetProcAddress(user32, "GetClientRect");
+    g_screen_to_client_target = GetProcAddress(user32, "ScreenToClient");
+    g_client_to_screen_target = GetProcAddress(user32, "ClientToScreen");
+    g_set_cursor_target = GetProcAddress(user32, "SetCursor");
+    g_get_cursor_pos_target = GetProcAddress(user32, "GetCursorPos");
+    g_set_cursor_pos_target = GetProcAddress(user32, "SetCursorPos");
+    g_clip_cursor_target = GetProcAddress(user32, "ClipCursor");
+    g_get_clip_cursor_target = GetProcAddress(user32, "GetClipCursor");
+    g_set_window_pos_target = GetProcAddress(user32, "SetWindowPos");
+    g_move_window_target = GetProcAddress(user32, "MoveWindow");
+    if (g_get_client_rect_target == nullptr || g_screen_to_client_target == nullptr ||
+        g_client_to_screen_target == nullptr || g_set_cursor_target == nullptr ||
+        g_get_cursor_pos_target == nullptr ||
+        g_set_cursor_pos_target == nullptr || g_clip_cursor_target == nullptr ||
+        g_get_clip_cursor_target == nullptr || g_set_window_pos_target == nullptr ||
+        g_move_window_target == nullptr)
+        return false;
+
+    MH_STATUS status = MH_Initialize();
+    if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED)
+    {
+        Log("logical-client API virtualization could not initialize hook engine: %s", MH_StatusToString(status));
+        return false;
+    }
+    status = MH_CreateHook(g_get_client_rect_target, reinterpret_cast<void *>(VirtualizedGetClientRect),
+        reinterpret_cast<void **>(&g_original_get_client_rect));
+    if (status == MH_OK)
+        status = MH_CreateHook(g_screen_to_client_target, reinterpret_cast<void *>(VirtualizedScreenToClient),
+            reinterpret_cast<void **>(&g_original_screen_to_client));
+    if (status == MH_OK)
+        status = MH_CreateHook(g_client_to_screen_target, reinterpret_cast<void *>(VirtualizedClientToScreen),
+            reinterpret_cast<void **>(&g_original_client_to_screen));
+    if (status == MH_OK)
+        status = MH_CreateHook(g_set_cursor_target, reinterpret_cast<void *>(VirtualizedSetCursor),
+            reinterpret_cast<void **>(&g_original_set_cursor));
+    if (status == MH_OK)
+        status = MH_CreateHook(g_get_cursor_pos_target, reinterpret_cast<void *>(VirtualizedGetCursorPos),
+            reinterpret_cast<void **>(&g_original_get_cursor_pos));
+    if (status == MH_OK)
+        status = MH_CreateHook(g_set_cursor_pos_target, reinterpret_cast<void *>(VirtualizedSetCursorPos),
+            reinterpret_cast<void **>(&g_original_set_cursor_pos));
+    if (status == MH_OK)
+        status = MH_CreateHook(g_clip_cursor_target, reinterpret_cast<void *>(VirtualizedClipCursor),
+            reinterpret_cast<void **>(&g_original_clip_cursor));
+    if (status == MH_OK)
+        status = MH_CreateHook(g_get_clip_cursor_target, reinterpret_cast<void *>(VirtualizedGetClipCursor),
+            reinterpret_cast<void **>(&g_original_get_clip_cursor));
+    if (status == MH_OK)
+        status = MH_CreateHook(g_set_window_pos_target, reinterpret_cast<void *>(VirtualizedSetWindowPos),
+            reinterpret_cast<void **>(&g_original_set_window_pos));
+    if (status == MH_OK)
+        status = MH_CreateHook(g_move_window_target, reinterpret_cast<void *>(VirtualizedMoveWindow),
+            reinterpret_cast<void **>(&g_original_move_window));
+    if (status == MH_OK) status = MH_EnableHook(g_get_client_rect_target);
+    if (status == MH_OK) status = MH_EnableHook(g_screen_to_client_target);
+    if (status == MH_OK) status = MH_EnableHook(g_client_to_screen_target);
+    if (status == MH_OK) status = MH_EnableHook(g_set_cursor_target);
+    if (status == MH_OK) status = MH_EnableHook(g_get_cursor_pos_target);
+    if (status == MH_OK) status = MH_EnableHook(g_set_cursor_pos_target);
+    if (status == MH_OK) status = MH_EnableHook(g_clip_cursor_target);
+    if (status == MH_OK) status = MH_EnableHook(g_get_clip_cursor_target);
+    if (status == MH_OK) status = MH_EnableHook(g_set_window_pos_target);
+    if (status == MH_OK) status = MH_EnableHook(g_move_window_target);
+    if (status != MH_OK)
+    {
+        Log("logical-client API virtualization hook installation failed: %s", MH_StatusToString(status));
+        // Remove any hooks that were created before the failure. Do not call
+        // MH_Uninitialize: the Vulkan bootstrap hook may share this instance.
+        for (void *target : {g_get_client_rect_target, g_screen_to_client_target, g_client_to_screen_target,
+            g_set_cursor_target,
+            g_get_cursor_pos_target, g_set_cursor_pos_target, g_clip_cursor_target, g_get_clip_cursor_target,
+            g_set_window_pos_target, g_move_window_target})
+            if (target != nullptr) { MH_DisableHook(target); MH_RemoveHook(target); }
+        g_original_get_client_rect = nullptr;
+        g_original_screen_to_client = nullptr;
+        g_original_client_to_screen = nullptr;
+        g_original_set_cursor = nullptr;
+        g_original_get_cursor_pos = nullptr;
+        g_original_set_cursor_pos = nullptr;
+        g_original_clip_cursor = nullptr;
+        g_original_get_clip_cursor = nullptr;
+        g_original_set_window_pos = nullptr;
+        g_original_move_window = nullptr;
+        return false;
+    }
+    g_window_query_hooks_installed = true;
+    Log("logical-client API virtualization installed: size queries + coherent cursor polling/warping/clipping/messages + resolution placement (game executable callers only)");
+    return true;
+}
+
+static LRESULT CALLBACK WindowedVirtualizationWndProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
+{
+    WNDPROC original = g_windowed_original_wndproc;
+    if (original == nullptr)
+        return DefWindowProcW(hwnd, message, wparam, lparam);
+
+    // Some engines derive their render viewport directly from WM_SIZE. The
+    // actual HWND must be monitor-sized so DirectComposition is not clipped,
+    // but the game must continue to see its reduced logical render size.
+    WINDOWPOS logical_window_position = {};
+    if (message == WM_WINDOWPOSCHANGED && lparam != 0 &&
+        WindowedLogicalSizeEnabled() && g_windowed_virtualization_active.load() &&
+        hwnd == g_windowed_virtualization_window.load())
+    {
+        logical_window_position = *reinterpret_cast<WINDOWPOS *>(lparam);
+        logical_window_position.cx = static_cast<int>(g_windowed_render_width.load());
+        logical_window_position.cy = static_cast<int>(g_windowed_render_height.load());
+        lparam = reinterpret_cast<LPARAM>(&logical_window_position);
+    }
+    if (message == WM_SIZE && wparam != SIZE_MINIMIZED &&
+        WindowedLogicalSizeEnabled() && g_windowed_virtualization_active.load() &&
+        hwnd == g_windowed_virtualization_window.load())
+    {
+        const UINT width = g_windowed_render_width.load();
+        const UINT height = g_windowed_render_height.load();
+        if (width > 0 && height > 0 && width <= 0xffff && height <= 0xffff)
+        {
+            lparam = MAKELPARAM(width, height);
+            ++g_windowed_logical_size_overrides;
+        }
+    }
+    const bool client_mouse_message = message == WM_MOUSEMOVE ||
+        message == WM_LBUTTONDOWN || message == WM_LBUTTONUP ||
+        message == WM_RBUTTONDOWN || message == WM_RBUTTONUP ||
+        message == WM_MBUTTONDOWN || message == WM_MBUTTONUP ||
+        message == WM_XBUTTONDOWN || message == WM_XBUTTONUP;
+    if (client_mouse_message && !g_reshade_overlay_open.load() && WindowedInputScalingEnabled() &&
+        g_windowed_virtualization_active.load() && hwnd == g_windowed_virtualization_window.load())
+    {
+        RECT physical = {};
+        const UINT logical_width = g_windowed_render_width.load();
+        const UINT logical_height = g_windowed_render_height.load();
+        if (GetClientRect(hwnd, &physical) && physical.right > physical.left && physical.bottom > physical.top &&
+            logical_width != 0 && logical_height != 0)
+        {
+            const int x = static_cast<short>(LOWORD(lparam));
+            const int y = static_cast<short>(HIWORD(lparam));
+            const int logical_x = MulDiv(x, static_cast<int>(logical_width), physical.right - physical.left);
+            const int logical_y = MulDiv(y, static_cast<int>(logical_height), physical.bottom - physical.top);
+            lparam = MAKELPARAM(static_cast<short>(logical_x), static_cast<short>(logical_y));
+            ++g_windowed_mouse_message_overrides;
+        }
+    }
+    return CallWindowProcW(original, hwnd, message, wparam, lparam);
+}
+
+static bool EnsureWindowedLogicalSizeSubclass(HWND game_window)
+{
+    if (!WindowedLogicalSizeEnabled() && !WindowedInputScalingEnabled())
+        return true;
+    if (!InstallWindowQueryHooks())
+        return false;
+    if (g_windowed_subclassed_window == game_window &&
+        reinterpret_cast<WNDPROC>(GetWindowLongPtrW(game_window, GWLP_WNDPROC)) == WindowedVirtualizationWndProc)
+        return true;
+    if (g_windowed_subclassed_window != nullptr && g_windowed_subclassed_window != game_window)
+    {
+        Log("logical-size message virtualization refused a second HWND: current=%p requested=%p",
+            g_windowed_subclassed_window, game_window);
+        return false;
+    }
+
+    SetLastError(ERROR_SUCCESS);
+    const LONG_PTR previous = SetWindowLongPtrW(game_window, GWLP_WNDPROC,
+        reinterpret_cast<LONG_PTR>(WindowedVirtualizationWndProc));
+    if (previous == 0 && GetLastError() != ERROR_SUCCESS)
+    {
+        Log("logical-size message virtualization could not subclass HWND=%p error=%lu",
+            game_window, GetLastError());
+        return false;
+    }
+    g_windowed_original_wndproc = reinterpret_cast<WNDPROC>(previous);
+    g_windowed_subclassed_window = game_window;
+    Log("logical-size WM_SIZE virtualization installed for HWND=%p", game_window);
+    return true;
+}
+
+static void RestoreWindowedLogicalSizeSubclass()
+{
+    HWND hwnd = g_windowed_subclassed_window;
+    WNDPROC original = g_windowed_original_wndproc;
+    if (hwnd != nullptr && original != nullptr && IsWindow(hwnd) &&
+        reinterpret_cast<WNDPROC>(GetWindowLongPtrW(hwnd, GWLP_WNDPROC)) == WindowedVirtualizationWndProc)
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(original));
+    g_windowed_subclassed_window = nullptr;
+    g_windowed_original_wndproc = nullptr;
+    RemoveWindowQueryHooks();
+}
+
 static void ApplyDeferredWindowedVirtualization(HWND game_window)
 {
     struct PendingGuard
@@ -3030,7 +3892,7 @@ static void ApplyDeferredWindowedVirtualization(HWND game_window)
     if (game_window == nullptr || !IsWindow(game_window))
         return;
 
-    if (!g_windowed_virtualization_enabled)
+    if (!WindowedVirtualizationEnabled())
     {
         if (!g_windowed_virtualization_active.load() ||
             !g_windowed_original_state_saved || g_windowed_original_window != game_window)
@@ -3048,6 +3910,7 @@ static void ApplyDeferredWindowedVirtualization(HWND game_window)
             g_windowed_original_rect.left, g_windowed_original_rect.top,
             g_windowed_original_rect.right - g_windowed_original_rect.left,
             g_windowed_original_rect.bottom - g_windowed_original_rect.top);
+        RestoreWindowedLogicalSizeSubclass();
         g_windowed_original_state_saved = false;
         g_windowed_original_window = nullptr;
         return;
@@ -3083,6 +3946,13 @@ static void ApplyDeferredWindowedVirtualization(HWND game_window)
     // request to the reduced render dimensions rather than the new client size.
     g_windowed_virtualization_window = game_window;
     g_windowed_virtualization_active = true;
+    if (!EnsureWindowedLogicalSizeSubclass(game_window))
+    {
+        // Do not enlarge the client if the selected compatibility contract
+        // cannot be installed; doing so produces a cropped upper-left image.
+        g_windowed_virtualization_active = false;
+        return;
+    }
 
     LONG_PTR style = GetWindowLongPtrW(game_window, GWL_STYLE);
     style &= ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU);
@@ -3102,6 +3972,10 @@ static void ApplyDeferredWindowedVirtualization(HWND game_window)
 
     Log("windowed virtualization active: render=%ux%u client target=%ldx%ld hwnd=%p",
         render_width, render_height, monitor_width, monitor_height, game_window);
+    if (WindowedLogicalSizeEnabled())
+        Log("windowed virtualization is preserving logical client=%ux%u (messages=%llu queries=%llu coordinates=%llu)",
+            render_width, render_height, g_windowed_logical_size_overrides.load(),
+            g_windowed_client_query_overrides.load(), g_windowed_coordinate_overrides.load());
 }
 
 static DWORD WINAPI DeferredWindowedVirtualizationWorker(void *parameter)
@@ -3119,6 +3993,86 @@ static void QueueWindowedVirtualization(HWND game_window)
     {
         g_windowed_virtualization_pending = false;
         Log("windowed virtualization worker could not be queued: error=%lu", GetLastError());
+    }
+}
+
+static void ScheduleWindowedVirtualization(HWND game_window, ULONGLONG delay_ms)
+{
+    if (game_window == nullptr || !IsWindow(game_window))
+        return;
+    g_windowed_reapply_window = game_window;
+    g_windowed_reapply_after_tick = GetTickCount64() + delay_ms;
+    Log("windowed virtualization scheduled after swapchain transition: delay=%llums hwnd=%p",
+        delay_ms, game_window);
+}
+
+static void ApplyDetachedFallbackWindowRepair(HWND game_window)
+{
+    struct PendingGuard
+    {
+        ~PendingGuard() { g_detached_window_repair_pending = false; }
+    } pending_guard;
+
+    if (game_window == nullptr || !IsWindow(game_window) ||
+        !g_auto_detached_presentation_active.load() ||
+        !g_auto_windowed_transpose_seen.load())
+        return;
+
+    const UINT render_width = g_windowed_render_width.load();
+    const UINT render_height = g_windowed_render_height.load();
+    if (render_width < 640 || render_height < 360)
+        return;
+
+    HMONITOR monitor = MonitorFromWindow(game_window, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info = {sizeof(info)};
+    if (!GetMonitorInfoW(monitor, &info))
+        return;
+
+    const LONG_PTR style = GetWindowLongPtrW(game_window, GWL_STYLE);
+    const LONG_PTR ex_style = GetWindowLongPtrW(game_window, GWL_EXSTYLE);
+    RECT desired = {0, 0, static_cast<LONG>(render_width), static_cast<LONG>(render_height)};
+    if (!AdjustWindowRectEx(&desired, static_cast<DWORD>(style), FALSE,
+        static_cast<DWORD>(ex_style)))
+        return;
+    const int outer_width = desired.right - desired.left;
+    const int outer_height = desired.bottom - desired.top;
+    const int monitor_width = info.rcMonitor.right - info.rcMonitor.left;
+    const int monitor_height = info.rcMonitor.bottom - info.rcMonitor.top;
+    const int x = info.rcMonitor.left + (monitor_width - outer_width) / 2;
+    const int y = info.rcMonitor.top + (monitor_height - outer_height) / 2;
+
+    if (!SetWindowPos(game_window, nullptr, x, y, outer_width, outer_height,
+        SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW))
+    {
+        Log("detached fallback physical-window repair failed: error=%lu target_client=%ux%u",
+            GetLastError(), render_width, render_height);
+        return;
+    }
+
+    RECT client = {};
+    GetClientRect(game_window, &client);
+    const unsigned long long repairs = ++g_detached_window_repairs;
+    g_need_history_reset = true;
+    Log("detached fallback repaired transposed physical client: target=%ux%u actual=%ldx%ld outer=%dx%d count=%llu",
+        render_width, render_height, client.right - client.left, client.bottom - client.top,
+        outer_width, outer_height, repairs);
+}
+
+static DWORD WINAPI DetachedFallbackWindowRepairWorker(void *parameter)
+{
+    ApplyDetachedFallbackWindowRepair(static_cast<HWND>(parameter));
+    return 0;
+}
+
+static void QueueDetachedFallbackWindowRepair(HWND game_window)
+{
+    if (game_window == nullptr || !IsWindow(game_window) ||
+        g_detached_window_repair_pending.exchange(true))
+        return;
+    if (!QueueUserWorkItem(DetachedFallbackWindowRepairWorker, game_window, WT_EXECUTEDEFAULT))
+    {
+        g_detached_window_repair_pending = false;
+        Log("detached fallback physical-window repair could not be queued: error=%lu", GetLastError());
     }
 }
 
@@ -3156,6 +4110,108 @@ static DWORD WINAPI DeferredFullscreenWorker(void *parameter)
     return 0;
 }
 
+static bool RetargetCompositionWindow(HWND target_window)
+{
+    if (target_window == nullptr || !IsWindow(target_window) ||
+        !g_composition_device || !g_composition_visual)
+        return false;
+    if (target_window == g_composition_target_window.load())
+        return true;
+
+    Microsoft::WRL::ComPtr<IDCompositionTarget> new_target;
+    HRESULT hr = g_composition_device->CreateTargetForHwnd(
+        target_window, TRUE, &new_target);
+    if (FAILED(hr))
+    {
+        Log("composition host migration could not create target: old=%p new=%p hr=0x%08X",
+            g_composition_target_window.load(), target_window, static_cast<unsigned int>(hr));
+        return false;
+    }
+
+    const HWND old_window = g_composition_target_window.load();
+    Microsoft::WRL::ComPtr<IDCompositionTarget> old_target = g_composition_target;
+    if (old_target)
+        old_target->SetRoot(nullptr);
+    hr = new_target->SetRoot(g_composition_visual.Get());
+    if (SUCCEEDED(hr))
+        hr = g_composition_device->Commit();
+    if (FAILED(hr))
+    {
+        // Restore the previous visual tree if the migration could not be
+        // committed. Keeping the last working output is safer than leaving
+        // both presentation hosts blank after a mode switch.
+        if (old_target)
+        {
+            old_target->SetRoot(g_composition_visual.Get());
+            g_composition_device->Commit();
+        }
+        Log("composition host migration failed: old=%p new=%p hr=0x%08X",
+            old_window, target_window, static_cast<unsigned int>(hr));
+        return false;
+    }
+
+    g_composition_target = new_target;
+    g_composition_target_window = target_window;
+    g_same_window_compositor = target_window == g_game_window;
+
+    const bool show = !g_proxy_hidden && !g_proxy_failed &&
+        !g_proxy_overlay_bypass && !g_proxy_early_pending_activation;
+    if (g_same_window_compositor)
+    {
+        if (g_proxy_window != nullptr)
+            ShowWindow(g_proxy_window, SW_HIDE);
+    }
+    else if (target_window == g_proxy_window)
+    {
+        if (show)
+            ShowWindow(g_proxy_window, SW_SHOWNOACTIVATE);
+        else
+            ShowWindow(g_proxy_window, SW_HIDE);
+    }
+    if (g_composition_effect)
+    {
+        g_composition_effect->SetOpacity(show ? 1.0f : 0.0f);
+        g_composition_device->Commit();
+    }
+
+    Log("composition host migrated: old=%p new=%p ownership=%s visible=%s",
+        old_window, target_window,
+        g_same_window_compositor ? "attached/game-HWND" : "detached/proxy-HWND",
+        show ? "yes" : "no");
+    return true;
+}
+
+static void QueueCompositionRetarget(HWND target_window)
+{
+    if (target_window == nullptr || target_window == g_composition_target_window.load() ||
+        target_window == g_composition_retarget_pending.load())
+        return;
+    const HWND dispatcher = g_proxy_window;
+    if (dispatcher == nullptr || !IsWindow(dispatcher))
+        return;
+    g_composition_retarget_pending = target_window;
+    if (!PostMessageW(dispatcher, kProxyRetargetCompositionMessage,
+        reinterpret_cast<WPARAM>(target_window), 0))
+    {
+        g_composition_retarget_pending = nullptr;
+        Log("composition host migration could not be queued: target=%p error=%lu",
+            target_window, GetLastError());
+    }
+}
+
+static bool IsGameProcessForeground(HWND foreground)
+{
+    if (foreground == nullptr || g_game_window == nullptr)
+        return false;
+    if (foreground == g_game_window || GetAncestor(foreground, GA_ROOT) == g_game_window)
+        return true;
+    DWORD foreground_process = 0;
+    DWORD game_process = 0;
+    GetWindowThreadProcessId(foreground, &foreground_process);
+    GetWindowThreadProcessId(g_game_window, &game_process);
+    return foreground_process != 0 && foreground_process == game_process;
+}
+
 static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
 {
     if (message == kProxyVirtualizeFullscreenMessage)
@@ -3167,7 +4223,23 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
     {
         if (wparam != 0 && !g_proxy_hidden && !g_proxy_failed &&
             !g_proxy_overlay_bypass && !g_proxy_early_pending_activation)
-            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        {
+            // ShowWindow alone can leave a startup-created Vulkan host behind
+            // the game's later top-level window. Reassert its topmost band on
+            // the first completed processed frame without stealing focus.
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+            SetCursor(DetachedProxyCursor(
+                g_reshade_overlay_open.load() || g_proxy_overlay_open.load()));
+            g_proxy_watchdog_hidden = false;
+            if (DetachedPresentationEnabled() && !g_same_window_compositor &&
+                !g_detached_binding_refreshed && !g_detached_binding_refresh_queued)
+            {
+                g_detached_binding_refresh_queued = true;
+                SetTimer(hwnd, 2, 750, nullptr);
+            }
+        }
         else
         {
             UpdateProxyCursorClip(false);
@@ -3184,6 +4256,13 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
                 info.rcMonitor.right - info.rcMonitor.left, info.rcMonitor.bottom - info.rcMonitor.top,
                 SWP_NOACTIVATE | (g_proxy_hidden || g_proxy_overlay_bypass || g_proxy_failed ||
                     g_proxy_early_pending_activation ? 0 : SWP_SHOWWINDOW));
+        return 0;
+    }
+    if (message == kProxyRetargetCompositionMessage)
+    {
+        const HWND target_window = reinterpret_cast<HWND>(wparam);
+        RetargetCompositionWindow(target_window);
+        g_composition_retarget_pending = nullptr;
         return 0;
     }
     if (message == kProxyOverlayInputModeMessage)
@@ -3213,6 +4292,7 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
         {
             SetForegroundWindow(g_game_window);
         }
+        SetCursor(DetachedProxyCursor(overlay_input));
         Log("native proxy input mode: %s foreground=%p focus=%p",
             overlay_input ? "ReShade overlay capture" : "game click-through",
             GetForegroundWindow(), GetFocus());
@@ -3231,14 +4311,37 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
         return MA_ACTIVATE;
     if (message == WM_ERASEBKGND) return 1;
     if (message == WM_CLOSE) { DestroyWindow(hwnd); return 0; }
-    if (message == WM_DESTROY) { KillTimer(hwnd, 1); PostQuitMessage(0); return 0; }
+    if (message == WM_DESTROY) { KillTimer(hwnd, 1); KillTimer(hwnd, 2); PostQuitMessage(0); return 0; }
+    if (message == WM_TIMER && wparam == 2)
+    {
+        KillTimer(hwnd, 2);
+        g_detached_binding_refresh_queued = false;
+        if (!g_detached_binding_refreshed && DetachedPresentationEnabled() &&
+            g_composition_target_window.load() == g_proxy_window)
+        {
+            // A Vulkan window created during startup can leave the first DComp
+            // target visually stale even while its swapchain keeps presenting.
+            // A mode switch fixes it by migrating away and back; perform that
+            // same transaction once after the first processed frame settles.
+            const bool attached = RetargetCompositionWindow(g_game_window);
+            const bool detached = attached && RetargetCompositionWindow(g_proxy_window);
+            g_detached_binding_refreshed = detached;
+            Log("detached startup binding refresh: attach=%s detach=%s target=%p",
+                attached ? "ok" : "failed", detached ? "ok" : "failed",
+                g_composition_target_window.load());
+        }
+        else
+        {
+            g_detached_binding_refreshed = true;
+        }
+        return 0;
+    }
     if (message == WM_TIMER && wparam == 1)
     {
         const ULONGLONG now = GetTickCount64();
         const ULONGLONG last_present = g_last_primary_present_tick.load();
         const HWND foreground = GetForegroundWindow();
-        const bool game_foreground = g_game_window != nullptr &&
-            (foreground == g_game_window || GetAncestor(foreground, GA_ROOT) == g_game_window);
+        const bool game_foreground = IsGameProcessForeground(foreground);
         const bool primary_alive = g_game_window != nullptr && IsWindow(g_game_window) &&
             last_present != 0 && now - last_present < 5000;
         if ((!primary_alive || !game_foreground) && !g_proxy_hidden && IsWindowVisible(hwnd))
@@ -3246,23 +4349,54 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
             UpdateProxyCursorClip(false);
             ShowWindow(hwnd, SW_HIDE);
             g_proxy_watchdog_hidden = true;
+            Log("detached proxy watchdog hid output: primary_alive=%u foreground=%p game_hwnd=%p same_process=%u",
+                primary_alive ? 1u : 0u, foreground, g_game_window,
+                IsGameProcessForeground(foreground) ? 1u : 0u);
+        }
+        else if (primary_alive && game_foreground && !g_proxy_hidden &&
+            !g_proxy_overlay_bypass && !g_proxy_failed &&
+            !g_proxy_early_pending_activation && IsWindowVisible(hwnd))
+        {
+            // Borderless Vulkan windows commonly promote themselves after a
+            // mode switch. Reassert the detached visual's z-order without
+            // activating it or disturbing the game's input focus.
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
         }
         return 0;
     }
     if (message == WM_SETCURSOR)
     {
-        SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)));
+        const bool overlay_input = g_reshade_overlay_open.load() ||
+            g_proxy_overlay_open.load();
+        SetCursor(DetachedProxyCursor(overlay_input));
         return TRUE;
     }
-    // The foreground game continues receiving its registered raw/relative mouse
-    // input even though this no-activate proxy covers its reduced window. Posting
-    // an additional, scaled absolute WM_MOUSEMOVE makes games which recenter the
-    // cursor feed that position back through the proxy repeatedly (visible as
-    // cursor "gravity"). Leave movement to the game's native raw-input path and
-    // bridge only events whose hit target is otherwise consumed by the proxy.
     if (message == WM_MOUSEMOVE && g_game_window != nullptr)
-        return g_reshade_overlay_open.load() && g_proxy_runtime.load() != nullptr ?
-            DefWindowProcW(hwnd, message, wparam, lparam) : 0;
+    {
+        if (g_reshade_overlay_open.load() && g_proxy_runtime.load() != nullptr)
+            return DefWindowProcW(hwnd, message, wparam, lparam);
+        CURSORINFO cursor_info = {sizeof(cursor_info)};
+        // Relative-look games continue receiving WM_INPUT directly. Forward
+        // absolute movement only while a visible menu cursor exists. The
+        // detached Get/SetCursorPos hooks keep any game recenter operation in
+        // the same coordinate space, avoiding the old recursive "gravity".
+        if (DetachedCursorHidden() ||
+            (GetCursorInfo(&cursor_info) && (cursor_info.flags & CURSOR_SHOWING) != 0))
+        {
+            POINT screen_point = {static_cast<short>(LOWORD(lparam)), static_cast<short>(HIWORD(lparam))};
+            ClientToScreen(hwnd, &screen_point);
+            POINT game_client = {}, game_screen = {};
+            if (MapProxyScreenPointToGame(screen_point, game_client, game_screen))
+            {
+                const LPARAM mapped = MAKELPARAM(static_cast<short>(game_client.x),
+                    static_cast<short>(game_client.y));
+                if (PostMessageW(g_game_window, WM_MOUSEMOVE, wparam, mapped))
+                    ++g_overlay_mouse_events;
+            }
+        }
+        return 0;
+    }
 
     const bool routed_mouse_message = message == WM_LBUTTONDOWN || message == WM_LBUTTONUP ||
         message == WM_RBUTTONDOWN || message == WM_RBUTTONUP ||
@@ -3405,6 +4539,23 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
             g_proxy_present_requests.load(), g_proxy_present_completed.load(),
             g_proxy_present_coalesced.load(), g_proxy_present_timeouts.load(),
             g_neural_presenter_deferrals.load(), g_neural_gpu_deferrals.load());
+        if (g_windowed_virtualization_active.load() || DetachedPresentationEnabled())
+            Log("presentation compatibility: host=%s window_virtualization=%s logical_client=%s input_coordinates=%s render=%ux%u output=%ux%u resolution_intents=%llu WM_SIZE=%llu client_queries=%llu coordinate_APIs=%llu mouse_messages=%llu cursor_queries=%llu cursor_warps=%llu cursor_clips=%llu resize_pins=%llu",
+                DetachedPresentationEnabled() ? "detached" : "attached",
+                g_windowed_virtualization_active.load() ? "active" : "inactive",
+                WindowedLogicalSizeEnabled() ? "enabled" : "disabled",
+                WindowedInputScalingEnabled() ? "scaled-to-render" : "native-client",
+                g_windowed_render_width.load(), g_windowed_render_height.load(),
+                g_output_width.load(), g_output_height.load(),
+                g_windowed_resolution_intents.load(),
+                g_windowed_logical_size_overrides.load(),
+                g_windowed_client_query_overrides.load(),
+                g_windowed_coordinate_overrides.load(),
+                g_windowed_mouse_message_overrides.load(),
+                g_windowed_cursor_query_overrides.load(),
+                g_windowed_cursor_warp_overrides.load(),
+                g_windowed_cursor_clip_overrides.load(),
+                g_windowed_resize_overrides.load());
     }
 }
 
@@ -3421,7 +4572,7 @@ static DWORD WINAPI ProxyWindowThread(void *)
     WNDCLASSEXW wc = {sizeof(wc)};
     wc.lpfnWndProc = ProxyWindowProc;
     wc.hInstance = g_self;
-    wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+    wc.hCursor = DetachedProxyCursor(false);
     wc.lpszClassName = L"StandaloneDLSSNRNativeOutput";
     RegisterClassExW(&wc);
     HMONITOR monitor = MonitorFromWindow(g_game_window, MONITOR_DEFAULTTONEAREST);
@@ -3501,10 +4652,48 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
     MONITORINFO monitor_info = {sizeof(monitor_info)};
     if (!GetMonitorInfoW(monitor, &monitor_info)) { g_proxy_failed = true; return false; }
 
-    // Prototype architecture: attach the native-resolution output to the
-    // game's existing HWND. There is no second top-level window, so Windows,
-    // ReShade and the game all agree about focus and input coordinates.
-    g_same_window_compositor = true;
+    // Prefer attaching the output to the game's HWND. Vulkan WSI requires its
+    // swapchain extent to match the physical client area, though, so a reduced
+    // Vulkan window cannot be enlarged without also forcing native rendering.
+    // Detached mode preserves the exact same neural/compositor pipeline while
+    // hosting only its final visual in a monitor-sized no-activate window.
+    HWND composition_window = g_game_window;
+    if (DetachedPresentationEnabled())
+    {
+        if (g_proxy_window == nullptr)
+        {
+            g_proxy_window_start_hidden = true;
+            g_proxy_window_ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (g_proxy_window_ready != nullptr)
+                g_proxy_window_thread = CreateThread(nullptr, 0, ProxyWindowThread, nullptr, 0, nullptr);
+            if (g_proxy_window_thread == nullptr ||
+                WaitForSingleObject(g_proxy_window_ready, kProxyWindowStartupWaitMs) != WAIT_OBJECT_0 ||
+                g_proxy_window == nullptr)
+            {
+                Log("detached compositor host creation failed: thread=%p event=%p hwnd=%p error=%lu",
+                    g_proxy_window_thread, g_proxy_window_ready, g_proxy_window, GetLastError());
+                g_proxy_failed = true;
+                return false;
+            }
+        }
+        RECT client = {};
+        GetClientRect(g_game_window, &client);
+        const UINT client_width = static_cast<UINT>(std::max<LONG>(0, client.right - client.left));
+        const UINT client_height = static_cast<UINT>(std::max<LONG>(0, client.bottom - client.top));
+        const bool native_client = client_width == width && client_height == height;
+        // A detached host is needed while Vulkan owns a genuinely reduced
+        // client. Once the game itself enters native borderless, bind the same
+        // visual directly to its HWND so independent-flip/z-order promotion
+        // cannot cover the processed output.
+        composition_window = native_client ? g_game_window : g_proxy_window;
+        g_same_window_compositor = native_client;
+        if (!g_same_window_compositor && !InstallWindowQueryHooks())
+            Log("detached cursor-coordinate hooks unavailable; proxy movement may not track the game cursor");
+    }
+    else
+    {
+        g_same_window_compositor = true;
+    }
 
     DXGI_FORMAT present_format = source_format;
     switch (present_format)
@@ -3527,11 +4716,12 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
         present_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     else
         present_format = DXGI_FORMAT_R10G10B10A2_UNORM;
-    Log("same-window compositor initialization: mode=%s source=%llux%u source_format=%u present_format=%u queue=%p game_window=%p",
+    Log("%s compositor initialization: mode=%s source=%llux%u source_format=%u present_format=%u queue=%p game_window=%p target_window=%p",
+        DetachedPresentationEnabled() ? "detached" : "same-window",
         early ? "early" : "Present fallback",
         source != nullptr ? source_desc.Width : width, source != nullptr ? source_desc.Height : height,
         static_cast<unsigned int>(source_format),
-        static_cast<unsigned int>(present_format), g_command_queue, g_game_window);
+        static_cast<unsigned int>(present_format), g_command_queue, g_game_window, composition_window);
 
     Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
@@ -3542,13 +4732,26 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
     desc.Width = width; desc.Height = height; desc.Format = present_format;
     desc.SampleDesc.Count = 1; desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     desc.BufferCount = 3; desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-    desc.Scaling = DXGI_SCALING_STRETCH; desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+    desc.Scaling = DXGI_SCALING_STRETCH;
+    desc.AlphaMode = g_same_window_compositor && OpaqueCompositionEnabled() ?
+        DXGI_ALPHA_MODE_IGNORE : DXGI_ALPHA_MODE_PREMULTIPLIED;
     desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
     Microsoft::WRL::ComPtr<IDXGISwapChain1> swapchain1;
-    if (SUCCEEDED(hr)) { failed_stage = "CreateSwapChainForComposition"; hr = factory->CreateSwapChainForComposition(g_command_queue, &desc, nullptr, &swapchain1); }
+    if (SUCCEEDED(hr))
+    {
+        failed_stage = "CreateSwapChainForComposition";
+        hr = factory->CreateSwapChainForComposition(g_command_queue, &desc, nullptr, &swapchain1);
+        if (FAILED(hr) && desc.AlphaMode == DXGI_ALPHA_MODE_IGNORE)
+        {
+            Log("opaque composition swapchain was rejected (0x%08X); retrying premultiplied alpha",
+                static_cast<unsigned int>(hr));
+            desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+            hr = factory->CreateSwapChainForComposition(g_command_queue, &desc, nullptr, &swapchain1);
+        }
+    }
     if (SUCCEEDED(hr)) { failed_stage = "IDXGISwapChain3"; hr = swapchain1.As(&g_proxy_swapchain); }
     if (SUCCEEDED(hr)) { failed_stage = "DCompositionCreateDevice"; hr = DCompositionCreateDevice(nullptr, IID_PPV_ARGS(&g_composition_device)); }
-    if (SUCCEEDED(hr)) { failed_stage = "CreateTargetForHwnd"; hr = g_composition_device->CreateTargetForHwnd(g_game_window, TRUE, &g_composition_target); }
+    if (SUCCEEDED(hr)) { failed_stage = "CreateTargetForHwnd"; hr = g_composition_device->CreateTargetForHwnd(composition_window, TRUE, &g_composition_target); }
     if (SUCCEEDED(hr)) { failed_stage = "CreateVisual"; hr = g_composition_device->CreateVisual(&g_composition_visual); }
     if (SUCCEEDED(hr)) { failed_stage = "CreateEffectGroup"; hr = g_composition_device->CreateEffectGroup(&g_composition_effect); }
     if (SUCCEEDED(hr)) { failed_stage = "SetEffect"; hr = g_composition_visual->SetEffect(g_composition_effect.Get()); }
@@ -3561,6 +4764,7 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
         // makes the visual opaque immediately after the first completed draw.
         hr = g_composition_effect->SetOpacity(0.0f);
         if (SUCCEEDED(hr)) hr = g_composition_device->Commit();
+        if (SUCCEEDED(hr)) g_composition_target_window = composition_window;
     }
     if (SUCCEEDED(hr))
     {
@@ -3713,12 +4917,18 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
         }
         g_composition_effect.Reset(); g_composition_visual.Reset(); g_composition_target.Reset(); g_composition_device.Reset();
         g_same_window_compositor = false;
+        g_composition_target_window = nullptr;
+        g_composition_retarget_pending = nullptr;
         g_proxy_swapchain.Reset(); return false;
     }
     g_proxy_present_format = present_format;
     g_proxy_early_pending_activation = true;
-    Log("same-window compositor ready: %ux%u source_format=%u present_format=%u game_hwnd=%p input_owner=game DWM_paced=yes presenter=%s buffers=3 max_latency=2", width, height,
+    Log("%s compositor ready: %ux%u source_format=%u present_format=%u game_hwnd=%p target_hwnd=%p ownership=%s alpha=%s input_owner=%s DWM_paced=yes presenter=%s buffers=3 max_latency=2",
+        DetachedPresentationEnabled() ? "detached" : "same-window", width, height,
         static_cast<unsigned int>(source_format), static_cast<unsigned int>(present_format), g_game_window,
+        composition_window, g_same_window_compositor ? "attached/game-HWND" : "detached/proxy-HWND",
+        desc.AlphaMode == DXGI_ALPHA_MODE_IGNORE ? "opaque/ignore" : "premultiplied",
+        DetachedPresentationEnabled() ? "routed-to-game" : "game",
         g_synchronous_proxy_presentation ? "serialized/game-thread" : "asynchronous/worker");
     return true;
 }
@@ -4301,9 +5511,10 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     if (g_game_window && present_window && present_window != g_game_window) return;
     if (!g_game_window && present_window) g_game_window = present_window;
     PresentCpuTelemetryScope cpu_telemetry;
-    g_last_primary_present_tick = GetTickCount64();
+    const ULONGLONG present_tick = GetTickCount64();
+    g_last_primary_present_tick = present_tick;
     const HWND foreground = GetForegroundWindow();
-    const bool primary_foreground = foreground == g_game_window || GetAncestor(foreground, GA_ROOT) == g_game_window;
+    const bool primary_foreground = IsGameProcessForeground(foreground);
     UpdateProxyCursorClip(primary_foreground && g_proxy_window != nullptr &&
         !g_proxy_hidden && !g_proxy_overlay_bypass && !g_proxy_failed &&
         !g_proxy_early_pending_activation && IsWindowVisible(g_proxy_window));
@@ -4313,7 +5524,101 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     {
         g_proxy_watchdog_hidden = false;
         RequestProxyVisibility(true);
-        Log("native proxy restored after primary borderless presentation resumed");
+        Log("native proxy restored after primary game-process presentation resumed: foreground=%p game_hwnd=%p",
+            foreground, g_game_window);
+    }
+    if (DetachedPresentationEnabled() && g_composition_device && g_proxy_window != nullptr)
+    {
+        const ULONGLONG previous_check = g_composition_last_retarget_check.load();
+        if (previous_check == 0 || present_tick - previous_check >= 500)
+        {
+            g_composition_last_retarget_check = present_tick;
+            RECT physical_client = {};
+            if (GetClientRect(g_game_window, &physical_client))
+            {
+                const UINT physical_width = static_cast<UINT>(std::max<LONG>(0,
+                    physical_client.right - physical_client.left));
+                const UINT physical_height = static_cast<UINT>(std::max<LONG>(0,
+                    physical_client.bottom - physical_client.top));
+                const UINT output_width = g_output_width.load();
+                const UINT output_height = g_output_height.load();
+                const UINT retained_width = g_windowed_render_width.load();
+                const UINT retained_height = g_windowed_render_height.load();
+                if (g_auto_detached_presentation_active.load() &&
+                    g_auto_windowed_transpose_seen.load() &&
+                    retained_width != retained_height &&
+                    physical_width == retained_height && physical_height == retained_width)
+                    QueueDetachedFallbackWindowRepair(g_game_window);
+                const bool native_client = output_width != 0 && output_height != 0 &&
+                    physical_width + 2 >= output_width && physical_height + 2 >= output_height;
+                QueueCompositionRetarget(native_client ? g_game_window : g_proxy_window);
+            }
+        }
+    }
+    if (DetachedPresentationEnabled() && g_windowed_virtualization_active.load() &&
+        g_game_window != nullptr)
+    {
+        // A transposed-window fallback can race an already queued expansion
+        // worker. Retry restoration from Present until that worker releases
+        // its pending flag, and never reassert the attached host meanwhile.
+        QueueWindowedVirtualization(g_game_window);
+    }
+    const ULONGLONG reapply_after = g_windowed_reapply_after_tick.load();
+    if (reapply_after != 0 && present_tick >= reapply_after)
+    {
+        if (g_windowed_virtualization_pending.load())
+        {
+            // A prior transaction still owns the HWND. Preserve serialization
+            // and retry from a later Present instead of overlapping workers.
+            g_windowed_reapply_after_tick = present_tick + 50;
+        }
+        else
+        {
+            HWND reapply_window = g_windowed_reapply_window.exchange(nullptr);
+            g_windowed_reapply_after_tick = 0;
+            QueueWindowedVirtualization(reapply_window);
+            Log("serialized windowed virtualization transition released from Present: hwnd=%p",
+                reapply_window);
+        }
+    }
+    else if (g_windowed_virtualization_active.load() && g_game_window != nullptr &&
+        reapply_after == 0)
+    {
+        const ULONGLONG previous_check = g_windowed_last_reassert_tick.load();
+        if (previous_check == 0 || present_tick - previous_check >= 500)
+        {
+            g_windowed_last_reassert_tick = present_tick;
+            RECT physical_client = {};
+            const LONG_PTR style = GetWindowLongPtrW(g_game_window, GWL_STYLE);
+            if (GetClientRect(g_game_window, &physical_client))
+            {
+                const UINT physical_width = static_cast<UINT>(std::max<LONG>(0,
+                    physical_client.right - physical_client.left));
+                const UINT physical_height = static_cast<UINT>(std::max<LONG>(0,
+                    physical_client.bottom - physical_client.top));
+                if (physical_width != g_output_width.load() || physical_height != g_output_height.load() ||
+                    (style & (WS_CAPTION | WS_THICKFRAME)) != 0)
+                {
+                    const unsigned int drift_count = ++g_auto_windowed_host_drift_count;
+                    const ULONGLONG activation_tick = g_auto_windowed_activation_tick.load();
+                    if (g_auto_windowed_virtualization_active.load() &&
+                        g_auto_windowed_logical_suppressed.load() &&
+                        !g_auto_windowed_transpose_seen.load() && drift_count >= 3 &&
+                        activation_tick != 0 && present_tick - activation_tick >= 1000)
+                    {
+                        g_auto_windowed_logical_suppressed = false;
+                        Log("automatic window compatibility promoted to logical-client tier after %u persistent host drifts; input mapping remains enabled",
+                            drift_count);
+                    }
+                    QueueWindowedVirtualization(g_game_window);
+                    Log("windowed virtualization detected host drift: client=%ux%u style=0x%llX count=%u tier=%s; native host reassert queued",
+                        physical_width, physical_height, static_cast<unsigned long long>(style), drift_count,
+                        WindowedLogicalSizeEnabled() ? "logical-client" : "host-only");
+                }
+                else
+                    g_auto_windowed_host_drift_count = 0;
+            }
+        }
     }
     const reshade::api::device_api api = queue->get_device()->get_api();
     if (!g_neural_ready)
@@ -4466,13 +5771,42 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
 static bool OnCreateSwapchain(reshade::api::device_api api,
     reshade::api::swapchain_desc &desc, void *window)
 {
-    if (!g_enabled || !g_windowed_virtualization_enabled || window == nullptr ||
+    if (!g_enabled || window == nullptr ||
         (api != reshade::api::device_api::d3d9 &&
          api != reshade::api::device_api::d3d11 &&
          api != reshade::api::device_api::d3d12))
         return false;
 
     HWND hwnd = static_cast<HWND>(window);
+    const UINT requested_width = desc.back_buffer.texture.width;
+    const UINT requested_height = desc.back_buffer.texture.height;
+    const UINT retained_width = g_windowed_render_width.load();
+    const UINT retained_height = g_windowed_render_height.load();
+
+    // Once a transposed resize has forced detached presentation, keep rejecting
+    // that exact bogus orientation for the rest of the process. The game may
+    // repeat the transaction long after the initial host restoration; allowing
+    // it then rebuilds NR/SR around a portrait source and horizontally stretches
+    // the result across the landscape monitor.
+    if (g_auto_detached_presentation_active.load() &&
+        g_auto_windowed_transpose_seen.load() &&
+        hwnd == g_windowed_virtualization_window.load() &&
+        retained_width >= 640 && retained_height >= 360 &&
+        retained_width != retained_height &&
+        requested_width == retained_height && requested_height == retained_width)
+    {
+        desc.back_buffer.texture.width = retained_width;
+        desc.back_buffer.texture.height = retained_height;
+        const unsigned long long overrides = ++g_windowed_resize_overrides;
+        QueueDetachedFallbackWindowRepair(hwnd);
+        Log("detached fallback rejected repeated transposed swapchain request: requested=%ux%u retained=%ux%u count=%llu",
+            requested_width, requested_height, retained_width, retained_height, overrides);
+        return true;
+    }
+
+    if (!WindowedVirtualizationEnabled())
+        return false;
+
     if (!g_windowed_virtualization_active.load() ||
         hwnd != g_windowed_virtualization_window.load() || desc.fullscreen_state)
         return false;
@@ -4490,6 +5824,28 @@ static bool OnCreateSwapchain(reshade::api::device_api api,
     if (render_width < 640 || render_height < 360)
         return false;
 
+    // Some engines rebuild both their swapchain and physical HWND with the
+    // current render dimensions transposed after an external host expansion.
+    // Rejecting only the portrait backbuffer is insufficient: the attached
+    // DComp target can still inherit the corrupted HWND placement. Restore the
+    // original game window and automatically move final output to the detached
+    // monitor-sized host. This is a behavioral fallback, not a game profile.
+    if (g_auto_windowed_virtualization_active.load() && render_width != render_height &&
+        request_width == render_height && request_height == render_width)
+    {
+        g_auto_windowed_transpose_seen = true;
+        g_auto_windowed_logical_suppressed = true;
+        desc.back_buffer.texture.width = render_width;
+        desc.back_buffer.texture.height = render_height;
+        const unsigned long long overrides = ++g_windowed_resize_overrides;
+        g_auto_detached_presentation_active = true;
+        g_auto_windowed_virtualization_active = false;
+        QueueWindowedVirtualization(hwnd);
+        Log("automatic window compatibility rejected transposed swapchain/physical-window transaction and selected detached fallback: requested=%ux%u retained=%ux%u count=%llu",
+            request_width, request_height, render_width, render_height, overrides);
+        return true;
+    }
+
     // A genuinely reduced request is an in-game resolution change. Adopt it as
     // the new logical render contract, then keep the already-expanded HWND.
     if (request_width >= 640 && request_height >= 360 &&
@@ -4501,7 +5857,7 @@ static bool OnCreateSwapchain(reshade::api::device_api api,
             g_windowed_render_width = request_width;
             g_windowed_render_height = request_height;
             Log("windowed virtualization adopted game resolution change: %ux%u", request_width, request_height);
-            QueueWindowedVirtualization(hwnd);
+            ScheduleWindowedVirtualization(hwnd, 250);
         }
         return false;
     }
@@ -4567,7 +5923,73 @@ static void OnInitSwapchain(reshade::api::swapchain *swapchain, bool)
         (client_width == static_cast<LONG>(g_output_width.load()) &&
          client_height == static_cast<LONG>(g_output_height.load())) ? "borderless/native-client" : "reduced borderless/windowed");
 
-    if (g_windowed_virtualization_enabled && width < g_output_width.load() &&
+    const UINT retained_width = g_windowed_render_width.load();
+    const UINT retained_height = g_windowed_render_height.load();
+    if (g_auto_detached_presentation_active.load() &&
+        g_auto_windowed_transpose_seen.load() &&
+        retained_width != retained_height &&
+        client_width == static_cast<LONG>(retained_height) &&
+        client_height == static_cast<LONG>(retained_width))
+    {
+        QueueDetachedFallbackWindowRepair(hwnd);
+        Log("detached fallback observed transposed physical client after swapchain initialization; landscape repair queued: client=%ldx%ld retained=%ux%u",
+            client_width, client_height, retained_width, retained_height);
+    }
+
+    const reshade::api::device_api api = swapchain->get_device()->get_api();
+    const bool reduced_surface = width < g_output_width.load() || height < g_output_height.load();
+    const bool reduced_client = client_width + 2 < static_cast<LONG>(g_output_width.load()) ||
+        client_height + 2 < static_cast<LONG>(g_output_height.load());
+    const bool client_tracks_surface = std::abs(client_width - static_cast<LONG>(width)) <= 2 &&
+        std::abs(client_height - static_cast<LONG>(height)) <= 2;
+    const LONG_PTR window_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    const bool eligible_top_level = GetAncestor(hwnd, GA_ROOT) == hwnd &&
+        (window_style & WS_CHILD) == 0;
+
+    // Never enlarge an ordinary reduced game window automatically. Changing
+    // the HWND feeds synthetic sizes back into engine viewport/swapchain code
+    // and is the root cause of the GTA orientation failures. Keep capture and
+    // input entirely game-owned and host only the final native output in the
+    // detached compositor. Vulkan selects the same prepared presenter even at
+    // native size so later mode changes can migrate without rebuilding it.
+    const bool reduced_window_needs_detached = eligible_top_level &&
+        reduced_surface && reduced_client && client_tracks_surface;
+    if (g_auto_windowed_virtualization && !g_windowed_virtualization_enabled &&
+        (api == reshade::api::device_api::vulkan || reduced_window_needs_detached) &&
+        !g_auto_detached_presentation_active.exchange(true))
+    {
+        g_windowed_render_width = width;
+        g_windowed_render_height = height;
+        g_windowed_virtualization_window = hwnd;
+        Log("non-invasive automatic presenter selected: render=%ux%u client=%ldx%ld output=%ux%u api=%u host=detached game_window=untouched",
+            width, height, client_width, client_height, g_output_width.load(), g_output_height.load(),
+            static_cast<unsigned int>(api));
+    }
+
+    // Clean up an older automatic attached transaction if the runtime changes
+    // modes while this DLL is loaded. New sessions never enter this path.
+    if (g_auto_windowed_virtualization_active.exchange(false))
+    {
+        g_auto_windowed_logical_suppressed = false;
+        g_auto_windowed_transpose_seen = false;
+        g_auto_windowed_host_drift_count = 0;
+        g_auto_windowed_activation_tick = 0;
+        QueueWindowedVirtualization(hwnd);
+        Log("legacy automatic attached-window transaction released in favor of non-invasive presentation");
+    }
+
+    if (DetachedPresentationEnabled() && g_composition_device && g_proxy_window != nullptr)
+    {
+        const bool native_client = client_width + 2 >= static_cast<LONG>(g_output_width.load()) &&
+            client_height + 2 >= static_cast<LONG>(g_output_height.load());
+        const HWND desired_host = native_client ? hwnd : g_proxy_window;
+        QueueCompositionRetarget(desired_host);
+        Log("composition ownership evaluated after swapchain change: client=%ldx%ld desired=%s hwnd=%p",
+            client_width, client_height, native_client ? "attached/game-HWND" : "detached/proxy-HWND",
+            desired_host);
+    }
+
+    if (WindowedVirtualizationEnabled() && !DetachedPresentationEnabled() && width < g_output_width.load() &&
         height < g_output_height.load() && client_width > 0 && client_height > 0 &&
         (client_width < static_cast<LONG>(g_output_width.load()) ||
          client_height < static_cast<LONG>(g_output_height.load())))
@@ -4575,8 +5997,8 @@ static void OnInitSwapchain(reshade::api::swapchain *swapchain, bool)
         g_windowed_render_width = width;
         g_windowed_render_height = height;
         g_windowed_virtualization_window = hwnd;
-        QueueWindowedVirtualization(hwnd);
-        Log("reduced ordinary window detected; queued native-client virtualization for %ux%u render", width, height);
+        ScheduleWindowedVirtualization(hwnd, 250);
+        Log("reduced ordinary window detected; scheduled native-client virtualization for %ux%u render after swapchain settles", width, height);
     }
 }
 
@@ -4585,6 +6007,15 @@ static bool OnSetFullscreenState(reshade::api::swapchain *swapchain, bool fullsc
     if (!g_enabled || !fullscreen || swapchain == nullptr) return false;
     HWND hwnd = static_cast<HWND>(swapchain->get_hwnd());
     if (hwnd == nullptr) return false;
+    if (WindowedVirtualizationEnabled())
+    {
+        // The forced-window worker already performs the required borderless
+        // conversion. Do not launch the independent exclusive-fullscreen
+        // worker against the same HWND during ResizeBuffers/runtime rebuild.
+        ScheduleWindowedVirtualization(hwnd, 250);
+        Log("exclusive fullscreen request coalesced into serialized forced-window transition");
+        return true;
+    }
     if (!g_fullscreen_virtualization_pending.exchange(true))
     {
         if (g_proxy_window != nullptr)
@@ -4628,8 +6059,42 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::SameLine();
     ImGui::TextDisabled("supports reduced-resolution fullscreen and borderless swapchains");
 
-    if (ImGui::Checkbox("Virtualize reduced window to native monitor", &g_windowed_virtualization_enabled))
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader("Compatibility / troubleshooting"))
     {
+    ImGui::TextWrapped("Leave automatic presentation enabled. The remaining options are manual fixes; use them only when the matching symptom appears.");
+
+    if (ImGui::Checkbox("Automatic non-invasive presentation", &g_auto_windowed_virtualization))
+    {
+        reshade::set_config_value(nullptr, section, "AutoWindowedVirtualization",
+            g_auto_windowed_virtualization ? "1" : "0");
+        if (!g_auto_windowed_virtualization && g_auto_windowed_virtualization_active.exchange(false))
+        {
+            g_auto_windowed_logical_suppressed = false;
+            g_auto_windowed_transpose_seen = false;
+            g_auto_windowed_host_drift_count = 0;
+            g_auto_windowed_activation_tick = 0;
+            HWND hwnd = g_windowed_virtualization_window.load();
+            if (hwnd == nullptr) hwnd = g_game_window;
+            QueueWindowedVirtualization(hwnd);
+        }
+        Log("automatic reduced-window compatibility changed to %s",
+            g_auto_windowed_virtualization ? "enabled" : "disabled");
+        SetStatus("automatic presentation setting changed; restart required");
+    }
+    ImGui::TextWrapped("Recommended. A reduced game window is left completely untouched while the addon displays only the finished native-resolution image in its own fullscreen output. This avoids feeding artificial window sizes back into the game.");
+    ImGui::Text("Automatic presentation: %s",
+        !g_auto_windowed_virtualization ? "disabled" :
+        (g_auto_detached_presentation_active.load() ? "detached output active" : "standing by"));
+
+    if (ImGui::Checkbox("Force reduced-window virtualization", &g_windowed_virtualization_enabled))
+    {
+        if (!g_windowed_virtualization_enabled && g_windowed_input_scaling)
+        {
+            g_windowed_input_scaling = false;
+            reshade::set_config_value(nullptr, section, "WindowedInputScaling", "0");
+            Log("windowed input-coordinate scaling disabled because its required window virtualization was disabled");
+        }
         reshade::set_config_value(nullptr, section, "WindowedVirtualization",
             g_windowed_virtualization_enabled ? "1" : "0");
         HWND hwnd = g_windowed_virtualization_window.load();
@@ -4644,10 +6109,90 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         Log("windowed virtualization setting changed to %s",
             g_windowed_virtualization_enabled ? "enabled" : "disabled");
     }
-    ImGui::TextDisabled("Opt-in: keeps a reduced game backbuffer while expanding the same window to native size.");
+    ImGui::TextWrapped("Legacy troubleshooting option. It physically enlarges the game window and can confuse some engines. Leave it disabled unless detached output cannot be used in a particular game.");
 
-    ImGui::Text("Compositor Present mode: %s",
+    if (ImGui::Checkbox("Virtualize logical client size and coordinates", &g_windowed_logical_size_messages))
+    {
+        reshade::set_config_value(nullptr, section, "WindowedLogicalSizeMessages",
+            g_windowed_logical_size_messages ? "1" : "0");
+        Log("logical-size message virtualization setting changed to %s; restart recommended",
+            g_windowed_logical_size_messages ? "enabled" : "disabled");
+    }
+    ImGui::TextWrapped("Use with the forced window option if a game jumps back to native rendering, becomes stretched, or breaks after its window is enlarged. It tells the game that its usable area is still the selected lower resolution. Restart after changing it.");
+
+    if (ImGui::Checkbox("Scale window input coordinates to render resolution", &g_windowed_input_scaling))
+    {
+        if (g_windowed_input_scaling && !g_windowed_virtualization_enabled)
+        {
+            g_windowed_virtualization_enabled = true;
+            reshade::set_config_value(nullptr, section, "WindowedVirtualization", "1");
+            HWND hwnd = g_windowed_virtualization_window.load();
+            if (hwnd == nullptr) hwnd = g_game_window;
+            if (hwnd != nullptr)
+            {
+                g_windowed_render_width = g_input_width.load();
+                g_windowed_render_height = g_input_height.load();
+                g_windowed_virtualization_window = hwnd;
+                QueueWindowedVirtualization(hwnd);
+            }
+            Log("windowed virtualization enabled automatically because input-coordinate scaling depends on it");
+        }
+        reshade::set_config_value(nullptr, section, "WindowedInputScaling",
+            g_windowed_input_scaling ? "1" : "0");
+        Log("windowed input-coordinate scaling changed to %s",
+            g_windowed_input_scaling ? "scaled-to-render" : "native-client");
+    }
+    ImGui::TextWrapped("Use when the picture is correct but mouse clicks land in the wrong place, the cursor is limited to one corner, or menus only respond in part of the screen. It maps the full-screen cursor back to the game's lower-resolution coordinates and automatically enables the required reduced-window virtualization.");
+
+    if (ImGui::Checkbox("Detached native output (Vulkan compatibility)", &g_detached_presentation))
+    {
+        reshade::set_config_value(nullptr, section, "DetachedPresentation",
+            g_detached_presentation ? "1" : "0");
+        SetStatus("presentation host changed; restart required");
+        Log("detached presentation setting changed to %s; restart required",
+            g_detached_presentation ? "enabled" : "disabled");
+    }
+    ImGui::TextWrapped("Mostly for Vulkan games. Try this when the addon initializes but the processed image is black, missing, stuck in the original window, or never replaces the game image. It displays the native output in a separate borderless window. Restart after changing it.");
+    ImGui::Text("Automatic Vulkan output: %s",
+        g_auto_detached_presentation_active.load() ? "active for this game" : "standing by");
+
+    if (ImGui::Checkbox("Hide detached Windows cursor", &g_hide_detached_system_cursor))
+    {
+        reshade::set_config_value(nullptr, section, "HideDetachedSystemCursor",
+            g_hide_detached_system_cursor ? "1" : "0");
+        if (g_proxy_window != nullptr)
+            PostMessageW(g_proxy_window, WM_SETCURSOR, 0, 0);
+        Log("detached Windows cursor visibility changed to %s",
+            g_hide_detached_system_cursor ? "hidden during gameplay" : "visible");
+    }
+    ImGui::TextWrapped("Normally leave this off: detached output now mirrors whether the game requests a hidden gameplay cursor or a visible menu cursor. Force hiding only if a game never reports its cursor state and still shows a duplicate pointer.");
+
+    if (ImGui::Checkbox("Opaque attached composition", &g_opaque_composition))
+    {
+        reshade::set_config_value(nullptr, section, "OpaqueComposition",
+            g_opaque_composition ? "1" : "0");
+        SetStatus("composition alpha mode changed; restart required");
+        Log("opaque attached composition setting changed to %s; restart required",
+            g_opaque_composition ? "enabled" : "disabled");
+    }
+    ImGui::TextWrapped("Try this when the original and processed pictures appear at the same time, or the image looks transparent and layers bleed together. It affects same-window output only and requires a restart.");
+
+    if (ImGui::Checkbox("Serialized presentation (crash workaround)",
+        &g_requested_synchronous_proxy_presentation))
+    {
+        reshade::set_config_value(nullptr, section, "SynchronousProxyPresentation",
+            g_requested_synchronous_proxy_presentation ? "1" : "0");
+        SetStatus("presentation mode changed; restart required");
+        Log("requested compositor presentation mode changed to %s; restart required",
+            g_requested_synchronous_proxy_presentation ? "serialized" : "asynchronous");
+    }
+    ImGui::Text("Active presentation mode: %s",
         g_synchronous_proxy_presentation ? "serialized compatibility" : "asynchronous performance");
+    ImGui::TextWrapped("Try serialized mode if the game crashes, freezes, or produces a black screen when the processed output starts or after changing resolution. It is safer for some games such as GTA V, but may reduce performance. Restart after changing it.");
+    ImGui::TextWrapped("If the game crashes before this menu can open, launch it again while holding F8. The addon will select serialized safe mode before the first frame. It also does this automatically after detecting that the previous game session did not shut down cleanly.");
+    if (g_startup_recovery_forced)
+        ImGui::TextWrapped("Safe startup is active now because %s.",
+            g_startup_recovery_detected ? "the previous game session did not shut down cleanly" : "F8 was held during launch");
 
     ImGui::TextDisabled("Vulkan: select a real reduced windowed resolution in-game; the native proxy supplies borderless output.");
 
@@ -4663,7 +6208,10 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         Log("early proxy compatibility setting changed to %s; restart required",
             g_early_proxy_initialization ? "enabled" : "disabled");
     }
-    ImGui::TextDisabled("Opt-in D3D12 path. Creates the native proxy before first Present; restart required after changing.");
+    ImGui::TextWrapped("Last-resort D3D12 workaround. Try it when the addon remains on 'waiting for Present' or fails before the processed output appears. It may reduce compatibility in games that already start correctly, so leave it off unless needed. Restart after changing it.");
+    }
+
+    ImGui::Separator();
 
     int profile = static_cast<int>(g_color_profile);
     if (ImGui::Combo("Input color profile", &profile,
@@ -4806,7 +6354,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g_proxy_failed ? "failed/quarantined" : (g_proxy_swapchain ? "presenting" : "waiting"),
         g_frames_presented.load(), g_post_reshade_frames.load());
     ImGui::Text("Windowed virtualization: %s; render pin=%ux%u; resize overrides=%llu",
-        !g_windowed_virtualization_enabled ? "off" :
+        !WindowedVirtualizationEnabled() ? "off" :
         g_windowed_virtualization_active.load() ? "active" :
         g_windowed_virtualization_pending.load() ? "pending" : "waiting for reduced window",
         g_windowed_render_width.load(), g_windowed_render_height.load(),
@@ -4950,7 +6498,15 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         else strcpy_s(g_log_path, "standalone-dlssnr.log");
         { FILE *file = nullptr; if (fopen_s(&file, g_log_path, "w") == 0 && file) fclose(file); }
 
-        if (!reshade::register_addon(module)) return FALSE;
+        g_startup_recovery_detected = BeginStartupRecoveryTracking(local);
+        g_startup_recovery_forced = g_startup_recovery_detected ||
+            (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+
+        if (!reshade::register_addon(module))
+        {
+            if (g_startup_recovery_path[0] != '\0') DeleteFileA(g_startup_recovery_path);
+            return FALSE;
+        }
         constexpr const char *section = "Standalone.DLSSNR";
         char enabled[8] = "1"; size_t enabled_size = sizeof(enabled);
         reshade::get_config_value(nullptr, section, "Enabled", enabled, &enabled_size);
@@ -4981,15 +6537,42 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
         read_setting("PerformanceTelemetry", "1", value, sizeof(value)); g_performance_telemetry_enabled = strcmp(value, "0") != 0;
         read_setting("EarlyProxyInitialization", "0", value, sizeof(value)); g_early_proxy_initialization = strcmp(value, "0") != 0;
+        read_setting("AutoWindowedVirtualization", "1", value, sizeof(value)); g_auto_windowed_virtualization = strcmp(value, "0") != 0;
         read_setting("WindowedVirtualization", "0", value, sizeof(value)); g_windowed_virtualization_enabled = strcmp(value, "0") != 0;
+        read_setting("WindowedLogicalSizeMessages", "0", value, sizeof(value)); g_windowed_logical_size_messages = strcmp(value, "0") != 0;
+        read_setting("WindowedInputScaling", "0", value, sizeof(value)); g_windowed_input_scaling = strcmp(value, "0") != 0;
+        if (g_windowed_input_scaling && !g_windowed_virtualization_enabled)
+        {
+            g_windowed_virtualization_enabled = true;
+            reshade::set_config_value(nullptr, section, "WindowedVirtualization", "1");
+        }
+        read_setting("DetachedPresentation", "0", value, sizeof(value)); g_detached_presentation = strcmp(value, "0") != 0;
+        read_setting("HideDetachedSystemCursor", "0", value, sizeof(value)); g_hide_detached_system_cursor = strcmp(value, "0") != 0;
+        read_setting("OpaqueComposition", "0", value, sizeof(value)); g_opaque_composition = strcmp(value, "0") != 0;
         read_setting("SynchronousProxyPresentation", "0", value, sizeof(value)); g_synchronous_proxy_presentation = strcmp(value, "0") != 0;
-        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d style=%u NR=%s NR-mask=%s strength=%.2f early_proxy=%s windowed_virtualization=%s presenter=%s telemetry=%s",
+        if (g_startup_recovery_forced)
+        {
+            g_synchronous_proxy_presentation = true;
+            reshade::set_config_value(nullptr, section, "SynchronousProxyPresentation", "1");
+        }
+        g_requested_synchronous_proxy_presentation = g_synchronous_proxy_presentation;
+        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d style=%u NR=%s NR-mask=%s strength=%.2f early_proxy=%s auto_presentation=%s windowed_virtualization=%s logical_client=%s input_coordinates=%s detached_output=%s detached_cursor=%s opaque_composition=%s presenter=%s telemetry=%s",
             ADDON_VERSION, ProfileName(g_color_profile), g_nr_model, NrStyle(), g_nr_enabled ? "enabled" : "disabled",
             g_nr_rejection_mask_enabled ? "enabled" : "disabled", g_nr_rejection_mask_strength,
             g_early_proxy_initialization ? "enabled" : "disabled",
+            g_auto_windowed_virtualization ? "enabled" : "disabled",
             g_windowed_virtualization_enabled ? "enabled" : "disabled",
+            g_windowed_logical_size_messages ? "enabled" : "disabled",
+            g_windowed_input_scaling ? "scaled-to-render" : "native-client",
+            g_detached_presentation ? "enabled" : "disabled",
+            g_hide_detached_system_cursor ? "hidden-during-gameplay" : "visible",
+            g_opaque_composition ? "enabled" : "disabled",
             g_synchronous_proxy_presentation ? "serialized" : "asynchronous",
             g_performance_telemetry_enabled ? "enabled" : "disabled");
+        if (g_startup_recovery_forced)
+            Log("serialized safe startup forced before first Present: reason=%s state=%s",
+                g_startup_recovery_detected ? "previous game session did not shut down cleanly" : "F8 held during launch",
+                g_startup_recovery_path[0] != '\0' ? g_startup_recovery_path : "marker unavailable");
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::register_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
@@ -5008,6 +6591,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
+        ClearStartupRecoveryMarker("clean process shutdown");
+        g_windowed_virtualization_active = false;
+        RestoreWindowedLogicalSizeSubclass();
         reshade::unregister_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::unregister_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
         reshade::unregister_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
@@ -5049,10 +6635,18 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         g_composition_effect.Reset(); g_composition_visual.Reset();
         g_composition_target.Reset(); g_composition_device.Reset();
         g_same_window_compositor = false;
+        g_composition_target_window = nullptr;
+        g_composition_retarget_pending = nullptr;
         g_proxy_swapchain.Reset();
         UpdateProxyCursorClip(false);
         if (g_proxy_window) PostMessageW(g_proxy_window, WM_CLOSE, 0, 0);
-        if (g_proxy_window_thread) CloseHandle(g_proxy_window_thread);
+        if (g_proxy_window_thread)
+        {
+            // Detached mode executes ProxyWindowProc inside this DLL. Do not
+            // let the module unload while that thread can still dispatch it.
+            WaitForSingleObject(g_proxy_window_thread, 2000);
+            CloseHandle(g_proxy_window_thread);
+        }
         if (g_proxy_window_ready) CloseHandle(g_proxy_window_ready);
         if (g_nr_output) g_nr_output->Release();
         g_captured_depth.Reset(); g_captured_motion.Reset(); g_captured_mask.Reset(); g_captured_nr_mask.Reset();
