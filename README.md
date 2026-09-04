@@ -36,9 +36,21 @@ Bring Neural Rendering, DLAA/DLSS Super Resolution, and Frame Generation to supp
 Reduced-resolution DLSS SR can provide major performance improvements. Native-resolution DLAA instead prioritizes image quality.
 
 - Press **F10** to compare the processed image with the original game output.
+- Press **Ctrl+Alt+P** to cycle through the modern DLSS render presets **J → K → L → M**. NVIDIA Default remains selectable in ReShade. A three-second corner notice shows the selected preset and the mode it was designed to target; the ReShade status separately reports the pipeline's actual active DLAA/DLSS mode.
+- Press **Ctrl+Alt+N** to cycle through Neural Rendering models **1 → 2 → 3**. A three-second corner notice confirms the selected model.
 - While ReShade is open in a reduced window, version 2.0.1 moves the processed/F10 output into a small mouse-transparent preview beside it. This lets the real ReShade window receive normal clicks. Close ReShade to restore the fullscreen compositor.
 - The addon draws its own FPS counter because third-party overlays may not appear through its presentation proxy.
 - Logs are written to `%LOCALAPPDATA%\RHI\Logs\standalone-dlssnr.log`.
+
+### DLSS render presets
+
+These presets tune reconstruction behavior; they do not change the input resolution selected in the game.
+
+- **Default:** Lets the NVIDIA runtime select a preset for the active DLAA/DLSS mode.
+- **J:** May reduce some ghosting versus K, but can introduce more flickering.
+- **K:** Recommended high-quality choice for DLAA, Quality, and Balanced; relatively demanding.
+- **L:** Sharp and temporally stable for extreme scaling with reduced ghosting; highest performance cost.
+- **M:** Performance-oriented modern preset with much of L's image-quality behavior at speed closer to J/K.
 
 ## Troubleshooting — start here
 
@@ -92,6 +104,10 @@ The new **Compatibility / troubleshooting** panel provides opt-in fixes for game
 Resolution transitions are serialized outside the game's DXGI callback, failed sessions can recover into serialized mode by holding **F8** during launch, and startup contract changes hold the last completed native frame instead of repeatedly exposing the low-resolution game surface.
 
 Because presentation behavior varies substantially between engines, 2.0 may work better or worse than 1.x in a particular game. Keep [v1.7.24](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/tag/v1.7.24) available as the stable 1.x fallback and report regressions with the game name, graphics API, display mode, and persistent addon log.
+
+### Version 2.0.2
+
+The DLSS Super Resolution stage now exposes NVIDIA's modern render presets **J, K, L, and M**, while legacy and deprecated presets remain hidden. **Ctrl+Alt+P** cycles the DLSS presets and **Ctrl+Alt+N** cycles Neural Rendering models 1–3 without opening ReShade. Three-second native-output notices confirm each selection; DLSS notices also identify the preset's intended role. The active DLAA/DLSS quality contract is still selected automatically from the game's input resolution and is reported separately in ReShade.
 
 ### Version 2.0.1
 

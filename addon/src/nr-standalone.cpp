@@ -32,7 +32,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "2.0.1"
+#define ADDON_VERSION "2.0.2"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -126,6 +126,11 @@ static unsigned long long g_last_logged_mouse_event;
 static bool g_show_proxy_fps = true;
 static std::atomic<unsigned int> g_proxy_fps{0};
 static std::atomic<unsigned int> g_source_fps{0};
+static constexpr size_t kPipelineNoticeTextLength = 40;
+static constexpr ULONGLONG kPipelineNoticeDurationMs = 3000;
+static std::array<std::atomic<UINT>, kPipelineNoticeTextLength> g_pipeline_notice_text = {};
+static std::atomic<UINT> g_pipeline_notice_length{0};
+static std::atomic<ULONGLONG> g_pipeline_notice_until_tick{0};
 static ULONGLONG g_source_fps_sample_start;
 static unsigned int g_source_fps_sample_frames;
 static ULONGLONG g_output_fps_sample_start;
@@ -380,6 +385,14 @@ enum class ColorProfile : int
     Hdr10Pq = 3,
     Hdr10Hlg = 4
 };
+enum class DlssRenderPreset : int
+{
+    Default = 0,
+    J = 10,
+    K = 11,
+    L = 12,
+    M = 13
+};
 // Keep the user's requested convention separate from the convention actually
 // fed to NGX and presented by the proxy. Auto is resolved from the primary
 // game swapchain, with a format fallback for older ReShade/DXGI paths.
@@ -387,6 +400,11 @@ static ColorProfile g_color_profile = ColorProfile::Auto;
 static ColorProfile g_active_color_profile = ColorProfile::Srgb;
 static reshade::api::color_space g_detected_color_space = reshade::api::color_space::unknown;
 static DXGI_FORMAT g_detected_swapchain_format = DXGI_FORMAT_UNKNOWN;
+static DlssRenderPreset g_dlss_render_preset = DlssRenderPreset::Default;
+static DlssRenderPreset g_active_dlss_render_preset = DlssRenderPreset::Default;
+static bool g_dlss_render_preset_hotkey_down;
+static bool g_nr_model_hotkey_down;
+static int g_active_dlss_quality = -1;
 static int g_nr_model = 1;
 static int g_active_nr_model;
 static float g_nr_intensity = 1.0f;
@@ -588,6 +606,171 @@ static void Log(const char *format, ...)
     }
     LeaveCriticalSection(&g_log_lock);
     reshade::log::message(reshade::log::level::info, message);
+}
+
+static const char *DlssRenderPresetName(DlssRenderPreset preset)
+{
+    switch (preset)
+    {
+    case DlssRenderPreset::J: return "J";
+    case DlssRenderPreset::K: return "K";
+    case DlssRenderPreset::L: return "L";
+    case DlssRenderPreset::M: return "M";
+    default: return "Default";
+    }
+}
+
+static const char *DlssRenderPresetDescription(DlssRenderPreset preset)
+{
+    switch (preset)
+    {
+    case DlssRenderPreset::J:
+        return "Slightly less ghosting than K, but more flickering; useful for testing motion trails.";
+    case DlssRenderPreset::K:
+        return "Recommended high-quality preset for DLAA, Quality, and Balanced; stable but relatively expensive.";
+    case DlssRenderPreset::L:
+        return "Sharpest and most stable at extreme scaling with less ghosting, but the highest performance cost.";
+    case DlssRenderPreset::M:
+        return "Performance-oriented modern preset with L-like image improvements at speed closer to J/K.";
+    default:
+        return "Lets NVIDIA choose a mode-specific preset: normally K, L, or M with the supplied runtime.";
+    }
+}
+
+static const char *DlssRenderPresetRole(DlssRenderPreset preset)
+{
+    switch (preset)
+    {
+    case DlssRenderPreset::J: return "QUALITY ALTERNATIVE";
+    case DlssRenderPreset::K: return "DLAA QUALITY BALANCED";
+    case DlssRenderPreset::L: return "ULTRA PERFORMANCE";
+    case DlssRenderPreset::M: return "PERFORMANCE";
+    default: return "NVIDIA AUTO";
+    }
+}
+
+static void ShowPipelineNotice(const char *format, ...)
+{
+    char message[kPipelineNoticeTextLength + 1] = {};
+    va_list arguments;
+    va_start(arguments, format);
+    vsnprintf_s(message, sizeof(message), _TRUNCATE, format, arguments);
+    va_end(arguments);
+
+    g_pipeline_notice_until_tick.store(0, std::memory_order_release);
+    UINT length = 0;
+    for (; length < kPipelineNoticeTextLength && message[length] != '\0'; ++length)
+    {
+        unsigned char character = static_cast<unsigned char>(message[length]);
+        if (character >= 'a' && character <= 'z') character -= 'a' - 'A';
+        g_pipeline_notice_text[length].store(character, std::memory_order_relaxed);
+    }
+    for (UINT index = length; index < kPipelineNoticeTextLength; ++index)
+        g_pipeline_notice_text[index].store(0, std::memory_order_relaxed);
+    g_pipeline_notice_length.store(length, std::memory_order_release);
+    g_pipeline_notice_until_tick.store(GetTickCount64() + kPipelineNoticeDurationMs,
+        std::memory_order_release);
+}
+
+static void SelectDlssRenderPreset(DlssRenderPreset preset, const char *source)
+{
+    if (preset == g_dlss_render_preset) return;
+    g_dlss_render_preset = preset;
+    char value[16]; sprintf_s(value, "%d", static_cast<int>(preset));
+    reshade::set_config_value(nullptr, "Standalone.DLSSNR", "DlssRenderPreset",
+        static_cast<const char *>(value));
+    g_need_history_reset = true;
+    g_fg_frames = 0;
+    if (g_neural_ready)
+    {
+        g_feature_recreate_requested = true;
+        SetStatus("switching DLSS render preset to %s on next Present",
+            DlssRenderPresetName(preset));
+    }
+    Log("requested DLSS render preset changed to %s via %s",
+        DlssRenderPresetName(preset), source);
+    ShowPipelineNotice("PRESET %s (%s)",
+        preset == DlssRenderPreset::Default ? "DEFAULT" : DlssRenderPresetName(preset),
+        DlssRenderPresetRole(preset));
+}
+
+static void CycleDlssRenderPreset()
+{
+    DlssRenderPreset next = DlssRenderPreset::J;
+    switch (g_dlss_render_preset)
+    {
+    case DlssRenderPreset::J: next = DlssRenderPreset::K; break;
+    case DlssRenderPreset::K: next = DlssRenderPreset::L; break;
+    case DlssRenderPreset::L: next = DlssRenderPreset::M; break;
+    case DlssRenderPreset::M: next = DlssRenderPreset::J; break;
+    default: break;
+    }
+    SelectDlssRenderPreset(next, "Ctrl+Alt+P hotkey");
+}
+
+static void SelectNrModel(int model, const char *source)
+{
+    model = std::clamp(model, 1, 3);
+    if (model == g_nr_model) return;
+    const int previous_model = g_nr_model;
+    g_nr_model = model;
+    char value[16]; sprintf_s(value, "%d", model);
+    reshade::set_config_value(nullptr, "Standalone.DLSSNR", "Model",
+        static_cast<const char *>(value));
+    g_need_history_reset = true;
+    g_fg_frames = 0;
+    if (g_neural_ready && g_nr_enabled)
+    {
+        g_feature_recreate_requested = true;
+        SetStatus("switching live feature from model %d to model %d",
+            g_active_nr_model, model);
+    }
+    Log("requested DLSS-NR model changed from %d to %d via %s",
+        previous_model, model, source);
+    ShowPipelineNotice("NR MODEL %d", model);
+}
+
+static void CycleNrModel()
+{
+    SelectNrModel(g_nr_model >= 3 ? 1 : g_nr_model + 1,
+        "Ctrl+Alt+N hotkey");
+}
+
+static const char *DlssQualityName(int quality)
+{
+    switch (quality)
+    {
+    case NVSDK_NGX_PerfQuality_Value_DLAA: return "DLAA";
+    case NVSDK_NGX_PerfQuality_Value_MaxQuality: return "Quality";
+    case NVSDK_NGX_PerfQuality_Value_Balanced: return "Balanced";
+    case NVSDK_NGX_PerfQuality_Value_MaxPerf: return "Performance";
+    case NVSDK_NGX_PerfQuality_Value_UltraPerformance: return "Ultra Performance";
+    default: return "Unknown";
+    }
+}
+
+static int AutomaticDlssQuality()
+{
+    if (IsDlaaMode()) return NVSDK_NGX_PerfQuality_Value_DLAA;
+    const float ratio = g_resource_output_width != 0 ?
+        static_cast<float>(g_resource_input_width) / static_cast<float>(g_resource_output_width) : 1.0f;
+    return ratio >= 0.62f ? NVSDK_NGX_PerfQuality_Value_MaxQuality :
+        ratio >= 0.54f ? NVSDK_NGX_PerfQuality_Value_Balanced :
+        ratio >= 0.42f ? NVSDK_NGX_PerfQuality_Value_MaxPerf :
+        NVSDK_NGX_PerfQuality_Value_UltraPerformance;
+}
+
+static void SetDlssRenderPresetHints(int preset)
+{
+    // NGX has a distinct render-preset hint for every PerfQualityValue. Apply
+    // the same user choice to each contract so it survives resolution changes
+    // that move the pipeline between DLAA and the various SR quality modes.
+    g_ngx_params->Set("DLSS.Hint.Render.Preset.DLAA", preset);
+    g_ngx_params->Set("DLSS.Hint.Render.Preset.Quality", preset);
+    g_ngx_params->Set("DLSS.Hint.Render.Preset.Balanced", preset);
+    g_ngx_params->Set("DLSS.Hint.Render.Preset.Performance", preset);
+    g_ngx_params->Set("DLSS.Hint.Render.Preset.UltraPerformance", preset);
+    g_ngx_params->Set("DLSS.Hint.Render.Preset.UltraQuality", preset);
 }
 
 static bool IsProcessStillRunning(DWORD process_id)
@@ -1489,30 +1672,52 @@ static bool CreateFeatures()
         Log("CreateFeature(feature=18) skipped: Neural Rendering is disabled; SR + FG-only mode");
     }
 
-    const bool dlaa = IsDlaaMode();
-    const float ratio = static_cast<float>(g_resource_input_width) / static_cast<float>(g_resource_output_width);
-    // A 1:1 render/output contract is explicitly DLAA. For true upscaling,
-    // Quality is the highest broadly supported preset and also accepts ratios
-    // above its nominal recommendation, including common ultrawide inputs.
-    const int quality = dlaa ? NVSDK_NGX_PerfQuality_Value_DLAA :
-        ratio >= 0.62f ? NVSDK_NGX_PerfQuality_Value_MaxQuality :
-        ratio >= 0.54f ? NVSDK_NGX_PerfQuality_Value_Balanced :
-        ratio >= 0.42f ? NVSDK_NGX_PerfQuality_Value_MaxPerf : NVSDK_NGX_PerfQuality_Value_UltraPerformance;
-    g_ngx_params->Reset();
-    g_ngx_params->Set("CreationNodeMask", 1u); g_ngx_params->Set("VisibilityNodeMask", 1u);
-    g_ngx_params->Set("Width", g_resource_input_width); g_ngx_params->Set("Height", g_resource_input_height);
-    g_ngx_params->Set("OutWidth", g_resource_output_width); g_ngx_params->Set("OutHeight", g_resource_output_height);
-    g_ngx_params->Set("PerfQualityValue", quality);
-    g_ngx_params->Set("DLSS.Feature.Create.Flags", FeatureFlags());
-    g_ngx_params->Set("DLSS.Enable.Output.Subrects", 0);
-    if (!BeginNeuralCommands(kInitializationGpuWaitMs, true)) return false;
-    exception = 0;
-    result = SafeCreate(false, &exception);
-    if (exception) { g_neural_list->Close(); Fail("DLSS SR feature creation exception", exception); return false; }
-    if (!SubmitNeuralCommands(true)) return false;
-    Log("CreateFeature(feature=SuperSampling) = 0x%08X (%s), handle=%p mode=%s quality=%d",
-        static_cast<unsigned int>(result), ResultName(result), g_sr_feature, SrModeName(), quality);
+    const int automatic_quality = AutomaticDlssQuality();
+    const int quality = automatic_quality;
+    int render_preset = static_cast<int>(g_dlss_render_preset);
+    auto create_sr = [&](int attempt_preset) -> bool
+    {
+        g_ngx_params->Reset();
+        g_ngx_params->Set("CreationNodeMask", 1u); g_ngx_params->Set("VisibilityNodeMask", 1u);
+        g_ngx_params->Set("Width", g_resource_input_width); g_ngx_params->Set("Height", g_resource_input_height);
+        g_ngx_params->Set("OutWidth", g_resource_output_width); g_ngx_params->Set("OutHeight", g_resource_output_height);
+        g_ngx_params->Set("PerfQualityValue", quality);
+        SetDlssRenderPresetHints(attempt_preset);
+        g_ngx_params->Set("DLSS.Feature.Create.Flags", FeatureFlags());
+        g_ngx_params->Set("DLSS.Enable.Output.Subrects", 0);
+        if (!BeginNeuralCommands(kInitializationGpuWaitMs, true)) return false;
+        exception = 0;
+        result = SafeCreate(false, &exception);
+        if (exception)
+        {
+            g_neural_list->Close();
+            Fail("DLSS SR feature creation exception", exception);
+            return false;
+        }
+        if (!SubmitNeuralCommands(true)) return false;
+        Log("CreateFeature(feature=SuperSampling) = 0x%08X (%s), handle=%p mode=%s quality=%d (%s) render_preset=%s(%d)",
+            static_cast<unsigned int>(result), ResultName(result), g_sr_feature, SrModeName(),
+            quality, DlssQualityName(quality),
+            DlssRenderPresetName(static_cast<DlssRenderPreset>(attempt_preset)), attempt_preset);
+        return true;
+    };
+    if (!create_sr(render_preset)) return false;
+    if ((NVSDK_NGX_FAILED(result) || !g_sr_feature) && render_preset != 0)
+    {
+        if (g_sr_feature)
+        {
+            DWORD release_exception = 0;
+            SafeRelease(g_sr_release, g_sr_feature, &release_exception);
+            g_sr_feature = nullptr;
+        }
+        Log("DLSS render preset %s was rejected; retrying NVIDIA default",
+            DlssRenderPresetName(static_cast<DlssRenderPreset>(render_preset)));
+        render_preset = 0;
+        if (!create_sr(render_preset)) return false;
+    }
     if (NVSDK_NGX_FAILED(result) || !g_sr_feature) { Fail("DLSS SR feature creation", static_cast<unsigned int>(result)); return false; }
+    g_active_dlss_quality = quality;
+    g_active_dlss_render_preset = static_cast<DlssRenderPreset>(render_preset);
 
     if (!g_framegen_failed && EffectiveFramegenEnabled())
     {
@@ -1551,9 +1756,10 @@ static bool CreateFeatures()
         Log("CreateFeature(feature=FrameGeneration) skipped: %s",
             !g_framegen_enabled ? "Frame Generation is disabled" : "previous failure");
     }
-    Log("standalone contract ready: NR=%s at %ux%u, %s -> %ux%u, DLSS-G=%s, model=%d style=%u, profile=%s",
+    Log("standalone contract ready: NR=%s at %ux%u, %s (%s preset %s) -> %ux%u, DLSS-G=%s, model=%d style=%u, profile=%s",
         g_nr_feature ? "feature 18 active" : "disabled",
         g_resource_input_width, g_resource_input_height, SrModeName(),
+        DlssQualityName(g_active_dlss_quality), DlssRenderPresetName(g_active_dlss_render_preset),
         g_resource_output_width, g_resource_output_height,
         (!g_framegen_failed && g_fg_feature) ? "ready" : "fallback-off",
         g_nr_model, NrStyle(), ProfileName(g_active_color_profile));
@@ -5027,7 +5233,7 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
     root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     root_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     root_parameters[1].Constants.ShaderRegister = 0;
-    root_parameters[1].Constants.Num32BitValues = 8;
+    root_parameters[1].Constants.Num32BitValues = 52;
     root_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_STATIC_SAMPLER_DESC sampler = {};
     // Native neural output remains a 1:1 sample. The same sampler also gives
@@ -5043,20 +5249,33 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
     if (SUCCEEDED(hr)) { failed_stage = "CreateRootSignature"; hr = device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&g_proxy_root_signature)); }
     static const char *shader_source =
         "Texture2D<float3> Neural:register(t0); Texture2D<float3> Original:register(t1); Texture2D<float3> Post:register(t2);"
-        "SamplerState Samp:register(s0); cbuffer C:register(b0){uint Mode;uint Fps;uint ShowFps;float Threshold;float2 CursorInput;float2 PreviousCursorInput;}"
+        "SamplerState Samp:register(s0); cbuffer C:register(b0){uint Mode;uint Fps;uint ShowFps;float Threshold;float2 CursorInput;float2 PreviousCursorInput;uint NoticeVisible;uint NoticeLength;uint2 NoticePadding;uint4 NoticeText[10];}"
         "struct O{float4 p:SV_Position;float2 uv:TEXCOORD0;};"
         "O VS(uint id:SV_VertexID){O o; float2 p=float2((id<<1)&2,id&2); o.uv=p; o.p=float4(p*float2(2,-2)+float2(-1,1),0,1); return o;}"
-        "uint GlyphRow(uint c,uint y){static const uint r[91]={"
+        "uint GlyphRow(uint c,uint y){static const uint r[266]={"
         "14,17,17,17,17,17,14,4,12,4,4,4,4,14,14,17,1,2,4,8,31,30,1,1,14,1,1,30,"
         "2,6,10,18,31,2,2,31,16,16,30,1,1,30,14,16,16,30,17,17,14,31,1,2,4,8,8,8,"
-        "14,17,17,14,17,17,14,14,17,17,15,1,1,14,31,16,16,30,16,16,16,30,17,17,30,16,16,16,"
-        "15,16,16,14,1,1,30};return(c<13&&y<7)?r[c*7+y]:0;}"
+        "14,17,17,14,17,17,14,14,17,17,15,1,1,14,"
+        "14,17,17,31,17,17,17,30,17,17,30,17,17,30,14,17,16,16,16,17,14,30,17,17,17,17,17,30,"
+        "31,16,16,30,16,16,31,31,16,16,30,16,16,16,14,17,16,23,17,17,14,17,17,17,31,17,17,17,"
+        "14,4,4,4,4,4,14,7,2,2,2,18,18,12,17,18,20,24,20,18,17,16,16,16,16,16,16,31,"
+        "17,27,21,21,17,17,17,17,25,21,19,17,17,17,14,17,17,17,17,17,14,30,17,17,30,16,16,16,"
+        "14,17,17,17,21,18,13,30,17,17,30,20,18,17,15,16,16,14,1,1,30,31,4,4,4,4,4,4,"
+        "17,17,17,17,17,17,14,17,17,17,17,17,10,4,17,17,17,21,21,21,10,17,17,10,4,10,17,17,"
+        "17,17,10,4,4,4,4,31,1,2,4,8,16,31,2,4,8,8,8,4,2,8,4,2,2,2,4,8};"
+        "uint i=999;if(c>=48&&c<=57)i=c-48;else if(c>=65&&c<=90)i=10+c-65;else if(c==40)i=36;else if(c==41)i=37;return(i<38&&y<7)?r[i*7+y]:0;}"
         "float3 AddFps(float3 color,float2 pos){if(ShowFps==0)return color;const uint scale=4;"
         "int2 q=int2(pos)-int2(16,16);if(q.x< -8||q.y< -6||q.x>=176||q.y>=36)return color;"
         "color*=0.25;if(q.x<0||q.y<0)return color;uint ch=(uint)q.x/(6*scale);uint x=((uint)q.x%(6*scale))/scale;uint y=(uint)q.y/scale;"
-        "uint code=99;if(ch==0)code=10;else if(ch==1)code=11;else if(ch==2)code=12;else if(ch==4)code=min(Fps,999)/100;"
-        "else if(ch==5)code=(min(Fps,999)/10)%10;else if(ch==6)code=min(Fps,999)%10;"
+        "uint code=0;if(ch==0)code=70;else if(ch==1)code=80;else if(ch==2)code=83;else if(ch==4)code=48+min(Fps,999)/100;"
+        "else if(ch==5)code=48+(min(Fps,999)/10)%10;else if(ch==6)code=48+min(Fps,999)%10;"
         "if(x<5&&y<7&&((GlyphRow(code,y)>>(4-x))&1)!=0)return float3(0.25,0.95,0.35);return color;}"
+        "uint NoticeCode(uint ch){uint4 group=NoticeText[ch>>2];return group[ch&3];}"
+        "float3 AddNotice(float3 color,float2 pos){if(NoticeVisible==0||NoticeLength==0)return color;const uint scale=4;"
+        "int top=ShowFps!=0?58:16;int2 q=int2(pos)-int2(16,top);uint width=NoticeLength*6*scale;"
+        "if(q.x< -8||q.y< -6||q.x>=int(width+8)||q.y>=36)return color;color*=0.22;"
+        "if(q.x<0||q.y<0)return color;uint ch=(uint)q.x/(6*scale);uint x=((uint)q.x%(6*scale))/scale;uint y=(uint)q.y/scale;"
+        "uint code=ch<NoticeLength?NoticeCode(ch):0;if(x<5&&y<7&&((GlyphRow(code,y)>>(4-x))&1)!=0)return float3(1.0,0.82,0.18);return color;}"
         "float4 PS(O i):SV_Target{float3 post=Post.SampleLevel(Samp,i.uv,0);float3 neural=Neural.SampleLevel(Samp,i.uv,0);float3 result;"
         "uint w,h; Post.GetDimensions(w,h); uint2 p=min(uint2(i.uv*float2(w,h)),uint2(w-1,h-1));"
         "uint ow,oh; Original.GetDimensions(ow,oh); uint2 op=min(uint2(i.uv*float2(ow,oh)),uint2(ow-1,oh-1));"
@@ -5065,7 +5284,7 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
         "bool cursorNow=CursorInput.x>=0&&all(float2(p)>=CursorInput-float2(6,6))&&all(float2(p)<=CursorInput+float2(36,44));"
         "bool cursorPrevious=PreviousCursorInput.x>=0&&all(float2(p)>=PreviousCursorInput-float2(6,6))&&all(float2(p)<=PreviousCursorInput+float2(36,44));"
         "if((cursorNow||cursorPrevious)&&Mode!=1)result=Mode==0?original:neural;"
-        "return float4(AddFps(result,i.p.xy),1);}";
+        "return float4(AddNotice(AddFps(result,i.p.xy),i.p.xy),1);}";
     if (SUCCEEDED(hr)) { failed_stage = "Compile vertex shader"; hr = D3DCompile(shader_source, strlen(shader_source), nullptr, nullptr, nullptr, "VS", "vs_5_0", 0, 0, &vertex_shader, &error_blob); }
     if (SUCCEEDED(hr)) { failed_stage = "Compile pixel shader"; hr = D3DCompile(shader_source, strlen(shader_source), nullptr, nullptr, nullptr, "PS", "ps_5_0", 0, 0, &pixel_shader, &error_blob); }
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline_desc = {};
@@ -5256,14 +5475,25 @@ static bool PresentProxyFrameOnWorker()
     {
         UINT mode; UINT fps; UINT show_fps; float threshold;
         float cursor_x; float cursor_y; float previous_cursor_x; float previous_cursor_y;
-    } constants = {
-        g_composite_reshade_output && composite_post ?
-            (g_show_neural_output ? 2u : 3u) : (g_show_neural_output ? 1u : 0u),
-        g_proxy_fps.load(),
-        g_show_proxy_fps ? 1u : 0u,
-        0.0f,
-        cursor_x, cursor_y, previous_cursor_x, previous_cursor_y
-    };
+        UINT notice_visible; UINT notice_length; UINT notice_padding[2];
+        UINT notice_text[kPipelineNoticeTextLength];
+    } constants = {};
+    static_assert(sizeof(ProxyConstants) == 52 * sizeof(UINT));
+    constants.mode = g_composite_reshade_output && composite_post ?
+        (g_show_neural_output ? 2u : 3u) : (g_show_neural_output ? 1u : 0u);
+    constants.fps = g_proxy_fps.load();
+    constants.show_fps = g_show_proxy_fps ? 1u : 0u;
+    constants.cursor_x = cursor_x;
+    constants.cursor_y = cursor_y;
+    constants.previous_cursor_x = previous_cursor_x;
+    constants.previous_cursor_y = previous_cursor_y;
+    const ULONGLONG notice_until_tick = g_pipeline_notice_until_tick.load(std::memory_order_acquire);
+    constants.notice_visible = notice_until_tick != 0 && GetTickCount64() < notice_until_tick ? 1u : 0u;
+    constants.notice_length = constants.notice_visible ?
+        std::min<UINT>(g_pipeline_notice_length.load(std::memory_order_acquire),
+            static_cast<UINT>(kPipelineNoticeTextLength)) : 0u;
+    for (UINT index = 0; index < constants.notice_length; ++index)
+        constants.notice_text[index] = g_pipeline_notice_text[index].load(std::memory_order_relaxed);
     previous_cursor_x = cursor_x; previous_cursor_y = cursor_y;
     D3D12_VIEWPORT viewport = {0, 0, static_cast<float>(g_output_width.load()), static_cast<float>(g_output_height.load()), 0, 1};
     D3D12_RECT scissor = {0, 0, static_cast<LONG>(g_output_width.load()), static_cast<LONG>(g_output_height.load())};
@@ -5327,7 +5557,7 @@ static bool PresentProxyFrameOnWorker()
         auto gpu_srv = g_proxy_srv_heap->GetGPUDescriptorHandleForHeapStart();
         gpu_srv.ptr += static_cast<UINT64>(present_index) * 3 * g_proxy_srv_stride;
         list->SetGraphicsRootDescriptorTable(0, gpu_srv);
-        list->SetGraphicsRoot32BitConstants(1, 8, &constants, 0);
+        list->SetGraphicsRoot32BitConstants(1, 52, &constants, 0);
         list->RSSetViewports(1, &viewport); list->RSSetScissorRects(1, &scissor);
         auto rtv = g_proxy_rtv_heap->GetCPUDescriptorHandleForHeapStart(); rtv.ptr += buffer_index * g_proxy_rtv_stride;
         list->OMSetRenderTargets(1, &rtv, FALSE, nullptr); list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -5751,6 +5981,20 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     g_last_primary_present_tick = present_tick;
     const HWND foreground = GetForegroundWindow();
     const bool primary_foreground = IsGameProcessForeground(foreground);
+    const bool dlss_preset_hotkey_down = primary_foreground &&
+        (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 &&
+        (GetAsyncKeyState(VK_MENU) & 0x8000) != 0 &&
+        (GetAsyncKeyState('P') & 0x8000) != 0;
+    if (dlss_preset_hotkey_down && !g_dlss_render_preset_hotkey_down)
+        CycleDlssRenderPreset();
+    g_dlss_render_preset_hotkey_down = dlss_preset_hotkey_down;
+    const bool nr_model_hotkey_down = primary_foreground &&
+        (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 &&
+        (GetAsyncKeyState(VK_MENU) & 0x8000) != 0 &&
+        (GetAsyncKeyState('N') & 0x8000) != 0;
+    if (nr_model_hotkey_down && !g_nr_model_hotkey_down)
+        CycleNrModel();
+    g_nr_model_hotkey_down = nr_model_hotkey_down;
     UpdateProxyCursorClip(primary_foreground && g_proxy_window != nullptr &&
         !g_proxy_hidden && !g_proxy_overlay_bypass && !g_proxy_failed &&
         !g_proxy_early_pending_activation && !g_proxy_overlay_preview.load() &&
@@ -6466,6 +6710,24 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::TextDisabled("Active: %s | detected: %s (format %u)", ProfileName(g_active_color_profile),
         ColorSpaceName(g_detected_color_space), static_cast<unsigned int>(g_detected_swapchain_format));
     ImGui::TextDisabled("Auto follows the primary swapchain; use a manual profile only when a game reports it incorrectly.");
+    static constexpr DlssRenderPreset preset_values[] = {
+        DlssRenderPreset::Default,
+        DlssRenderPreset::J, DlssRenderPreset::K, DlssRenderPreset::L, DlssRenderPreset::M};
+    int preset_index = 0;
+    for (int index = 0; index < static_cast<int>(std::size(preset_values)); ++index)
+        if (preset_values[index] == g_dlss_render_preset) preset_index = index;
+    if (ImGui::Combo("DLSS render preset", &preset_index,
+        "Default (NVIDIA)\0Preset J\0Preset K\0Preset L\0Preset M\0"))
+    {
+        SelectDlssRenderPreset(preset_values[preset_index], "ReShade menu");
+    }
+    ImGui::TextDisabled("Active: %s quality mode, render preset %s%s",
+        g_active_dlss_quality >= 0 ? DlssQualityName(g_active_dlss_quality) : "waiting",
+        DlssRenderPresetName(g_active_dlss_render_preset),
+        g_feature_recreate_requested.load() ? " (switch queued for next Present)" : "");
+    ImGui::TextWrapped("%s", DlssRenderPresetDescription(g_dlss_render_preset));
+    ImGui::TextDisabled("Ctrl+Alt+P cycles J -> K -> L -> M. Default remains available from this menu.");
+    ImGui::TextDisabled("Render presets tune reconstruction behavior; they do not change the game's input resolution.");
     if (ImGui::Checkbox("Enable Neural Rendering", &g_nr_enabled))
     {
         reshade::set_config_value(nullptr, section, "NeuralRendering", g_nr_enabled ? "1" : "0");
@@ -6484,24 +6746,18 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::TextDisabled("Off skips NR evaluation; DLSS Super Resolution and optional Frame Generation remain active.");
     ImGui::TextUnformatted("DLSS-NR model:");
     bool model_changed = false;
-    if (ImGui::RadioButton("Model 1", g_nr_model == 1)) { g_nr_model = 1; model_changed = true; }
+    int selected_model = g_nr_model;
+    if (ImGui::RadioButton("Model 1", g_nr_model == 1)) { selected_model = 1; model_changed = true; }
     ImGui::SameLine();
-    if (ImGui::RadioButton("Model 2", g_nr_model == 2)) { g_nr_model = 2; model_changed = true; }
+    if (ImGui::RadioButton("Model 2", g_nr_model == 2)) { selected_model = 2; model_changed = true; }
     ImGui::SameLine();
-    if (ImGui::RadioButton("Model 3", g_nr_model == 3)) { g_nr_model = 3; model_changed = true; }
+    if (ImGui::RadioButton("Model 3", g_nr_model == 3)) { selected_model = 3; model_changed = true; }
     if (model_changed)
-    {
-        char value[16]; sprintf_s(value, "%d", g_nr_model);
-        reshade::set_config_value(nullptr, section, "Model", static_cast<const char *>(value));
-        if (g_neural_ready && g_nr_enabled)
-        {
-            g_feature_recreate_requested = true;
-            SetStatus("switching live feature from model %d to model %d", g_active_nr_model, g_nr_model);
-        }
-    }
+        SelectNrModel(selected_model, "ReShade menu");
     ImGui::TextDisabled("Active feature model: %d (NR style %u)%s", g_active_nr_model,
         g_active_nr_model > 0 ? static_cast<unsigned int>(g_active_nr_model - 1) : 0u,
         g_feature_recreate_requested.load() ? " (switch queued for next Present)" : "");
+    ImGui::TextDisabled("Ctrl+Alt+N cycles Model 1 -> Model 2 -> Model 3.");
 
     auto save_float = [section](const char *key, float value)
     {
@@ -6575,9 +6831,12 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::Separator();
     ImGui::Text("Status: %s", g_neural_status);
     ImGui::TextUnformatted("Activation boundary: game OnPresent (standalone private NGX runtime)");
-    ImGui::Text("Pipeline: NR=%s (%llu evals); %s=%llu; generated=%llu; FG=%s; active model=%d",
+    ImGui::Text("Pipeline: NR=%s (%llu evals); %s/%s preset %s=%llu; generated=%llu; FG=%s; active model=%d",
         g_nr_enabled ? (g_nr_feature ? "enabled" : "starting") : "disabled",
-        g_nr_frames.load(), SrModeName(), g_sr_frames.load(), g_fg_frames.load(),
+        g_nr_frames.load(), SrModeName(),
+        g_active_dlss_quality >= 0 ? DlssQualityName(g_active_dlss_quality) : "waiting",
+        DlssRenderPresetName(g_active_dlss_render_preset),
+        g_sr_frames.load(), g_fg_frames.load(),
         g_framegen_failed ? "failed/off" : (EffectiveFramegenEnabled() ? "2x" : "off"),
         g_active_nr_model);
     ImGui::Text("Contract: %ux%u -> %ux%u", g_input_width.load(), g_input_height.load(), g_output_width.load(), g_output_height.load());
@@ -6763,6 +7022,15 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         // ColorProfile to HDR10 globally, so importing that value would retain
         // the cross-game color bug instead of migrating installations to Auto.
         read_setting("InputColorProfile", "0", value, sizeof(value)); g_color_profile = static_cast<ColorProfile>(std::clamp(atoi(value), 0, 4));
+        read_setting("DlssRenderPreset", "0", value, sizeof(value));
+        switch (atoi(value))
+        {
+        case 10: g_dlss_render_preset = DlssRenderPreset::J; break;
+        case 11: g_dlss_render_preset = DlssRenderPreset::K; break;
+        case 12: g_dlss_render_preset = DlssRenderPreset::L; break;
+        case 13: g_dlss_render_preset = DlssRenderPreset::M; break;
+        default: g_dlss_render_preset = DlssRenderPreset::Default; break;
+        }
         read_setting("Model", "1", value, sizeof(value)); g_nr_model = std::clamp(atoi(value), 1, 3);
         read_setting("Intensity", "1.0", value, sizeof(value)); g_nr_intensity = std::clamp(static_cast<float>(atof(value)), 0.0f, 2.0f);
         read_setting("LocalTone", "1.0", value, sizeof(value)); g_nr_local_tone = std::clamp(static_cast<float>(atof(value)), 0.0f, 2.0f);
@@ -6797,8 +7065,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             reshade::set_config_value(nullptr, section, "SynchronousProxyPresentation", "1");
         }
         g_requested_synchronous_proxy_presentation = g_synchronous_proxy_presentation;
-        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s model=%d style=%u NR=%s NR-mask=%s strength=%.2f early_proxy=%s auto_presentation=%s windowed_virtualization=%s logical_client=%s input_coordinates=%s detached_output=%s detached_cursor=%s opaque_composition=%s presenter=%s telemetry=%s",
-            ADDON_VERSION, ProfileName(g_color_profile), g_nr_model, NrStyle(), g_nr_enabled ? "enabled" : "disabled",
+        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s DLSS_render_preset=%s model=%d style=%u NR=%s NR-mask=%s strength=%.2f early_proxy=%s auto_presentation=%s windowed_virtualization=%s logical_client=%s input_coordinates=%s detached_output=%s detached_cursor=%s opaque_composition=%s presenter=%s telemetry=%s",
+            ADDON_VERSION, ProfileName(g_color_profile), DlssRenderPresetName(g_dlss_render_preset),
+            g_nr_model, NrStyle(), g_nr_enabled ? "enabled" : "disabled",
             g_nr_rejection_mask_enabled ? "enabled" : "disabled", g_nr_rejection_mask_strength,
             g_early_proxy_initialization ? "enabled" : "disabled",
             g_auto_windowed_virtualization ? "enabled" : "disabled",
