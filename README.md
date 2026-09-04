@@ -5,6 +5,9 @@ Bring Neural Rendering, DLAA/DLSS Super Resolution, and Frame Generation to supp
 > [!IMPORTANT]
 > **Version 2.0 uses a new presentation and window-compatibility system.** It fixes input and reduced-window behavior in many games, but game compatibility can differ from the 1.x series. If a game has problems in 2.0 that it did not have before, install the [latest 1.x release (v1.7.24)](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/tag/v1.7.24). Do not mix the 1.x and 2.0 addon binaries.
 
+> [!TIP]
+> **Windowed mode is recommended for setup and normal use.** It reliably exposes a lower-resolution backbuffer for DLSS SR, and version 2.0.1 can place the processed output in a small preview beside the real ReShade window while you change settings. Closing ReShade restores the native-size processed output.
+
 ## Quick install
 
 > [!IMPORTANT]
@@ -23,16 +26,17 @@ Bring Neural Rendering, DLAA/DLSS Super Resolution, and Frame Generation to supp
 ## First-launch setup
 
 1. Disable the game's built-in **DLSS/upscaling, Frame Generation, and antialiasing**. The addon supplies its own pipeline.
-2. Try fullscreen or borderless first. Windowed mode is also supported and can help games that refuse to create a reduced-resolution fullscreen image.
+2. Select **windowed mode** when available. It is the recommended mode because it usually creates a genuinely lower-resolution backbuffer and leaves room for the processed preview while ReShade is open. Fullscreen and borderless remain supported when a game handles them correctly.
 3. Select the game resolution:
    - **Same as the monitor:** the addon automatically uses **DLAA** at a 1:1 render scale.
    - **Lower than the monitor:** the addon uses **DLSS Super Resolution** to reconstruct the image to the monitor's native size.
-4. If a lower game resolution still reports **DLAA**, the game is still presenting a native-size backbuffer. Switch between fullscreen, borderless, and windowed modes; restart after changing modes if necessary. Use whichever mode makes the overlay report **DLSS SR**.
+4. If a lower game resolution still reports **DLAA**, the game is still presenting a native-size backbuffer. Try windowed mode first, then borderless or fullscreen; restart after changing modes if necessary. Use whichever mode makes the overlay report **DLSS SR**.
 5. Neural Rendering and Frame Generation are enabled by default and can be toggled independently in ReShade. Disabling both leaves an SR/DLAA-only pipeline.
 
 Reduced-resolution DLSS SR can provide major performance improvements. Native-resolution DLAA instead prioritizes image quality.
 
 - Press **F10** to compare the processed image with the original game output.
+- While ReShade is open in a reduced window, version 2.0.1 moves the processed/F10 output into a small mouse-transparent preview beside it. This lets the real ReShade window receive normal clicks. Close ReShade to restore the fullscreen compositor.
 - The addon draws its own FPS counter because third-party overlays may not appear through its presentation proxy.
 - Logs are written to `%LOCALAPPDATA%\RHI\Logs\standalone-dlssnr.log`.
 
@@ -49,9 +53,9 @@ Open **ReShade > Add-ons > Standalone DLSS-NR + SR**, then expand **Compatibilit
 | **The original and processed pictures appear together, or the output looks transparent** | Enable **Opaque attached composition** and restart. |
 | **The game crashes, freezes, or goes black when processed output begins or after a resolution change** | Enable **Serialized presentation (crash workaround)** and restart. If the game crashes before you can reach ReShade, hold **F8 while launching** to start in serialized safe mode. |
 | **The addon stays on “waiting for Present” during D3D12 startup** | Try **Early proxy initialization (D3D11On12 compatibility)** and restart. Leave this disabled in games that already launch normally. |
-| **A lower game resolution still reports DLAA instead of DLSS SR** | Switch between fullscreen, borderless, and windowed. DLSS SR activates only when the game creates a genuinely lower-resolution backbuffer. Restart after changing mode if needed. |
+| **A lower game resolution still reports DLAA instead of DLSS SR** | Switch to windowed mode first. DLSS SR activates only when the game creates a genuinely lower-resolution backbuffer. If needed, test borderless/fullscreen and restart after changing mode. |
 | **The image becomes smeared, stretched, or wrongly sized after changing resolution** | Restart the game and set the desired resolution/display mode before loading gameplay. Live resolution changes remain game-dependent. |
-| **The ReShade menu makes the image temporarily become small** | Close the ReShade menu; native-size processed output should return. This remains a known input workaround in some games. |
+| **The processed preview does not appear while ReShade is open** | Use windowed mode at a resolution below the monitor's native resolution. Fullscreen and borderless windows may leave no separate desktop area for the preview. Closing ReShade should still restore the native-size processed output. |
 | **The addon is missing from ReShade** | Confirm the game is 64-bit, ReShade was installed with addon support, and `standalone-dlssnr.addon64` is beside the real game executable and ReShade DLL. |
 | **The log says `required private runtime dependency missing`** | Install `nvngx.dll` beside the addon. Also supply `nvngx_dlssnr.dll` and `nvngx_dlss.dll`; `nvngx_dlssg.dll` is required for Frame Generation. |
 | **The overlay reports fallback or zero-motion guides** | Install `DLSS5_AIO_Feed.fx` under `reshade-shaders\Shaders` and install VORT Motion in the same shader search path. The addon still works without them, but temporal guidance is reduced. |
@@ -74,7 +78,7 @@ The persistent log records `early_proxy=enabled` at startup when the saved setti
 
 - Occasional stuttering or uneven Frame Generation pacing may occur.
 - Changing resolution while running may cause visual glitches; restarting usually fixes them.
-- Some games temporarily show their lower-resolution image while the ReShade menu is open.
+- The processed side preview is designed primarily for reduced-resolution windowed mode. Fullscreen and borderless behavior while ReShade is open remains game-dependent.
 - No Man's Sky and potentially other Vulkan games may not display the ReShade menu correctly.
 - Additional game-specific and Vulkan issues are expected.
 - The experimental VORT NR rejection mask currently behaves more like a hard gate than a gradual blend at nonzero strength. Leave it disabled unless testing this feature; strength zero is an exact bypass that restores NVIDIA automatic masking.
@@ -88,6 +92,10 @@ The new **Compatibility / troubleshooting** panel provides opt-in fixes for game
 Resolution transitions are serialized outside the game's DXGI callback, failed sessions can recover into serialized mode by holding **F8** during launch, and startup contract changes hold the last completed native frame instead of repeatedly exposing the low-resolution game surface.
 
 Because presentation behavior varies substantially between engines, 2.0 may work better or worse than 1.x in a particular game. Keep [v1.7.24](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/tag/v1.7.24) available as the stable 1.x fallback and report regressions with the game name, graphics API, display mode, and persistent addon log.
+
+### Version 2.0.1
+
+Opening the primary ReShade menu with detached presentation now moves the processed output into a separate, aspect-correct side preview. The preview does not accept mouse input, so clicks go to the game's real ReShade window without synthetic forwarding or a duplicate interactive cursor. F10 continues to choose processed or raw-stretched output in the preview, and closing ReShade restores the fullscreen native-size compositor. Windowed mode is recommended because it provides predictable space for both windows.
 
 ## Companion guide shader
 
@@ -163,7 +171,7 @@ Run `addon\build.bat`. The available runtime set is emitted under `addon\build`:
 
 Every GitHub release from v1.7.16 onward must attach `standalone-dlssnr.addon64`, `nvngx.dll`, and `DLSS5_AIO_Feed.fx`. The NVIDIA runtime DLLs remain user-supplied and must not be attached to public releases.
 
-The game may be set to fullscreen or borderless at the desired render resolution. A native-resolution game swapchain selects DLAA automatically; a lower-resolution swapchain selects DLSS Super Resolution. The addon keeps the desktop at native resolution, rejects auxiliary/helper swapchains, and presents the processed native output in its proxy window.
+Windowed mode is recommended at the desired render resolution, particularly while configuring the addon: it tends to expose the intended lower-resolution swapchain and gives the ReShade menu and processed preview separate screen space. Fullscreen and borderless remain supported where the game creates the expected backbuffer. A native-resolution game swapchain selects DLAA automatically; a lower-resolution swapchain selects DLSS Super Resolution. The addon keeps the desktop at native resolution, rejects auxiliary/helper swapchains, and presents the processed native output in its proxy window.
 
 The game `OnPresent` event is the activation and evaluation boundary. The addon copies the reduced game backbuffer there and loads its own private `nvngx_dlssnr.dll`, `nvngx_dlss.dll`, and caller-identity bridge; it does not hook or reuse the game's DLSS implementation. RHI may deploy only the `.addon64` file to the game directory, so the addon also searches `%LOCALAPPDATA%\RHI\Custom\Addons` for the complete private runtime set.
 

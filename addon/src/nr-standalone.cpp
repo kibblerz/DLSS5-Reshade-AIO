@@ -32,7 +32,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "2.0.0"
+#define ADDON_VERSION "2.0.1"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -57,6 +57,7 @@ static ID3D12CommandQueue *g_command_queue;
 static reshade::api::command_queue *g_rs_queue;
 static HWND g_game_window;
 static HWND g_proxy_window;
+static HWND g_proxy_preview_window;
 static HANDLE g_proxy_window_thread;
 static HANDLE g_proxy_window_ready;
 static HHOOK g_proxy_mouse_hook;
@@ -118,6 +119,7 @@ static std::atomic<reshade::api::effect_runtime *> g_proxy_runtime{nullptr};
 static std::atomic<bool> g_proxy_overlay_open{false};
 static bool g_proxy_overlay_syncing;
 static std::atomic<bool> g_proxy_overlay_bypass{false};
+static std::atomic<bool> g_proxy_overlay_preview{false};
 static std::atomic<bool> g_proxy_cursor_clip_active{false};
 static std::atomic<unsigned long long> g_overlay_mouse_events{0};
 static unsigned long long g_last_logged_mouse_event;
@@ -207,6 +209,7 @@ static constexpr UINT kProxyVirtualizeFullscreenMessage = WM_APP + 0x52;
 static constexpr UINT kProxyVisibilityMessage = WM_APP + 0x53;
 static constexpr UINT kProxyResizeToMonitorMessage = WM_APP + 0x54;
 static constexpr UINT kProxyRetargetCompositionMessage = WM_APP + 0x55;
+static constexpr UINT kProxyOverlayPreviewMessage = WM_APP + 0x56;
 static constexpr DWORD kInitializationGpuWaitMs = 2000;
 static constexpr DWORD kTransitionGpuWaitMs = 250;
 static constexpr DWORD kProxyWindowStartupWaitMs = 1000;
@@ -4186,10 +4189,21 @@ static bool RetargetCompositionWindow(HWND target_window)
     }
     else if (target_window == g_proxy_window)
     {
+        if (g_proxy_preview_window != nullptr)
+            ShowWindow(g_proxy_preview_window, SW_HIDE);
         if (show)
             ShowWindow(g_proxy_window, SW_SHOWNOACTIVATE);
         else
             ShowWindow(g_proxy_window, SW_HIDE);
+    }
+    else if (target_window == g_proxy_preview_window)
+    {
+        if (g_proxy_window != nullptr)
+            ShowWindow(g_proxy_window, SW_HIDE);
+        if (show)
+            ShowWindow(g_proxy_preview_window, SW_SHOWNOACTIVATE);
+        else
+            ShowWindow(g_proxy_preview_window, SW_HIDE);
     }
     if (g_composition_effect)
     {
@@ -4222,6 +4236,125 @@ static void QueueCompositionRetarget(HWND target_window)
     }
 }
 
+static void ApplyProxyOverlayPreview(HWND hwnd, bool enable)
+{
+    if (hwnd == nullptr || !IsWindow(hwnd) || g_game_window == nullptr ||
+        !g_composition_visual || !g_composition_device)
+        return;
+
+    HMONITOR monitor = MonitorFromWindow(g_game_window, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO monitor_info = {sizeof(monitor_info)};
+    if (!GetMonitorInfoW(monitor, &monitor_info)) return;
+
+    if (!enable)
+    {
+        const D2D_MATRIX_3X2_F identity = {1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
+        g_composition_visual->SetTransform(identity);
+        g_composition_device->Commit();
+        const RECT &screen = monitor_info.rcMonitor;
+        if (g_proxy_preview_window != nullptr)
+            ShowWindow(g_proxy_preview_window, SW_HIDE);
+        RetargetCompositionWindow(g_proxy_window);
+        SetWindowPos(hwnd, HWND_TOPMOST, screen.left, screen.top,
+            screen.right - screen.left, screen.bottom - screen.top,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+        g_proxy_overlay_preview = false;
+        Log("ReShade side preview closed; detached compositor restored to %ldx%ld",
+            screen.right - screen.left, screen.bottom - screen.top);
+        return;
+    }
+
+    g_proxy_overlay_preview = true;
+    RECT game = {};
+    if (!GetWindowRect(g_game_window, &game)) game = monitor_info.rcMonitor;
+    const RECT &screen = monitor_info.rcMonitor;
+    game.left = std::clamp(game.left, screen.left, screen.right);
+    game.right = std::clamp(game.right, screen.left, screen.right);
+    game.top = std::clamp(game.top, screen.top, screen.bottom);
+    game.bottom = std::clamp(game.bottom, screen.top, screen.bottom);
+
+    const RECT regions[4] = {
+        {screen.left, screen.top, game.left, screen.bottom},
+        {game.right, screen.top, screen.right, screen.bottom},
+        {screen.left, screen.top, screen.right, game.top},
+        {screen.left, game.bottom, screen.right, screen.bottom}};
+    const UINT output_width = std::max(1u, g_output_width.load());
+    const UINT output_height = std::max(1u, g_output_height.load());
+    constexpr LONG margin = 12;
+    RECT best = {};
+    LONG best_width = 0, best_height = 0;
+    unsigned long long best_area = 0;
+    for (const RECT &region : regions)
+    {
+        const LONG available_width = std::max<LONG>(0, region.right - region.left - margin * 2);
+        const LONG available_height = std::max<LONG>(0, region.bottom - region.top - margin * 2);
+        if (available_width <= 0 || available_height <= 0) continue;
+        const double scale = std::min(
+            static_cast<double>(available_width) / output_width,
+            static_cast<double>(available_height) / output_height);
+        const LONG width = static_cast<LONG>(output_width * scale);
+        const LONG height = static_cast<LONG>(output_height * scale);
+        const unsigned long long area = static_cast<unsigned long long>(width) * height;
+        if (area > best_area)
+        {
+            best = region;
+            best_width = width;
+            best_height = height;
+            best_area = area;
+        }
+    }
+    if (best_width < 240 || best_height < 135)
+    {
+        best_width = std::max<LONG>(240, (screen.right - screen.left) / 3);
+        best_height = MulDiv(best_width, output_height, output_width);
+        const LONG maximum_height = std::max<LONG>(135, (screen.bottom - screen.top) / 2);
+        if (best_height > maximum_height)
+        {
+            best_height = maximum_height;
+            best_width = MulDiv(best_height, output_width, output_height);
+        }
+        best = screen;
+    }
+    const LONG x = best.right - margin - best_width;
+    const LONG y = best.top + margin;
+    if (g_proxy_preview_window == nullptr || !IsWindow(g_proxy_preview_window))
+    {
+        g_proxy_preview_window = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
+            L"StandaloneDLSSNRNativeOutput", L"Standalone DLSS-NR Preview", WS_POPUP | WS_BORDER,
+            x, y, best_width, best_height, nullptr, nullptr, g_self, nullptr);
+        if (g_proxy_preview_window == nullptr)
+        {
+            g_proxy_overlay_preview = false;
+            Log("ReShade side preview window creation failed: error=%lu", GetLastError());
+            return;
+        }
+    }
+    if (!RetargetCompositionWindow(g_proxy_preview_window))
+    {
+        g_proxy_overlay_preview = false;
+        Log("ReShade side preview composition retarget failed");
+        return;
+    }
+    const float scale_x = static_cast<float>(best_width) / output_width;
+    const float scale_y = static_cast<float>(best_height) / output_height;
+    const D2D_MATRIX_3X2_F scale = {scale_x, 0.0f, 0.0f, scale_y, 0.0f, 0.0f};
+    g_composition_visual->SetTransform(scale);
+    g_composition_device->Commit();
+    SetWindowPos(g_proxy_preview_window, HWND_TOPMOST, x, y, best_width, best_height,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+    ShowWindow(hwnd, SW_HIDE);
+    RECT visible_rect = {};
+    GetWindowRect(g_proxy_preview_window, &visible_rect);
+    Log("ReShade side preview opened: preview=%ldx%ld at (%ld,%ld) game=(%ld,%ld)-(%ld,%ld) monitor=%ldx%ld",
+        best_width, best_height, x, y, game.left, game.top, game.right, game.bottom,
+        screen.right - screen.left, screen.bottom - screen.top);
+    Log("ReShade side preview window state: hwnd=%p visible=%u rect=(%ld,%ld)-(%ld,%ld) composition_target=%p",
+        g_proxy_preview_window, IsWindowVisible(g_proxy_preview_window) ? 1u : 0u,
+        visible_rect.left, visible_rect.top, visible_rect.right, visible_rect.bottom,
+        g_composition_target_window.load());
+}
+
 static bool IsGameProcessForeground(HWND foreground)
 {
     if (foreground == nullptr || g_game_window == nullptr)
@@ -4244,6 +4377,18 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
     }
     if (message == kProxyVisibilityMessage)
     {
+        if (g_proxy_overlay_preview.load() && g_proxy_preview_window != nullptr)
+        {
+            ShowWindow(hwnd, SW_HIDE);
+            if (wparam != 0 && !g_proxy_hidden && !g_proxy_failed &&
+                !g_proxy_overlay_bypass && !g_proxy_early_pending_activation)
+                SetWindowPos(g_proxy_preview_window, HWND_TOPMOST, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                    SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+            else
+                ShowWindow(g_proxy_preview_window, SW_HIDE);
+            return 0;
+        }
         if (wparam != 0 && !g_proxy_hidden && !g_proxy_failed &&
             !g_proxy_overlay_bypass && !g_proxy_early_pending_activation)
         {
@@ -4272,6 +4417,11 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
     }
     if (message == kProxyResizeToMonitorMessage)
     {
+        if (g_proxy_overlay_preview.load())
+        {
+            ApplyProxyOverlayPreview(hwnd, true);
+            return 0;
+        }
         HMONITOR monitor = MonitorFromWindow(g_game_window, MONITOR_DEFAULTTONEAREST);
         MONITORINFO info = {sizeof(info)};
         if (GetMonitorInfoW(monitor, &info))
@@ -4286,6 +4436,11 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
         const HWND target_window = reinterpret_cast<HWND>(wparam);
         RetargetCompositionWindow(target_window);
         g_composition_retarget_pending = nullptr;
+        return 0;
+    }
+    if (message == kProxyOverlayPreviewMessage)
+    {
+        ApplyProxyOverlayPreview(hwnd, wparam != 0);
         return 0;
     }
     if (message == kProxyOverlayInputModeMessage)
@@ -4323,18 +4478,34 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
     }
     if (message == WM_NCHITTEST)
     {
-        // The proxy is a normal hit target during gameplay and forwards the
-        // button messages below. When the primary ReShade menu is open without
-        // a proxy runtime, the entire proxy window is hidden instead, allowing
-        // Windows/ReShade to process genuine input on the game window.
+        if (g_proxy_overlay_preview.load()) return HTTRANSPARENT;
         return HTCLIENT;
     }
     if (message == WM_MOUSEACTIVATE && g_reshade_overlay_open.load() &&
         g_proxy_runtime.load() != nullptr)
         return MA_ACTIVATE;
     if (message == WM_ERASEBKGND) return 1;
-    if (message == WM_CLOSE) { DestroyWindow(hwnd); return 0; }
-    if (message == WM_DESTROY) { KillTimer(hwnd, 1); KillTimer(hwnd, 2); PostQuitMessage(0); return 0; }
+    if (message == WM_CLOSE)
+    {
+        if (hwnd == g_proxy_preview_window)
+        {
+            ShowWindow(hwnd, SW_HIDE);
+            return 0;
+        }
+        if (g_proxy_preview_window != nullptr)
+        {
+            DestroyWindow(g_proxy_preview_window);
+            g_proxy_preview_window = nullptr;
+        }
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    if (message == WM_DESTROY)
+    {
+        KillTimer(hwnd, 1); KillTimer(hwnd, 2);
+        if (hwnd == g_proxy_window) PostQuitMessage(0);
+        return 0;
+    }
     if (message == WM_TIMER && wparam == 2)
     {
         KillTimer(hwnd, 2);
@@ -4367,10 +4538,12 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
         const bool game_foreground = IsGameProcessForeground(foreground);
         const bool primary_alive = g_game_window != nullptr && IsWindow(g_game_window) &&
             last_present != 0 && now - last_present < 5000;
-        if ((!primary_alive || !game_foreground) && !g_proxy_hidden && IsWindowVisible(hwnd))
+        const HWND output_window = g_proxy_overlay_preview.load() && g_proxy_preview_window != nullptr ?
+            g_proxy_preview_window : hwnd;
+        if ((!primary_alive || !game_foreground) && !g_proxy_hidden && IsWindowVisible(output_window))
         {
             UpdateProxyCursorClip(false);
-            ShowWindow(hwnd, SW_HIDE);
+            ShowWindow(output_window, SW_HIDE);
             g_proxy_watchdog_hidden = true;
             Log("detached proxy watchdog hid output: primary_alive=%u foreground=%p game_hwnd=%p same_process=%u",
                 primary_alive ? 1u : 0u, foreground, g_game_window,
@@ -4378,12 +4551,12 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
         }
         else if (primary_alive && game_foreground && !g_proxy_hidden &&
             !g_proxy_overlay_bypass && !g_proxy_failed &&
-            !g_proxy_early_pending_activation && IsWindowVisible(hwnd))
+            !g_proxy_early_pending_activation && IsWindowVisible(output_window))
         {
             // Borderless Vulkan windows commonly promote themselves after a
             // mode switch. Reassert the detached visual's z-order without
             // activating it or disturbing the game's input focus.
-            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+            SetWindowPos(output_window, HWND_TOPMOST, 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
         }
         return 0;
@@ -4888,7 +5061,7 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
         "uint w,h; Post.GetDimensions(w,h); uint2 p=min(uint2(i.uv*float2(w,h)),uint2(w-1,h-1));"
         "uint ow,oh; Original.GetDimensions(ow,oh); uint2 op=min(uint2(i.uv*float2(ow,oh)),uint2(ow-1,oh-1));"
         "float3 postPoint=Post.Load(int3(p,0)); float3 original=Original.Load(int3(op,0));"
-        "if(Mode==0)result=original;else if(Mode==1)result=neural;else result=neural+(postPoint-original);"
+        "if(Mode==0)result=original;else if(Mode==1)result=neural;else if(Mode==2)result=neural+(postPoint-original);else result=postPoint;"
         "bool cursorNow=CursorInput.x>=0&&all(float2(p)>=CursorInput-float2(6,6))&&all(float2(p)<=CursorInput+float2(36,44));"
         "bool cursorPrevious=PreviousCursorInput.x>=0&&all(float2(p)>=PreviousCursorInput-float2(6,6))&&all(float2(p)<=PreviousCursorInput+float2(36,44));"
         "if((cursorNow||cursorPrevious)&&Mode!=1)result=Mode==0?original:neural;"
@@ -5026,7 +5199,8 @@ static bool PresentProxyFrameOnWorker()
         g_present_api == reshade::api::device_api::vulkan;
     const D3D12_RESOURCE_STATES original_base_state = legacy ?
         D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    const bool composite_post = g_same_window_compositor && g_reshade_overlay_open.load() &&
+    const bool composite_post = !g_proxy_overlay_preview.load() &&
+        g_reshade_overlay_open.load() &&
         g_post_reshade_color_ready.load(std::memory_order_acquire) && g_post_reshade_color;
     ID3D12Resource *post_source = composite_post ? g_post_reshade_color.Get() : original_source;
     ID3D12Resource *present_sources[2] = {
@@ -5083,7 +5257,8 @@ static bool PresentProxyFrameOnWorker()
         UINT mode; UINT fps; UINT show_fps; float threshold;
         float cursor_x; float cursor_y; float previous_cursor_x; float previous_cursor_y;
     } constants = {
-        g_show_neural_output ? (g_composite_reshade_output && composite_post ? 2u : 1u) : 0u,
+        g_composite_reshade_output && composite_post ?
+            (g_show_neural_output ? 2u : 3u) : (g_show_neural_output ? 1u : 0u),
         g_proxy_fps.load(),
         g_show_proxy_fps ? 1u : 0u,
         0.0f,
@@ -5392,7 +5567,7 @@ static void OnReshadePresent(reshade::api::effect_runtime *runtime)
     if (api == reshade::api::device_api::d3d12)
     {
         auto *backbuffer = reinterpret_cast<ID3D12Resource *>(resource.handle);
-        if (g_same_window_compositor && g_reshade_overlay_open.load())
+        if (g_reshade_overlay_open.load() && !g_proxy_overlay_preview.load())
         {
             // Do not overwrite the persistent menu snapshot while the worker
             // owns it. A later ReShade Present will refresh it.
@@ -5403,7 +5578,7 @@ static void OnReshadePresent(reshade::api::effect_runtime *runtime)
             }
             if (!CapturePostReshadeFrame(backbuffer))
             {
-                Log("same-window compositor could not capture the post-ReShade menu frame");
+                Log("native compositor could not capture the post-ReShade menu frame");
                 return;
             }
         }
@@ -5480,6 +5655,34 @@ static bool OnReshadeOpenOverlay(reshade::api::effect_runtime *runtime, bool ope
     }
     if (runtime != g_runtime) return false;
     g_reshade_overlay_open = open;
+
+    // A detached full-screen proxy sits above the game's real ReShade runtime,
+    // so letting it continue to cover the monitor forces us to synthesize
+    // clicks. ReShade rejects those in many games. While its overlay is open,
+    // put the processed output in a mouse-transparent side preview instead and
+    // expose the real game window for native ReShade input.
+    if (DetachedPresentationEnabled() && g_proxy_window != nullptr &&
+        g_proxy_runtime.load() == nullptr)
+    {
+        g_proxy_overlay_bypass = false;
+        g_post_reshade_color_ready = false;
+        UpdateProxyCursorClip(false);
+        if (open)
+            g_proxy_overlay_preview = true;
+        if (!PostMessageW(g_proxy_window, kProxyOverlayPreviewMessage, open ? 1 : 0, 0))
+        {
+            if (open) g_proxy_overlay_preview = false;
+            Log("primary ReShade overlay side-preview request failed: error=%lu", GetLastError());
+        }
+        else if (!open && g_proxy_swapchain != nullptr && g_enabled && !g_neural_failed &&
+            !g_proxy_hidden && !g_proxy_failed && !g_proxy_early_pending_activation)
+            RequestProxyVisibility(true);
+        Log("primary ReShade overlay %s; detached compositor %s with native game-window input (F10=%s)",
+            open ? "opened" : "closed", open ? "moved to side preview" : "restored full-screen",
+            g_show_neural_output ? "processed" : "raw-stretch");
+        return false;
+    }
+
     if (g_proxy_runtime.load() != nullptr)
     {
         RequestProxyOverlayInputMode();
@@ -5488,16 +5691,21 @@ static bool OnReshadeOpenOverlay(reshade::api::effect_runtime *runtime, bool ope
         return false;
     }
 
-    if (g_same_window_compositor && g_present_api == reshade::api::device_api::d3d12 &&
-        g_post_reshade_color)
+    if (g_same_window_compositor &&
+        g_present_api == reshade::api::device_api::d3d12 && g_post_reshade_color)
     {
-        // The composition visual is not a window and cannot intercept input.
-        // Keep it visible, then composite the primary runtime's post-ReShade
-        // frame so the menu does not reveal the reduced game swapchain.
+        // Attached composition has no detached window to move aside. Carry the
+        // primary runtime's post-ReShade pixels into the native-size output.
         g_proxy_overlay_bypass = false;
         if (!open) g_post_reshade_color_ready = false;
-        Log("primary ReShade overlay %s; same-window compositor remains active with direct game-window input",
-            open ? "opened" : "closed");
+        UpdateProxyCursorClip(false);
+        RequestProxyOverlayInputMode();
+        if (g_proxy_swapchain != nullptr && g_enabled && !g_neural_failed &&
+            !g_proxy_hidden && !g_proxy_failed && !g_proxy_early_pending_activation)
+            RequestProxyVisibility(true);
+        Log("primary ReShade overlay %s; attached compositor remains visible with mapped game-window input (F10=%s)",
+            open ? "opened" : "closed",
+            g_show_neural_output ? "processed" : "raw-stretch");
         return false;
     }
 
@@ -5545,7 +5753,8 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     const bool primary_foreground = IsGameProcessForeground(foreground);
     UpdateProxyCursorClip(primary_foreground && g_proxy_window != nullptr &&
         !g_proxy_hidden && !g_proxy_overlay_bypass && !g_proxy_failed &&
-        !g_proxy_early_pending_activation && IsWindowVisible(g_proxy_window));
+        !g_proxy_early_pending_activation && !g_proxy_overlay_preview.load() &&
+        IsWindowVisible(g_proxy_window));
     if (g_proxy_watchdog_hidden.load() && primary_foreground && g_proxy_window != nullptr &&
         !g_proxy_hidden && !g_proxy_overlay_bypass && !g_proxy_failed &&
         !g_proxy_early_pending_activation)
@@ -5579,7 +5788,9 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
                     QueueDetachedFallbackWindowRepair(g_game_window);
                 const bool native_client = output_width != 0 && output_height != 0 &&
                     physical_width + 2 >= output_width && physical_height + 2 >= output_height;
-                QueueCompositionRetarget(native_client ? g_game_window : g_proxy_window);
+                QueueCompositionRetarget(g_proxy_overlay_preview.load() && g_proxy_preview_window != nullptr ?
+                    g_proxy_preview_window :
+                    (native_client ? g_game_window : g_proxy_window));
             }
         }
     }
@@ -6010,7 +6221,9 @@ static void OnInitSwapchain(reshade::api::swapchain *swapchain, bool)
     {
         const bool native_client = client_width + 2 >= static_cast<LONG>(g_output_width.load()) &&
             client_height + 2 >= static_cast<LONG>(g_output_height.load());
-        const HWND desired_host = native_client ? hwnd : g_proxy_window;
+        const HWND desired_host = g_proxy_overlay_preview.load() && g_proxy_preview_window != nullptr ?
+            g_proxy_preview_window :
+            (native_client ? hwnd : g_proxy_window);
         QueueCompositionRetarget(desired_host);
         Log("composition ownership evaluated after swapchain change: client=%ldx%ld desired=%s hwnd=%p",
             client_width, client_height, native_client ? "attached/game-HWND" : "detached/proxy-HWND",
