@@ -33,7 +33,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.5-decoupled-presentation-prototype"
+#define ADDON_VERSION "2.0.6-direct-output-handoff-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -214,6 +214,12 @@ static bool g_proxy_last_accepted_was_generated;
 static std::atomic<unsigned int> g_cpu_shared_telemetry_us{0};
 static std::atomic<unsigned long long> g_proxy_present_requests{0};
 static std::atomic<unsigned long long> g_proxy_present_completed{0};
+static std::atomic<unsigned int> g_direct_submit_to_ready_us{0};
+static std::atomic<unsigned int> g_direct_submit_to_ready_peak_us{0};
+static std::atomic<unsigned int> g_direct_ready_to_present_us{0};
+static std::atomic<unsigned int> g_direct_submit_to_present_us{0};
+static std::atomic<unsigned long long> g_direct_handoff_samples{0};
+static std::atomic<unsigned long long> g_direct_output_deferrals{0};
 static std::atomic<unsigned long long> g_neural_presenter_deferrals{0};
 static std::atomic<unsigned long long> g_neural_gpu_deferrals{0};
 static std::atomic<unsigned long long> g_source_frame_sequence{0};
@@ -515,6 +521,7 @@ struct PipelineFrameSlot
     UINT64 async_input_fence_value = 0;
     unsigned long long sequence = 0;
     bool has_generated_frame = false;
+    int presentation_slot_index = -1;
 };
 static PipelineFrameSlot g_pipeline_slots[kPipelineFrameSlotCount];
 enum PresentationFrameSlotState : unsigned int
@@ -531,10 +538,27 @@ struct PresentationFrameSlot
     Microsoft::WRL::ComPtr<ID3D12Resource> original_input;
     std::atomic<unsigned int> state{PresentationSlotFree};
     UINT64 fence_value = 0;
+    UINT64 neural_fence_value = 0;
     unsigned long long sequence = 0;
     bool has_generated_frame = false;
+    bool has_original_frame = false;
+    LARGE_INTEGER submitted_qpc = {};
+    LARGE_INTEGER ready_qpc = {};
 };
 static PresentationFrameSlot g_presentation_slots[kPresentationFrameSlotCount];
+struct ScopedPresentationReservation
+{
+    int index = -1;
+    ~ScopedPresentationReservation()
+    {
+        if (index < 0 || index >= static_cast<int>(kPresentationFrameSlotCount)) return;
+        PresentationFrameSlot &slot = g_presentation_slots[index];
+        unsigned int expected = PresentationSlotRecording;
+        slot.state.compare_exchange_strong(expected, PresentationSlotFree,
+            std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+    void Commit() { index = -1; }
+};
 static UINT g_next_presentation_slot;
 static UINT g_next_pipeline_slot;
 static int g_pending_pipeline_slot = -1;
@@ -1613,6 +1637,12 @@ static ID3D12GraphicsCommandList *NeuralCommandList()
     return g_active_neural_list != nullptr ? g_active_neural_list : g_neural_list.Get();
 }
 
+static bool DirectOutputHandoffEnabled()
+{
+    return g_async_compute_active && g_proxy_explicit_pacing_active &&
+        !g_synchronous_proxy_presentation;
+}
+
 static void ReclaimPipelineFrameSlots()
 {
     const UINT64 neural_completed = g_neural_fence ? g_neural_fence->GetCompletedValue() : 0;
@@ -1624,9 +1654,21 @@ static void ReclaimPipelineFrameSlots()
             neural_completed >= slot.neural_fence_value :
             state == PipelineSlotPresenting &&
                 proxy_completed >= slot.proxy_fence_value.load(std::memory_order_acquire);
-        if (completed)
-            slot.state.compare_exchange_strong(state, PipelineSlotFree,
-                std::memory_order_acq_rel, std::memory_order_acquire);
+        if (completed && slot.state.compare_exchange_strong(state, PipelineSlotFree,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+            const int presentation_index = slot.presentation_slot_index;
+            if (presentation_index >= 0 &&
+                presentation_index < static_cast<int>(kPresentationFrameSlotCount))
+            {
+                PresentationFrameSlot &presentation = g_presentation_slots[presentation_index];
+                unsigned int expected = PresentationSlotRecording;
+                presentation.state.compare_exchange_strong(expected, PresentationSlotFree,
+                    std::memory_order_acq_rel, std::memory_order_acquire);
+            }
+            slot.presentation_slot_index = -1;
+            slot.proxy_fence_value.store(0, std::memory_order_release);
+        }
     }
 }
 
@@ -1641,6 +1683,9 @@ static int AcquirePipelineFrameSlot()
                 std::memory_order_acq_rel, std::memory_order_acquire))
         {
             g_next_pipeline_slot = (index + 1) % kPipelineFrameSlotCount;
+            g_pipeline_slots[index].neural_fence_value = 0;
+            g_pipeline_slots[index].proxy_fence_value.store(0, std::memory_order_release);
+            g_pipeline_slots[index].presentation_slot_index = -1;
             return static_cast<int>(index);
         }
     }
@@ -1653,9 +1698,13 @@ static void ReclaimPresentationFrameSlots()
     for (PresentationFrameSlot &slot : g_presentation_slots)
     {
         unsigned int state = slot.state.load(std::memory_order_acquire);
-        if (state == PresentationSlotPresenting && completed >= slot.fence_value)
+        if (state == PresentationSlotPresenting && completed >= slot.fence_value &&
             slot.state.compare_exchange_strong(state, PresentationSlotFree,
-                std::memory_order_acq_rel, std::memory_order_acquire);
+                std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+            slot.fence_value = 0;
+            slot.neural_fence_value = 0;
+        }
     }
 }
 
@@ -1670,6 +1719,14 @@ static int AcquirePresentationFrameSlot()
                 PresentationSlotRecording, std::memory_order_acq_rel, std::memory_order_acquire))
         {
             g_next_presentation_slot = (index + 1) % kPresentationFrameSlotCount;
+            PresentationFrameSlot &slot = g_presentation_slots[index];
+            slot.fence_value = 0;
+            slot.neural_fence_value = 0;
+            slot.sequence = 0;
+            slot.has_generated_frame = false;
+            slot.has_original_frame = false;
+            slot.submitted_qpc = {};
+            slot.ready_qpc = {};
             return static_cast<int>(index);
         }
     }
@@ -2604,6 +2661,7 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
         slot.neural_fence_value = 0;
         slot.proxy_fence_value = 0;
         slot.async_input_fence_value = 0;
+        slot.presentation_slot_index = -1;
     }
     for (PresentationFrameSlot &slot : g_presentation_slots)
     {
@@ -2612,8 +2670,12 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
         slot.original_input.Reset();
         slot.state.store(PresentationSlotFree, std::memory_order_release);
         slot.fence_value = 0;
+        slot.neural_fence_value = 0;
         slot.sequence = 0;
         slot.has_generated_frame = false;
+        slot.has_original_frame = false;
+        slot.submitted_qpc = {};
+        slot.ready_qpc = {};
     }
     g_next_presentation_slot = 0;
     g_pending_pipeline_slot = -1;
@@ -3381,6 +3443,7 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
         slot.async_input_fence_value = 0;
         slot.sequence = 0;
         slot.has_generated_frame = false;
+        slot.presentation_slot_index = -1;
         slot.state.store(PipelineSlotFree, std::memory_order_release);
         if (!CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, slot.real_output) ||
             !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, slot.generated_output) ||
@@ -3394,11 +3457,18 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
         slot.generated_output.Reset();
         slot.original_input.Reset();
         slot.fence_value = 0;
+        slot.neural_fence_value = 0;
         slot.sequence = 0;
         slot.has_generated_frame = false;
+        slot.has_original_frame = false;
+        slot.submitted_qpc = {};
+        slot.ready_qpc = {};
         slot.state.store(PresentationSlotFree, std::memory_order_release);
-        if (!CreateTexture(ow, oh, result_format, false, D3D12_RESOURCE_STATE_COMMON, slot.real_output) ||
-            !CreateTexture(ow, oh, result_format, false, D3D12_RESOURCE_STATE_COMMON, slot.generated_output) ||
+        // In the direct handoff path these are NGX output targets, not copy
+        // destinations. They remain presentation-owned until the compositor's
+        // sampling fence retires them.
+        if (!CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, slot.real_output) ||
+            !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, slot.generated_output) ||
             !CreateTexture(iw, ih, input_format, false, D3D12_RESOURCE_STATE_COMMON, slot.original_input))
             return false;
     }
@@ -4050,6 +4120,8 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     if (pipeline_slot.state.load(std::memory_order_acquire) != PipelineSlotRecording) return false;
     ID3D12Resource *real_output = pipeline_slot.real_output.Get();
     ID3D12Resource *generated_output = pipeline_slot.generated_output.Get();
+    ID3D12Resource *original_snapshot = pipeline_slot.original_input.Get();
+    ScopedPresentationReservation direct_reservation;
     const bool ringed_d3d11_input = legacy_input &&
         g_present_api == reshade::api::device_api::d3d11;
     ID3D12Resource *packed_color = (ringed_d3d11_input ||
@@ -4087,6 +4159,26 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     }
     ID3D12Resource *motion = use_external_guides ? g_captured_motion.Get() : g_fallback_motion.Get();
     ID3D12Resource *depth = use_external_guides ? g_captured_depth.Get() : g_fallback_depth.Get();
+
+    if (DirectOutputHandoffEnabled())
+    {
+        direct_reservation.index = AcquirePresentationFrameSlot();
+        if (direct_reservation.index < 0)
+        {
+            ++g_direct_output_deferrals;
+            pipeline_slot.state.store(PipelineSlotFree, std::memory_order_release);
+            return false;
+        }
+        PresentationFrameSlot &presentation = g_presentation_slots[direct_reservation.index];
+        real_output = presentation.real_output.Get();
+        generated_output = presentation.generated_output.Get();
+        original_snapshot = presentation.original_input.Get();
+        if (!real_output || !generated_output || !original_snapshot)
+        {
+            pipeline_slot.state.store(PipelineSlotFree, std::memory_order_release);
+            return false;
+        }
+    }
 
     if (!legacy_input && g_async_compute_active &&
         !CaptureAsyncD3D12Backbuffer(pipeline_slot, backbuffer, packed_color))
@@ -4296,7 +4388,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     }
     commands->ResourceBarrier(restore_count, restore);
 
-    if (!ringed_d3d11_input && pipeline_slot.original_input.Get() != packed_color)
+    if (original_snapshot != packed_color)
     {
         // Preserve the exact source frame used by this NGX submission. F10 and
         // overlay composition can sample it without racing the next capture.
@@ -4304,13 +4396,15 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
             D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         D3D12_RESOURCE_BARRIER snapshot_begin[2] = {
             Transition(packed_color, packed_base_state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-            Transition(pipeline_slot.original_input.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)
+            Transition(original_snapshot, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)
         };
         commands->ResourceBarrier(2, snapshot_begin);
-        commands->CopyResource(pipeline_slot.original_input.Get(), packed_color);
+        commands->CopyResource(original_snapshot, packed_color);
+        const D3D12_RESOURCE_STATES packed_final_state =
+            !legacy_input && g_async_compute_active ? D3D12_RESOURCE_STATE_COMMON : packed_base_state;
         D3D12_RESOURCE_BARRIER snapshot_end[2] = {
-            Transition(packed_color, D3D12_RESOURCE_STATE_COPY_SOURCE, packed_base_state),
-            Transition(pipeline_slot.original_input.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)
+            Transition(packed_color, D3D12_RESOURCE_STATE_COPY_SOURCE, packed_final_state),
+            Transition(original_snapshot, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)
         };
         commands->ResourceBarrier(2, snapshot_end);
     }
@@ -4328,6 +4422,16 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
         commands->ResolveQueryData(g_telemetry_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
             0, kTelemetryQueryCount, g_telemetry_readback.Get(), 0);
     if (!SubmitNeuralFrameCommands(slot_index)) return false;
+    if (direct_reservation.index >= 0)
+    {
+        pipeline_slot.presentation_slot_index = direct_reservation.index;
+        PresentationFrameSlot &presentation =
+            g_presentation_slots[pipeline_slot.presentation_slot_index];
+        presentation.neural_fence_value = pipeline_slot.neural_fence_value;
+        if (g_performance_telemetry_enabled)
+            QueryPerformanceCounter(&presentation.submitted_qpc);
+        direct_reservation.Commit();
+    }
     g_last_neural_source_sequence = source_sequence;
     if (record_gpu_telemetry)
     {
@@ -4368,6 +4472,14 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
 
     pipeline_slot.sequence = source_sequence;
     pipeline_slot.has_generated_frame = evaluate_fg && NVSDK_NGX_SUCCEED(fg_result) && !g_framegen_failed;
+    if (pipeline_slot.presentation_slot_index >= 0)
+    {
+        PresentationFrameSlot &presentation =
+            g_presentation_slots[pipeline_slot.presentation_slot_index];
+        presentation.sequence = source_sequence;
+        presentation.has_generated_frame = pipeline_slot.has_generated_frame;
+        presentation.has_original_frame = true;
+    }
     pipeline_slot.state.store(PipelineSlotReady, std::memory_order_release);
     g_pending_pipeline_slot = static_cast<int>(slot_index);
 
@@ -6078,6 +6190,13 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
             g_proxy_present_coalesced.load(), g_proxy_present_timeouts.load(),
             g_proxy_display_backpressure_drops.load(),
             g_neural_presenter_deferrals.load(), g_neural_gpu_deferrals.load());
+        Log("performance direct handoff: active=%u submit->ready=%.3fms peak=%.3fms ready->present=%.3fms submit->present=%.3fms samples=%llu output_deferrals=%llu",
+            DirectOutputHandoffEnabled() ? 1u : 0u,
+            g_direct_submit_to_ready_us.load() / 1000.0f,
+            g_direct_submit_to_ready_peak_us.load() / 1000.0f,
+            g_direct_ready_to_present_us.load() / 1000.0f,
+            g_direct_submit_to_present_us.load() / 1000.0f,
+            g_direct_handoff_samples.load(), g_direct_output_deferrals.load());
         if (g_windowed_virtualization_active.load() || DetachedPresentationEnabled())
             Log("presentation compatibility: host=%s window_virtualization=%s logical_client=%s input_coordinates=%s render=%ux%u output=%ux%u resolution_intents=%llu WM_SIZE=%llu client_queries=%llu coordinate_APIs=%llu mouse_messages=%llu cursor_queries=%llu cursor_warps=%llu cursor_clips=%llu resize_pins=%llu",
                 DetachedPresentationEnabled() ? "detached" : "attached",
@@ -6616,6 +6735,7 @@ static int ClaimOldestReadyPipelineSlot()
     {
         PipelineFrameSlot &slot = g_pipeline_slots[index];
         if (slot.state.load(std::memory_order_acquire) == PipelineSlotReady &&
+            slot.presentation_slot_index < 0 &&
             (!g_async_compute_active || neural_completed >= slot.neural_fence_value) &&
             slot.sequence < oldest)
         {
@@ -6629,6 +6749,41 @@ static int ClaimOldestReadyPipelineSlot()
         std::memory_order_acq_rel, std::memory_order_acquire) ? selected : -1;
 }
 
+static int ClaimOldestReadyPresentationSlot()
+{
+    int selected = -1;
+    unsigned long long oldest = ~0ull;
+    const UINT64 neural_completed = g_neural_fence ?
+        g_neural_fence->GetCompletedValue() : ~0ull;
+    for (UINT index = 0; index < kPresentationFrameSlotCount; ++index)
+    {
+        PresentationFrameSlot &slot = g_presentation_slots[index];
+        if (slot.state.load(std::memory_order_acquire) == PresentationSlotReady &&
+            slot.neural_fence_value != 0 && neural_completed >= slot.neural_fence_value &&
+            slot.sequence < oldest)
+        {
+            selected = static_cast<int>(index);
+            oldest = slot.sequence;
+        }
+    }
+    if (selected < 0) return -1;
+    PresentationFrameSlot &slot = g_presentation_slots[selected];
+    unsigned int expected = PresentationSlotReady;
+    if (!slot.state.compare_exchange_strong(expected, PresentationSlotRecording,
+            std::memory_order_acq_rel, std::memory_order_acquire))
+        return -1;
+    if (g_performance_telemetry_enabled)
+    {
+        QueryPerformanceCounter(&slot.ready_qpc);
+        const unsigned int duration = CounterDeltaMicroseconds(
+            slot.submitted_qpc, slot.ready_qpc);
+        SmoothMicroseconds(g_direct_submit_to_ready_us, duration);
+        RecordPeakMicroseconds(g_direct_submit_to_ready_peak_us, duration);
+        ++g_direct_handoff_samples;
+    }
+    return selected;
+}
+
 static void ArmAsyncProxyWakeForNeuralCompletion()
 {
     if (!g_async_compute_active || !g_neural_fence || !g_proxy_present_event) return;
@@ -6637,6 +6792,13 @@ static void ArmAsyncProxyWakeForNeuralCompletion()
     for (PipelineFrameSlot &slot : g_pipeline_slots)
     {
         if (slot.state.load(std::memory_order_acquire) == PipelineSlotReady &&
+            slot.presentation_slot_index < 0 &&
+            slot.neural_fence_value > completed)
+            next_completion = std::min(next_completion, slot.neural_fence_value);
+    }
+    for (PresentationFrameSlot &slot : g_presentation_slots)
+    {
+        if (slot.state.load(std::memory_order_acquire) == PresentationSlotReady &&
             slot.neural_fence_value > completed)
             next_completion = std::min(next_completion, slot.neural_fence_value);
     }
@@ -7016,10 +7178,24 @@ static bool PresentStagedFrameOnWorker(UINT slot_index)
 {
     if (slot_index >= kPresentationFrameSlotCount) return false;
     PresentationFrameSlot &slot = g_presentation_slots[slot_index];
-    unsigned int expected = PresentationSlotReady;
-    if (!slot.state.compare_exchange_strong(expected, PresentationSlotRecording,
-            std::memory_order_acq_rel, std::memory_order_acquire))
+    unsigned int state = slot.state.load(std::memory_order_acquire);
+    if (state == PresentationSlotReady)
+    {
+        if (!slot.state.compare_exchange_strong(state, PresentationSlotRecording,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+            return false;
+    }
+    else if (state != PresentationSlotRecording)
         return false;
+    LARGE_INTEGER present_begin = {};
+    if (g_performance_telemetry_enabled && slot.neural_fence_value != 0)
+    {
+        QueryPerformanceCounter(&present_begin);
+        SmoothMicroseconds(g_direct_ready_to_present_us,
+            CounterDeltaMicroseconds(slot.ready_qpc, present_begin));
+        SmoothMicroseconds(g_direct_submit_to_present_us,
+            CounterDeltaMicroseconds(slot.submitted_qpc, present_begin));
+    }
     const bool presented = PresentProxySourcesOnWorker(slot.real_output.Get(),
         slot.generated_output.Get(), slot.original_input.Get(), slot.has_generated_frame);
     slot.fence_value = g_proxy_fence_value;
@@ -7039,6 +7215,42 @@ static DWORD WINAPI ProxyPresentationThread(void *)
 
         while (true)
         {
+            const int direct_slot_index = ClaimOldestReadyPresentationSlot();
+            if (direct_slot_index >= 0)
+            {
+                g_proxy_present_request_state.store(2, std::memory_order_release);
+                LARGE_INTEGER worker_begin = {}, worker_end = {};
+                if (g_performance_telemetry_enabled)
+                {
+                    QueryPerformanceCounter(&worker_begin);
+                    LARGE_INTEGER queued = {};
+                    queued.QuadPart = g_proxy_request_qpc.exchange(0, std::memory_order_acq_rel);
+                    if (queued.QuadPart != 0)
+                        SmoothMicroseconds(g_cpu_proxy_mailbox_us,
+                            CounterDeltaMicroseconds(queued, worker_begin));
+                }
+                const bool presented = PresentStagedFrameOnWorker(
+                    static_cast<UINT>(direct_slot_index));
+                if (presented)
+                    ++g_proxy_present_completed;
+                else
+                {
+                    const unsigned long long skipped = ++g_proxy_busy_frame_skips;
+                    if (skipped <= 8 || skipped % 120 == 0)
+                        Log("direct-output presentation request dropped safely (skip=%llu output_slot=%d)",
+                            skipped, direct_slot_index);
+                }
+                if (g_performance_telemetry_enabled)
+                {
+                    QueryPerformanceCounter(&worker_end);
+                    const unsigned int duration = CounterDeltaMicroseconds(worker_begin, worker_end);
+                    SmoothMicroseconds(g_cpu_proxy_worker_us, duration);
+                    RecordPeakMicroseconds(g_cpu_proxy_worker_peak_us, duration);
+                }
+                ReclaimPipelineFrameSlots();
+                ReclaimPresentationFrameSlots();
+                continue;
+            }
             const int slot_index = ClaimOldestReadyPipelineSlot();
             if (slot_index < 0)
             {
@@ -7121,8 +7333,13 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer, int slot_index)
 {
     if (slot_index < 0 || slot_index >= static_cast<int>(kPipelineFrameSlotCount)) return false;
     PipelineFrameSlot &slot = g_pipeline_slots[slot_index];
-    ID3D12Resource *real_source = slot.real_output.Get();
-    ID3D12Resource *original_source = slot.original_input.Get();
+    const int direct_slot_index = slot.presentation_slot_index;
+    const bool direct_output = direct_slot_index >= 0 &&
+        direct_slot_index < static_cast<int>(kPresentationFrameSlotCount);
+    PresentationFrameSlot *direct_slot = direct_output ?
+        &g_presentation_slots[direct_slot_index] : nullptr;
+    ID3D12Resource *real_source = direct_slot ? direct_slot->real_output.Get() : slot.real_output.Get();
+    ID3D12Resource *original_source = direct_slot ? direct_slot->original_input.Get() : slot.original_input.Get();
     if (g_proxy_hidden || g_proxy_transition_hold || g_sr_frames.load() == 0 || real_source == nullptr ||
         original_source == nullptr || backbuffer == nullptr || !EnsureProxy(real_source) ||
         g_proxy_present_event == nullptr || g_proxy_present_thread == nullptr)
@@ -7131,6 +7348,44 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer, int slot_index)
         return false;
     }
     ++g_proxy_present_requests;
+
+    if (direct_output)
+    {
+        unsigned int pipeline_expected = PipelineSlotReady;
+        if (!slot.state.compare_exchange_strong(pipeline_expected, PipelineSlotPresentRecording,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+            return false;
+        if (direct_slot->state.load(std::memory_order_acquire) != PresentationSlotRecording)
+        {
+            slot.state.store(PipelineSlotAbandoned, std::memory_order_release);
+            return false;
+        }
+        // NGX already wrote the final DLSS and generated images into this
+        // presentation slot. The neural fence is now the only producer
+        // dependency; no native-resolution output copy is inserted.
+        direct_slot->state.store(PresentationSlotReady, std::memory_order_release);
+        slot.presentation_slot_index = -1;
+        slot.state.store(PipelineSlotAbandoned, std::memory_order_release);
+        if (g_performance_telemetry_enabled)
+        {
+            LARGE_INTEGER queued = {};
+            QueryPerformanceCounter(&queued);
+            g_proxy_request_qpc.store(queued.QuadPart, std::memory_order_release);
+        }
+        g_proxy_present_request_state.store(1, std::memory_order_release);
+        const HRESULT arm_result = g_neural_fence->SetEventOnCompletion(
+            direct_slot->neural_fence_value, g_proxy_present_event);
+        if (FAILED(arm_result) || !SetEvent(g_proxy_present_event))
+        {
+            Log("direct-output presenter wake failed: fence=%llu hr=0x%08X win32=%lu",
+                direct_slot->neural_fence_value, static_cast<unsigned int>(arm_result), GetLastError());
+            return false;
+        }
+        static std::atomic<bool> logged_direct_output{false};
+        if (!logged_direct_output.exchange(true, std::memory_order_acq_rel))
+            Log("direct NGX output handoff active: DLSS SR and FG write into presenter-owned textures; post-NGX output copies eliminated");
+        return true;
+    }
 
     if (g_synchronous_proxy_presentation)
     {
