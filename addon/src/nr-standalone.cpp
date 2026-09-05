@@ -33,7 +33,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.7-admission-ring-prototype"
+#define ADDON_VERSION "2.0.8-bounded-neural-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -221,6 +221,7 @@ static std::atomic<unsigned int> g_direct_submit_to_present_us{0};
 static std::atomic<unsigned long long> g_direct_handoff_samples{0};
 static std::atomic<unsigned long long> g_direct_output_deferrals{0};
 static std::atomic<unsigned long long> g_fg_admission_deferrals{0};
+static std::atomic<unsigned long long> g_fg_admission_inflight_deferrals{0};
 static std::atomic<unsigned long long> g_fg_admission_capacity_deferrals{0};
 static LONGLONG g_fg_admission_next_qpc;
 static LONGLONG g_fg_admission_frequency;
@@ -500,9 +501,13 @@ static UINT64 g_async_input_fence_value;
 static HANDLE g_async_input_fence_event;
 static constexpr UINT kPipelineFrameSlotCount = 3;
 // Direct NGX outputs remain owned from compute submission through the paced
-// generated/real pair. Five slots cover the three-deep neural queue plus two
-// display-owned frames without reintroducing a post-NGX copy.
+// generated/real pair. The larger ring lets neural and display ownership be
+// budgeted separately without reintroducing a post-NGX copy.
 static constexpr UINT kPresentationFrameSlotCount = 5;
+// Bound the NGX backlog independently from the display ring. This leaves three
+// slots available for completed generated/real pairs while two neural jobs are
+// outstanding, without reintroducing a post-NGX output copy.
+static constexpr UINT kMaxDirectNeuralFramesInFlight = 2;
 enum PipelineFrameSlotState : unsigned int
 {
     PipelineSlotFree = 0,
@@ -534,9 +539,10 @@ static PipelineFrameSlot g_pipeline_slots[kPipelineFrameSlotCount];
 enum PresentationFrameSlotState : unsigned int
 {
     PresentationSlotFree = 0,
-    PresentationSlotRecording = 1,
+    PresentationSlotNeuralRecording = 1,
     PresentationSlotReady = 2,
-    PresentationSlotPresenting = 3,
+    PresentationSlotPresentRecording = 3,
+    PresentationSlotPresenting = 4,
 };
 struct PresentationFrameSlot
 {
@@ -560,7 +566,7 @@ struct ScopedPresentationReservation
     {
         if (index < 0 || index >= static_cast<int>(kPresentationFrameSlotCount)) return;
         PresentationFrameSlot &slot = g_presentation_slots[index];
-        unsigned int expected = PresentationSlotRecording;
+        unsigned int expected = PresentationSlotNeuralRecording;
         slot.state.compare_exchange_strong(expected, PresentationSlotFree,
             std::memory_order_acq_rel, std::memory_order_acquire);
     }
@@ -1399,7 +1405,8 @@ static void ResetPerformanceTelemetry()
     g_direct_submit_to_ready_us = 0; g_direct_submit_to_ready_peak_us = 0;
     g_direct_ready_to_present_us = 0; g_direct_submit_to_present_us = 0;
     g_direct_handoff_samples = 0; g_direct_output_deferrals = 0;
-    g_fg_admission_deferrals = 0; g_fg_admission_capacity_deferrals = 0;
+    g_fg_admission_deferrals = 0; g_fg_admission_inflight_deferrals = 0;
+    g_fg_admission_capacity_deferrals = 0;
     g_fg_admission_next_qpc = 0;
     g_telemetry_samples = 0;
     g_guide_telemetry_samples = 0; g_proxy_telemetry_samples = 0;
@@ -1674,7 +1681,7 @@ static void ReclaimPipelineFrameSlots()
                 presentation_index < static_cast<int>(kPresentationFrameSlotCount))
             {
                 PresentationFrameSlot &presentation = g_presentation_slots[presentation_index];
-                unsigned int expected = PresentationSlotRecording;
+                unsigned int expected = PresentationSlotNeuralRecording;
                 presentation.state.compare_exchange_strong(expected, PresentationSlotFree,
                     std::memory_order_acq_rel, std::memory_order_acquire);
             }
@@ -1728,7 +1735,7 @@ static int AcquirePresentationFrameSlot()
         const UINT index = (g_next_presentation_slot + offset) % kPresentationFrameSlotCount;
         unsigned int expected = PresentationSlotFree;
         if (g_presentation_slots[index].state.compare_exchange_strong(expected,
-                PresentationSlotRecording, std::memory_order_acq_rel, std::memory_order_acquire))
+                PresentationSlotNeuralRecording, std::memory_order_acq_rel, std::memory_order_acquire))
         {
             g_next_presentation_slot = (index + 1) % kPresentationFrameSlotCount;
             PresentationFrameSlot &slot = g_presentation_slots[index];
@@ -1756,6 +1763,22 @@ static bool DirectOutputCapacityAvailable()
     return false;
 }
 
+static UINT DirectNeuralFramesInFlight()
+{
+    const UINT64 neural_completed = g_neural_fence ?
+        g_neural_fence->GetCompletedValue() : 0;
+    UINT count = 0;
+    for (PresentationFrameSlot &slot : g_presentation_slots)
+    {
+        const unsigned int state = slot.state.load(std::memory_order_acquire);
+        if (state == PresentationSlotNeuralRecording ||
+            (state == PresentationSlotReady && slot.neural_fence_value != 0 &&
+                neural_completed < slot.neural_fence_value))
+            ++count;
+    }
+    return count;
+}
+
 static bool AdmitNewestFrameForFgPair()
 {
     const bool paced_fg = DirectOutputHandoffEnabled() &&
@@ -1766,15 +1789,6 @@ static bool AdmitNewestFrameForFgPair()
     {
         g_fg_admission_next_qpc = 0;
         return true;
-    }
-
-    // Do not capture an input that cannot acquire an output target. Leaving the
-    // deadline untouched means the first Present after a slot retires uses the
-    // newest game frame immediately instead of replaying an older candidate.
-    if (!DirectOutputCapacityAvailable())
-    {
-        ++g_fg_admission_capacity_deferrals;
-        return false;
     }
 
     LARGE_INTEGER now = {};
@@ -1792,6 +1806,24 @@ static bool AdmitNewestFrameForFgPair()
     if (g_fg_admission_next_qpc != 0 && now.QuadPart < g_fg_admission_next_qpc)
     {
         ++g_fg_admission_deferrals;
+        return false;
+    }
+
+    // More output textures previously just made the serial NGX queue deeper.
+    // Keep only two unfinished evaluations while allowing completed frames to
+    // occupy the rest of the ring until their generated/real pair is shown.
+    if (DirectNeuralFramesInFlight() >= kMaxDirectNeuralFramesInFlight)
+    {
+        ++g_fg_admission_inflight_deferrals;
+        return false;
+    }
+
+    // Do not capture an input that cannot acquire an output target. Leaving the
+    // deadline untouched means the first Present after a slot retires uses the
+    // newest game frame immediately instead of replaying an older candidate.
+    if (!DirectOutputCapacityAvailable())
+    {
+        ++g_fg_admission_capacity_deferrals;
         return false;
     }
 
@@ -6264,15 +6296,17 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
             g_proxy_present_coalesced.load(), g_proxy_present_timeouts.load(),
             g_proxy_display_backpressure_drops.load(),
             g_neural_presenter_deferrals.load(), g_neural_gpu_deferrals.load());
-        Log("performance direct handoff: active=%u slots=%u submit->ready=%.3fms peak=%.3fms ready->present=%.3fms submit->present=%.3fms samples=%llu output_deferrals=%llu admission_deferrals=%llu capacity_deferrals=%llu target_real=%.1fHz",
+        Log("performance direct handoff: active=%u slots=%u neural_limit=%u submit->ready=%.3fms peak=%.3fms ready->present=%.3fms submit->present=%.3fms samples=%llu output_deferrals=%llu admission_deferrals=%llu inflight_deferrals=%llu capacity_deferrals=%llu target_real=%.1fHz",
             DirectOutputHandoffEnabled() ? 1u : 0u,
             kPresentationFrameSlotCount,
+            kMaxDirectNeuralFramesInFlight,
             g_direct_submit_to_ready_us.load() / 1000.0f,
             g_direct_submit_to_ready_peak_us.load() / 1000.0f,
             g_direct_ready_to_present_us.load() / 1000.0f,
             g_direct_submit_to_present_us.load() / 1000.0f,
             g_direct_handoff_samples.load(), g_direct_output_deferrals.load(),
-            g_fg_admission_deferrals.load(), g_fg_admission_capacity_deferrals.load(),
+            g_fg_admission_deferrals.load(), g_fg_admission_inflight_deferrals.load(),
+            g_fg_admission_capacity_deferrals.load(),
             EffectiveFramegenEnabled() && g_show_neural_output ? g_proxy_refresh_hz * 0.5f : 0.0f);
         if (g_windowed_virtualization_active.load() || DetachedPresentationEnabled())
             Log("presentation compatibility: host=%s window_virtualization=%s logical_client=%s input_coordinates=%s render=%ux%u output=%ux%u resolution_intents=%llu WM_SIZE=%llu client_queries=%llu coordinate_APIs=%llu mouse_messages=%llu cursor_queries=%llu cursor_warps=%llu cursor_clips=%llu resize_pins=%llu",
@@ -6846,7 +6880,7 @@ static int ClaimOldestReadyPresentationSlot()
     if (selected < 0) return -1;
     PresentationFrameSlot &slot = g_presentation_slots[selected];
     unsigned int expected = PresentationSlotReady;
-    if (!slot.state.compare_exchange_strong(expected, PresentationSlotRecording,
+    if (!slot.state.compare_exchange_strong(expected, PresentationSlotPresentRecording,
             std::memory_order_acq_rel, std::memory_order_acquire))
         return -1;
     if (g_performance_telemetry_enabled)
@@ -7258,11 +7292,11 @@ static bool PresentStagedFrameOnWorker(UINT slot_index)
     unsigned int state = slot.state.load(std::memory_order_acquire);
     if (state == PresentationSlotReady)
     {
-        if (!slot.state.compare_exchange_strong(state, PresentationSlotRecording,
+        if (!slot.state.compare_exchange_strong(state, PresentationSlotPresentRecording,
                 std::memory_order_acq_rel, std::memory_order_acquire))
             return false;
     }
-    else if (state != PresentationSlotRecording)
+    else if (state != PresentationSlotPresentRecording)
         return false;
     LARGE_INTEGER present_begin = {};
     if (g_performance_telemetry_enabled && slot.neural_fence_value != 0)
@@ -7432,7 +7466,7 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer, int slot_index)
         if (!slot.state.compare_exchange_strong(pipeline_expected, PipelineSlotPresentRecording,
                 std::memory_order_acq_rel, std::memory_order_acquire))
             return false;
-        if (direct_slot->state.load(std::memory_order_acquire) != PresentationSlotRecording)
+        if (direct_slot->state.load(std::memory_order_acquire) != PresentationSlotNeuralRecording)
         {
             slot.state.store(PipelineSlotAbandoned, std::memory_order_release);
             return false;
