@@ -33,7 +33,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.11-fence-dispatch-prototype"
+#define ADDON_VERSION "2.0.12-split-fg-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -509,6 +509,12 @@ static bool g_async_compute_requested;
 static bool g_async_compute_active;
 static bool g_async_compute_restart_required;
 static Microsoft::WRL::ComPtr<ID3D12CommandQueue> g_async_compute_queue;
+static Microsoft::WRL::ComPtr<ID3D12CommandQueue> g_async_fg_queue;
+static Microsoft::WRL::ComPtr<ID3D12Fence> g_async_fg_fence;
+static UINT64 g_async_fg_fence_value;
+static UINT64 g_async_fg_timestamp_frequency;
+static std::atomic<unsigned long long> g_async_fg_submissions{0};
+static std::atomic<unsigned long long> g_async_fg_overlap_frames{0};
 static Microsoft::WRL::ComPtr<ID3D12Fence> g_async_input_fence;
 static UINT64 g_async_input_fence_value;
 static HANDLE g_async_input_fence_event;
@@ -548,6 +554,7 @@ struct PipelineFrameSlot
     unsigned long long sequence = 0;
     bool has_generated_frame = false;
     bool input_dependency_satisfied = false;
+    bool fg_split_submission = false;
     int presentation_slot_index = -1;
     Microsoft::WRL::ComPtr<ID3D12QueryHeap> telemetry_query_heap;
     Microsoft::WRL::ComPtr<ID3D12Resource> telemetry_readback;
@@ -609,12 +616,18 @@ enum PresentationFrameSlotState : unsigned int
 };
 struct PresentationFrameSlot
 {
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> fg_allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> fg_list;
     Microsoft::WRL::ComPtr<ID3D12Resource> real_output;
     Microsoft::WRL::ComPtr<ID3D12Resource> generated_output;
     Microsoft::WRL::ComPtr<ID3D12Resource> original_input;
+    Microsoft::WRL::ComPtr<ID3D12QueryHeap> fg_telemetry_query_heap;
+    Microsoft::WRL::ComPtr<ID3D12Resource> fg_telemetry_readback;
     std::atomic<unsigned int> state{PresentationSlotFree};
     UINT64 fence_value = 0;
     UINT64 neural_fence_value = 0;
+    UINT64 fg_fence_value = 0;
+    bool fg_telemetry_pending = false;
     unsigned long long sequence = 0;
     bool has_generated_frame = false;
     bool has_original_frame = false;
@@ -1483,6 +1496,7 @@ static void ResetPerformanceTelemetry()
     g_neural_dispatch_submissions = 0;
     g_neural_dispatch_gap_us = 0; g_neural_dispatch_gap_peak_us = 0;
     g_neural_dispatch_completion_qpc = 0;
+    g_async_fg_submissions = 0; g_async_fg_overlap_frames = 0;
     g_telemetry_samples = 0;
     g_guide_telemetry_samples = 0; g_proxy_telemetry_samples = 0;
     g_gpu_telemetry_available = false; g_guide_gpu_telemetry_available = false;
@@ -1561,11 +1575,34 @@ static void ConsumeGpuTelemetry(PipelineFrameSlot &slot)
     SmoothMicroseconds(g_gpu_prep_us, TimestampDeltaMicroseconds(values[0], values[1]));
     SmoothMicroseconds(g_gpu_nr_us, TimestampDeltaMicroseconds(values[1], values[2]));
     SmoothMicroseconds(g_gpu_sr_us, TimestampDeltaMicroseconds(values[2], values[3]));
-    SmoothMicroseconds(g_gpu_fg_us, TimestampDeltaMicroseconds(values[3], values[4]));
+    if (!slot.fg_split_submission)
+        SmoothMicroseconds(g_gpu_fg_us, TimestampDeltaMicroseconds(values[3], values[4]));
     SmoothMicroseconds(g_gpu_cleanup_us, TimestampDeltaMicroseconds(values[4], values[5]));
     SmoothMicroseconds(g_gpu_total_us, TimestampDeltaMicroseconds(values[0], values[5]));
     ++g_telemetry_samples;
     g_gpu_telemetry_available = true;
+}
+
+static void ConsumeAsyncFgTelemetry(PresentationFrameSlot &slot)
+{
+    if (!slot.fg_telemetry_pending || !g_async_fg_fence ||
+        g_async_fg_fence->GetCompletedValue() < slot.fg_fence_value ||
+        !slot.fg_telemetry_readback || g_async_fg_timestamp_frequency == 0)
+        return;
+    UINT64 *timestamps = nullptr;
+    const D3D12_RANGE read_range = {0, sizeof(UINT64) * 2};
+    if (FAILED(slot.fg_telemetry_readback->Map(
+            0, &read_range, reinterpret_cast<void **>(&timestamps))) || !timestamps)
+    {
+        slot.fg_telemetry_pending = false;
+        return;
+    }
+    const UINT64 begin = timestamps[0], end = timestamps[1];
+    const D3D12_RANGE written_range = {0, 0};
+    slot.fg_telemetry_readback->Unmap(0, &written_range);
+    slot.fg_telemetry_pending = false;
+    SmoothMicroseconds(g_gpu_fg_us,
+        TimestampDeltaMicroseconds(begin, end, g_async_fg_timestamp_frequency));
 }
 
 static bool CreateTimestampResources(ID3D12Device *device, UINT count,
@@ -1717,6 +1754,12 @@ static ID3D12GraphicsCommandList *NeuralCommandList()
     return g_active_neural_list != nullptr ? g_active_neural_list : g_neural_list.Get();
 }
 
+static bool AsyncFgGpuIdle()
+{
+    return !g_async_fg_fence || g_async_fg_fence_value == 0 ||
+        g_async_fg_fence->GetCompletedValue() >= g_async_fg_fence_value;
+}
+
 static bool DirectOutputHandoffEnabled()
 {
     return g_async_compute_active && g_proxy_explicit_pacing_active &&
@@ -1729,6 +1772,11 @@ static bool LegacyCaptureMailboxEnabled()
         DirectOutputHandoffEnabled() && EffectiveFramegenEnabled() &&
         !g_framegen_failed && !g_vort_guides_enabled &&
         g_capture_ready_fence11 && g_capture_ready_fence12;
+}
+
+static bool SplitFrameGenerationEnabled()
+{
+    return LegacyCaptureMailboxEnabled() && g_async_fg_queue && g_async_fg_fence;
 }
 
 static void ReclaimLegacyCaptureSlots()
@@ -1886,8 +1934,20 @@ static void ReclaimPipelineFrameSlots()
     for (PipelineFrameSlot &slot : g_pipeline_slots)
     {
         unsigned int state = slot.state.load(std::memory_order_acquire);
+        bool abandoned_complete = neural_completed >= slot.neural_fence_value;
+        if (state == PipelineSlotAbandoned && abandoned_complete &&
+            slot.presentation_slot_index >= 0 &&
+            slot.presentation_slot_index < static_cast<int>(kPresentationFrameSlotCount))
+        {
+            const PresentationFrameSlot &presentation =
+                g_presentation_slots[slot.presentation_slot_index];
+            if (presentation.has_generated_frame && presentation.fg_fence_value != 0 &&
+                g_async_fg_fence &&
+                g_async_fg_fence->GetCompletedValue() < presentation.fg_fence_value)
+                abandoned_complete = false;
+        }
         const bool completed = state == PipelineSlotAbandoned ?
-            neural_completed >= slot.neural_fence_value :
+            abandoned_complete :
             state == PipelineSlotPresenting &&
                 proxy_completed >= slot.proxy_fence_value.load(std::memory_order_acquire);
         if (completed && slot.state.compare_exchange_strong(state, PipelineSlotFree,
@@ -1922,6 +1982,7 @@ static int AcquirePipelineFrameSlot()
             g_pipeline_slots[index].neural_fence_value = 0;
             g_pipeline_slots[index].proxy_fence_value.store(0, std::memory_order_release);
             g_pipeline_slots[index].input_dependency_satisfied = false;
+            g_pipeline_slots[index].fg_split_submission = false;
             g_pipeline_slots[index].presentation_slot_index = -1;
             return static_cast<int>(index);
         }
@@ -1940,8 +2001,11 @@ static void ReclaimPresentationFrameSlots()
             slot.state.compare_exchange_strong(state, PresentationSlotFree,
                 std::memory_order_acq_rel, std::memory_order_acquire))
         {
+            ConsumeAsyncFgTelemetry(slot);
             slot.fence_value = 0;
             slot.neural_fence_value = 0;
+            slot.fg_fence_value = 0;
+            slot.fg_telemetry_pending = false;
             reclaimed = true;
         }
     }
@@ -1963,6 +2027,8 @@ static int AcquirePresentationFrameSlot()
             PresentationFrameSlot &slot = g_presentation_slots[index];
             slot.fence_value = 0;
             slot.neural_fence_value = 0;
+            slot.fg_fence_value = 0;
+            slot.fg_telemetry_pending = false;
             slot.sequence = 0;
             slot.has_generated_frame = false;
             slot.has_original_frame = false;
@@ -2722,6 +2788,13 @@ static bool RecreateFeatures()
     if (!g_neural_ready || !g_sr_feature) return false;
     if (!WaitForNeuralGpu(0, false, "pipeline switch GPU fence"))
         return false;
+    if (!AsyncFgGpuIdle())
+    {
+        if (g_neural_dispatch_wake_event && g_async_fg_fence)
+            g_async_fg_fence->SetEventOnCompletion(
+                g_async_fg_fence_value, g_neural_dispatch_wake_event);
+        return false;
+    }
     DWORD exception = 0;
     if (g_fg_feature)
     {
@@ -3056,6 +3129,7 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
         slot.proxy_fence_value = 0;
         slot.async_input_fence_value = 0;
         slot.input_dependency_satisfied = false;
+        slot.fg_split_submission = false;
         slot.presentation_slot_index = -1;
     }
     for (PresentationFrameSlot &slot : g_presentation_slots)
@@ -3066,6 +3140,8 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
         slot.state.store(PresentationSlotFree, std::memory_order_release);
         slot.fence_value = 0;
         slot.neural_fence_value = 0;
+        slot.fg_fence_value = 0;
+        slot.fg_telemetry_pending = false;
         slot.sequence = 0;
         slot.has_generated_frame = false;
         slot.has_original_frame = false;
@@ -3942,6 +4018,52 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
             if (SUCCEEDED(hr) && g_async_compute_active) hr = slot.capture_list->Close();
         }
         if (SUCCEEDED(hr)) hr = g_neural_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_neural_fence));
+        if (SUCCEEDED(hr) && g_async_compute_active)
+        {
+            // Frame generation is a distinct NGX feature. Give it a separate
+            // compute timeline so FG for frame N can overlap NR+SR for N+1.
+            // If any part is unavailable, retain the proven inline path.
+            D3D12_COMMAND_QUEUE_DESC fg_queue_desc = {};
+            fg_queue_desc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+            HRESULT fg_hr = g_neural_device->CreateCommandQueue(
+                &fg_queue_desc, IID_PPV_ARGS(&g_async_fg_queue));
+            if (SUCCEEDED(fg_hr))
+                fg_hr = g_neural_device->CreateFence(
+                    0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_async_fg_fence));
+            for (UINT index = 0; SUCCEEDED(fg_hr) && index < kPresentationFrameSlotCount; ++index)
+            {
+                PresentationFrameSlot &slot = g_presentation_slots[index];
+                fg_hr = g_neural_device->CreateCommandAllocator(
+                    D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&slot.fg_allocator));
+                if (SUCCEEDED(fg_hr))
+                    fg_hr = g_neural_device->CreateCommandList(0,
+                        D3D12_COMMAND_LIST_TYPE_COMPUTE, slot.fg_allocator.Get(), nullptr,
+                        IID_PPV_ARGS(&slot.fg_list));
+                if (SUCCEEDED(fg_hr)) fg_hr = slot.fg_list->Close();
+            }
+            if (SUCCEEDED(fg_hr))
+                fg_hr = g_async_fg_queue->GetTimestampFrequency(
+                    &g_async_fg_timestamp_frequency);
+            if (FAILED(fg_hr))
+            {
+                for (PresentationFrameSlot &slot : g_presentation_slots)
+                {
+                    slot.fg_list.Reset();
+                    slot.fg_allocator.Reset();
+                }
+                g_async_fg_fence.Reset();
+                g_async_fg_queue.Reset();
+                g_async_fg_timestamp_frequency = 0;
+                Log("split FG infrastructure unavailable (0x%08X); using inline FG",
+                    static_cast<unsigned int>(fg_hr));
+            }
+            else
+            {
+                Log("split FG queue ready: reconstruction=%p framegen=%p timestamps=%lluHz",
+                    g_async_compute_queue.Get(), g_async_fg_queue.Get(),
+                    g_async_fg_timestamp_frequency);
+            }
+        }
         D3D12_DESCRIPTOR_HEAP_DESC guide_heap_desc = {};
         guide_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
         guide_heap_desc.NumDescriptors = 2;
@@ -3982,6 +4104,7 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
         slot.proxy_fence_value = 0;
         slot.async_input_fence_value = 0;
         slot.input_dependency_satisfied = false;
+        slot.fg_split_submission = false;
         slot.sequence = 0;
         slot.has_generated_frame = false;
         slot.presentation_slot_index = -1;
@@ -3999,6 +4122,8 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
         slot.original_input.Reset();
         slot.fence_value = 0;
         slot.neural_fence_value = 0;
+        slot.fg_fence_value = 0;
+        slot.fg_telemetry_pending = false;
         slot.sequence = 0;
         slot.has_generated_frame = false;
         slot.has_original_frame = false;
@@ -4012,6 +4137,10 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
             !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, slot.generated_output) ||
             !CreateTexture(iw, ih, input_format, false, D3D12_RESOURCE_STATE_COMMON, slot.original_input))
             return false;
+        if (g_async_fg_queue && (!slot.fg_telemetry_query_heap || !slot.fg_telemetry_readback) &&
+            !CreateTimestampResources(g_neural_device.Get(), 2,
+                slot.fg_telemetry_query_heap, slot.fg_telemetry_readback))
+            Log("split FG telemetry unavailable for output slot; rendering remains enabled");
     }
     // These aliases preserve the existing feature/readiness probes. Per-frame
     // evaluation and presentation use the selected slot resources directly.
@@ -4632,6 +4761,93 @@ static bool CaptureAsyncD3D12Backbuffer(PipelineFrameSlot &slot,
     return true;
 }
 
+static bool SubmitSplitFrameGeneration(PresentationFrameSlot &slot,
+    ID3D12Resource *real_output, ID3D12Resource *generated_output,
+    ID3D12Resource *depth, ID3D12Resource *motion, bool reset,
+    UINT64 reconstruction_fence_value, NVSDK_NGX_Result &result)
+{
+    if (!g_async_fg_queue || !g_async_fg_fence || !g_neural_fence ||
+        !slot.fg_allocator || !slot.fg_list || !real_output || !generated_output)
+        return false;
+
+    ConsumeAsyncFgTelemetry(slot);
+    HRESULT hr = slot.fg_allocator->Reset();
+    if (SUCCEEDED(hr)) hr = slot.fg_list->Reset(slot.fg_allocator.Get(), nullptr);
+    if (FAILED(hr))
+    {
+        Log("split FG command-list reset failed: 0x%08X; reverting to real frame",
+            static_cast<unsigned int>(hr));
+        return false;
+    }
+
+    const bool telemetry = g_performance_telemetry_enabled &&
+        !slot.fg_telemetry_pending && slot.fg_telemetry_query_heap &&
+        slot.fg_telemetry_readback && g_async_fg_timestamp_frequency != 0;
+    if (telemetry)
+        slot.fg_list->EndQuery(slot.fg_telemetry_query_heap.Get(),
+            D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    D3D12_RESOURCE_BARRIER begin[2] = {
+        Transition(real_output, D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        Transition(generated_output, D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+    };
+    slot.fg_list->ResourceBarrier(2, begin);
+
+    SetFgEvaluationContract(real_output, generated_output, depth, motion, reset);
+    DWORD exception = 0;
+    g_active_neural_list = slot.fg_list.Get();
+    result = SafeEvaluateFg(&exception);
+    g_active_neural_list = nullptr;
+    if (exception || NVSDK_NGX_FAILED(result))
+    {
+        slot.fg_list->Close();
+        Log("split FG evaluation failed before submission: result=0x%08X exception=0x%08X",
+            static_cast<unsigned int>(result), exception);
+        return false;
+    }
+
+    D3D12_RESOURCE_BARRIER end[2] = {
+        Transition(real_output, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COMMON),
+        Transition(generated_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON)
+    };
+    slot.fg_list->ResourceBarrier(2, end);
+    if (telemetry)
+    {
+        slot.fg_list->EndQuery(slot.fg_telemetry_query_heap.Get(),
+            D3D12_QUERY_TYPE_TIMESTAMP, 1);
+        slot.fg_list->ResolveQueryData(slot.fg_telemetry_query_heap.Get(),
+            D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, slot.fg_telemetry_readback.Get(), 0);
+    }
+    hr = slot.fg_list->Close();
+    if (SUCCEEDED(hr))
+        hr = g_async_fg_queue->Wait(g_neural_fence.Get(), reconstruction_fence_value);
+    if (FAILED(hr))
+    {
+        Log("split FG reconstruction dependency failed: 0x%08X",
+            static_cast<unsigned int>(hr));
+        return false;
+    }
+    ID3D12CommandList *lists[] = {slot.fg_list.Get()};
+    g_async_fg_queue->ExecuteCommandLists(1, lists);
+    const UINT64 fg_fence_value = ++g_async_fg_fence_value;
+    hr = g_async_fg_queue->Signal(g_async_fg_fence.Get(), fg_fence_value);
+    if (FAILED(hr))
+    {
+        Log("split FG queue signal failed: 0x%08X",
+            static_cast<unsigned int>(hr));
+        return false;
+    }
+    slot.fg_fence_value = fg_fence_value;
+    slot.fg_telemetry_pending = telemetry;
+    ++g_async_fg_submissions;
+    if (g_neural_fence->GetCompletedValue() < reconstruction_fence_value)
+        ++g_async_fg_overlap_frames;
+    return true;
+}
+
 static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pipeline_slot = -1,
     int prepared_capture_slot = -1, bool completion_driven_dispatch = false)
 {
@@ -4888,9 +5104,12 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     }
     timestamp(3);
     NVSDK_NGX_Result fg_result = static_cast<NVSDK_NGX_Result>(0xBAD00004);
-    const bool evaluate_fg = EffectiveFramegenEnabled() && !g_framegen_failed && g_fg_feature &&
+    bool evaluate_fg = EffectiveFramegenEnabled() && !g_framegen_failed && g_fg_feature &&
         NVSDK_NGX_SUCCEED(nr_result) && NVSDK_NGX_SUCCEED(sr_result);
-    if (evaluate_fg)
+    bool split_fg = evaluate_fg && completion_driven_dispatch && mailbox_d3d11_input &&
+        SplitFrameGenerationEnabled() && direct_reservation.index >= 0;
+    pipeline_slot.fg_split_submission = split_fg;
+    if (evaluate_fg && !split_fg)
     {
         D3D12_RESOURCE_BARRIER fg_begin[2] = {
             Transition(real_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -4918,7 +5137,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     if (evaluate_nr)
         restore[restore_count++] = Transition(g_nr_stage.Get(),
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    if (evaluate_fg)
+    if (evaluate_fg && !split_fg)
     {
         restore[restore_count++] = Transition(real_output,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -4983,6 +5202,21 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     if (!SubmitNeuralFrameCommands(slot_index)) return false;
     if (mailbox_d3d11_input)
         capture_reservation.Commit(pipeline_slot.neural_fence_value);
+    if (split_fg)
+    {
+        PresentationFrameSlot &presentation =
+            g_presentation_slots[direct_reservation.index];
+        if (!SubmitSplitFrameGeneration(presentation, real_output, generated_output,
+                depth, motion, reset || g_fg_frames.load() == 0,
+                pipeline_slot.neural_fence_value, fg_result))
+        {
+            Log("split FG submission failed; frame generation disabled, reconstructed real frames remain available");
+            g_framegen_failed = true;
+            evaluate_fg = false;
+            split_fg = false;
+            pipeline_slot.fg_split_submission = false;
+        }
+    }
     if (direct_reservation.index >= 0)
     {
         pipeline_slot.presentation_slot_index = direct_reservation.index;
@@ -6779,6 +7013,10 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
             g_neural_dispatch_submissions.load(),
             g_neural_dispatch_gap_us.load() / 1000.0f,
             g_neural_dispatch_gap_peak_us.load() / 1000.0f);
+        Log("performance split FG: active=%u submissions=%llu queued-before-reconstruction-complete=%llu FG_GPU=%.3fms reconstruction_GPU=%.3fms",
+            SplitFrameGenerationEnabled() ? 1u : 0u,
+            g_async_fg_submissions.load(), g_async_fg_overlap_frames.load(),
+            g_gpu_fg_us.load() / 1000.0f, g_gpu_total_us.load() / 1000.0f);
         if (g_windowed_virtualization_active.load() || DetachedPresentationEnabled())
             Log("presentation compatibility: host=%s window_virtualization=%s logical_client=%s input_coordinates=%s render=%ux%u output=%ux%u resolution_intents=%llu WM_SIZE=%llu client_queries=%llu coordinate_APIs=%llu mouse_messages=%llu cursor_queries=%llu cursor_warps=%llu cursor_clips=%llu resize_pins=%llu",
                 DetachedPresentationEnabled() ? "detached" : "attached",
@@ -7337,12 +7575,16 @@ static int ClaimOldestReadyPresentationSlot()
     unsigned long long oldest = ~0ull;
     const UINT64 neural_completed = g_neural_fence ?
         g_neural_fence->GetCompletedValue() : ~0ull;
+    const UINT64 fg_completed = g_async_fg_fence ?
+        g_async_fg_fence->GetCompletedValue() : ~0ull;
     for (UINT index = 0; index < kPresentationFrameSlotCount; ++index)
     {
         PresentationFrameSlot &slot = g_presentation_slots[index];
+        const bool producer_complete = slot.has_generated_frame && slot.fg_fence_value != 0 ?
+            fg_completed >= slot.fg_fence_value :
+            slot.neural_fence_value != 0 && neural_completed >= slot.neural_fence_value;
         if (slot.state.load(std::memory_order_acquire) == PresentationSlotReady &&
-            slot.neural_fence_value != 0 && neural_completed >= slot.neural_fence_value &&
-            slot.sequence < oldest)
+            producer_complete && slot.sequence < oldest)
         {
             selected = static_cast<int>(index);
             oldest = slot.sequence;
@@ -7380,8 +7622,15 @@ static void ArmAsyncProxyWakeForNeuralCompletion()
     }
     for (PresentationFrameSlot &slot : g_presentation_slots)
     {
-        if (slot.state.load(std::memory_order_acquire) == PresentationSlotReady &&
-            slot.neural_fence_value > completed)
+        if (slot.state.load(std::memory_order_acquire) != PresentationSlotReady)
+            continue;
+        if (slot.has_generated_frame && slot.fg_fence_value != 0 && g_async_fg_fence)
+        {
+            if (g_async_fg_fence->GetCompletedValue() < slot.fg_fence_value)
+                g_async_fg_fence->SetEventOnCompletion(
+                    slot.fg_fence_value, g_proxy_present_event);
+        }
+        else if (slot.neural_fence_value > completed)
             next_completion = std::min(next_completion, slot.neural_fence_value);
     }
     if (next_completion == ~0ull) return;
@@ -7953,12 +8202,17 @@ static bool PublishDirectOutputSlot(int slot_index)
         g_proxy_request_qpc.store(queued.QuadPart, std::memory_order_release);
     }
     g_proxy_present_request_state.store(1, std::memory_order_release);
-    const HRESULT arm_result = g_neural_fence->SetEventOnCompletion(
-        direct_slot->neural_fence_value, g_proxy_present_event);
+    ID3D12Fence *ready_fence = direct_slot->has_generated_frame &&
+        direct_slot->fg_fence_value != 0 && g_async_fg_fence ?
+        g_async_fg_fence.Get() : g_neural_fence.Get();
+    const UINT64 ready_value = ready_fence == g_async_fg_fence.Get() ?
+        direct_slot->fg_fence_value : direct_slot->neural_fence_value;
+    const HRESULT arm_result = ready_fence ? ready_fence->SetEventOnCompletion(
+        ready_value, g_proxy_present_event) : E_POINTER;
     if (FAILED(arm_result) || !SetEvent(g_proxy_present_event))
     {
         Log("direct-output presenter wake failed: fence=%llu hr=0x%08X win32=%lu",
-            direct_slot->neural_fence_value, static_cast<unsigned int>(arm_result), GetLastError());
+            ready_value, static_cast<unsigned int>(arm_result), GetLastError());
         return false;
     }
     static std::atomic<bool> logged_direct_output{false};
@@ -9826,6 +10080,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             slot.generated_output.Reset();
             slot.real_output.Reset();
             slot.original_input.Reset();
+            slot.fg_telemetry_readback.Reset();
+            slot.fg_telemetry_query_heap.Reset();
+            slot.fg_list.Reset();
+            slot.fg_allocator.Reset();
             slot.state.store(PresentationSlotFree, std::memory_order_release);
         }
         g_active_neural_list = nullptr;
@@ -9834,6 +10092,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         if (g_async_input_fence_event) CloseHandle(g_async_input_fence_event);
         g_async_input_fence_event = nullptr;
         g_async_input_fence.Reset();
+        g_async_fg_fence.Reset();
+        g_async_fg_queue.Reset();
         g_async_compute_queue.Reset();
         g_async_compute_active = false;
         if (g_command_queue) g_command_queue->Release();
