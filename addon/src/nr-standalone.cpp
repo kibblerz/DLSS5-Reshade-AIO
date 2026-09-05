@@ -33,7 +33,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.10-latest-frame-prototype"
+#define ADDON_VERSION "2.0.11-fence-dispatch-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -230,6 +230,14 @@ static std::atomic<unsigned int> g_capture_mailbox_age_peak_us{0};
 static std::atomic<unsigned int> g_capture_mailbox_queue_us{0};
 static std::atomic<unsigned int> g_capture_mailbox_queue_peak_us{0};
 static std::atomic<unsigned int> g_capture_mailbox_source_age{0};
+static HANDLE g_neural_dispatch_stop_event;
+static HANDLE g_neural_dispatch_wake_event;
+static HANDLE g_neural_dispatch_completion_event;
+static HANDLE g_neural_dispatch_thread;
+static std::atomic<unsigned long long> g_neural_dispatch_submissions{0};
+static std::atomic<unsigned int> g_neural_dispatch_gap_us{0};
+static std::atomic<unsigned int> g_neural_dispatch_gap_peak_us{0};
+static std::atomic<LONGLONG> g_neural_dispatch_completion_qpc{0};
 static std::atomic<unsigned long long> g_neural_presenter_deferrals{0};
 static std::atomic<unsigned long long> g_neural_gpu_deferrals{0};
 static std::atomic<unsigned long long> g_source_frame_sequence{0};
@@ -569,7 +577,7 @@ struct LegacyCaptureSlot
 };
 static LegacyCaptureSlot g_legacy_capture_slots[kLegacyCaptureSlotCount];
 static UINT g_next_legacy_capture_slot;
-static bool g_capture_mailbox_was_enabled;
+static std::atomic<bool> g_capture_mailbox_was_enabled{false};
 static unsigned long long g_capture_mailbox_min_sequence;
 struct ScopedLegacyCaptureReservation
 {
@@ -1472,6 +1480,9 @@ static void ResetPerformanceTelemetry()
     g_capture_mailbox_age_us = 0; g_capture_mailbox_age_peak_us = 0;
     g_capture_mailbox_queue_us = 0; g_capture_mailbox_queue_peak_us = 0;
     g_capture_mailbox_source_age = 0;
+    g_neural_dispatch_submissions = 0;
+    g_neural_dispatch_gap_us = 0; g_neural_dispatch_gap_peak_us = 0;
+    g_neural_dispatch_completion_qpc = 0;
     g_telemetry_samples = 0;
     g_guide_telemetry_samples = 0; g_proxy_telemetry_samples = 0;
     g_gpu_telemetry_available = false; g_guide_gpu_telemetry_available = false;
@@ -1784,8 +1795,8 @@ static void DiscardObsoleteLegacyCaptures()
 
 static void UpdateLegacyCaptureMailboxMode(bool enabled)
 {
-    if (enabled == g_capture_mailbox_was_enabled) return;
-    g_capture_mailbox_was_enabled = enabled;
+    if (enabled == g_capture_mailbox_was_enabled.load(std::memory_order_acquire)) return;
+    g_capture_mailbox_was_enabled.store(enabled, std::memory_order_release);
     g_capture_mailbox_min_sequence =
         g_source_frame_sequence.load(std::memory_order_acquire);
     ReclaimLegacyCaptureSlots();
@@ -1793,6 +1804,8 @@ static void UpdateLegacyCaptureMailboxMode(bool enabled)
     DiscardObsoleteLegacyCaptures();
     Log("D3D11 latest-frame mailbox %s at source sequence %llu; prior captures invalidated",
         enabled ? "enabled" : "disabled", g_capture_mailbox_min_sequence);
+    if (g_neural_dispatch_wake_event)
+        SetEvent(g_neural_dispatch_wake_event);
 }
 
 static int ReserveNewestReadyLegacyCapture()
@@ -1919,6 +1932,7 @@ static int AcquirePipelineFrameSlot()
 static void ReclaimPresentationFrameSlots()
 {
     const UINT64 completed = g_proxy_fence ? g_proxy_fence->GetCompletedValue() : 0;
+    bool reclaimed = false;
     for (PresentationFrameSlot &slot : g_presentation_slots)
     {
         unsigned int state = slot.state.load(std::memory_order_acquire);
@@ -1928,8 +1942,11 @@ static void ReclaimPresentationFrameSlots()
         {
             slot.fence_value = 0;
             slot.neural_fence_value = 0;
+            reclaimed = true;
         }
     }
+    if (reclaimed && g_neural_dispatch_wake_event)
+        SetEvent(g_neural_dispatch_wake_event);
 }
 
 static int AcquirePresentationFrameSlot()
@@ -4616,7 +4633,7 @@ static bool CaptureAsyncD3D12Backbuffer(PipelineFrameSlot &slot,
 }
 
 static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pipeline_slot = -1,
-    int prepared_capture_slot = -1)
+    int prepared_capture_slot = -1, bool completion_driven_dispatch = false)
 {
     const bool legacy_input = backbuffer == nullptr;
     ScopedLegacyCaptureReservation capture_reservation;
@@ -5025,7 +5042,8 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
         presentation.has_original_frame = true;
     }
     pipeline_slot.state.store(PipelineSlotReady, std::memory_order_release);
-    g_pending_pipeline_slot = static_cast<int>(slot_index);
+    if (!completion_driven_dispatch)
+        g_pending_pipeline_slot = static_cast<int>(slot_index);
 
     const unsigned long long frame = ++g_sr_frames;
     if (evaluate_nr) ++g_nr_frames;
@@ -6756,6 +6774,11 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
             g_capture_mailbox_age_us.load() / 1000.0f,
             g_capture_mailbox_age_peak_us.load() / 1000.0f,
             g_capture_mailbox_source_age.load());
+        Log("performance neural dispatcher: active=%u submissions=%llu completion->next-submit=%.3fms peak=%.3fms",
+            g_neural_dispatch_thread != nullptr ? 1u : 0u,
+            g_neural_dispatch_submissions.load(),
+            g_neural_dispatch_gap_us.load() / 1000.0f,
+            g_neural_dispatch_gap_peak_us.load() / 1000.0f);
         if (g_windowed_virtualization_active.load() || DetachedPresentationEnabled())
             Log("presentation compatibility: host=%s window_virtualization=%s logical_client=%s input_coordinates=%s render=%ux%u output=%ux%u resolution_intents=%llu WM_SIZE=%llu client_queries=%llu coordinate_APIs=%llu mouse_messages=%llu cursor_queries=%llu cursor_warps=%llu cursor_clips=%llu resize_pins=%llu",
                 DetachedPresentationEnabled() ? "detached" : "attached",
@@ -7764,16 +7787,13 @@ static bool PresentStagedFrameOnWorker(UINT slot_index)
 
 static DWORD WINAPI ProxyPresentationThread(void *)
 {
-    const HANDLE waits[3] = {
-        g_proxy_present_stop_event, g_proxy_present_event, g_capture_ready_event};
-    const DWORD wait_count = g_capture_ready_event ? 3u : 2u;
+    const HANDLE waits[2] = {g_proxy_present_stop_event, g_proxy_present_event};
     Log("async proxy presentation worker started");
     while (true)
     {
-        const DWORD wait = WaitForMultipleObjects(wait_count, waits, FALSE, INFINITE);
+        const DWORD wait = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
         if (wait == WAIT_OBJECT_0) break;
-        if (wait != WAIT_OBJECT_0 + 1 && wait != WAIT_OBJECT_0 + 2) continue;
-        ObserveLegacyCaptureCompletions();
+        if (wait != WAIT_OBJECT_0 + 1) continue;
 
         while (true)
         {
@@ -7891,17 +7911,70 @@ static DWORD WINAPI ProxyPresentationThread(void *)
     return 0;
 }
 
-static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer, int slot_index)
+static bool PublishDirectOutputSlot(int slot_index)
 {
     if (slot_index < 0 || slot_index >= static_cast<int>(kPipelineFrameSlotCount)) return false;
     PipelineFrameSlot &slot = g_pipeline_slots[slot_index];
     const int direct_slot_index = slot.presentation_slot_index;
-    const bool direct_output = direct_slot_index >= 0 &&
-        direct_slot_index < static_cast<int>(kPresentationFrameSlotCount);
-    PresentationFrameSlot *direct_slot = direct_output ?
-        &g_presentation_slots[direct_slot_index] : nullptr;
-    ID3D12Resource *real_source = direct_slot ? direct_slot->real_output.Get() : slot.real_output.Get();
-    ID3D12Resource *original_source = direct_slot ? direct_slot->original_input.Get() : slot.original_input.Get();
+    if (direct_slot_index < 0 ||
+        direct_slot_index >= static_cast<int>(kPresentationFrameSlotCount))
+        return false;
+    PresentationFrameSlot *direct_slot = &g_presentation_slots[direct_slot_index];
+    ID3D12Resource *real_source = direct_slot->real_output.Get();
+    ID3D12Resource *original_source = direct_slot->original_input.Get();
+    if (g_proxy_hidden || g_proxy_transition_hold || g_sr_frames.load() == 0 || real_source == nullptr ||
+        original_source == nullptr || !EnsureProxy(real_source) ||
+        g_proxy_present_event == nullptr || g_proxy_present_thread == nullptr)
+    {
+        slot.state.store(PipelineSlotAbandoned, std::memory_order_release);
+        return false;
+    }
+    ++g_proxy_present_requests;
+
+    unsigned int pipeline_expected = PipelineSlotReady;
+    if (!slot.state.compare_exchange_strong(pipeline_expected, PipelineSlotPresentRecording,
+            std::memory_order_acq_rel, std::memory_order_acquire))
+        return false;
+    if (direct_slot->state.load(std::memory_order_acquire) != PresentationSlotNeuralRecording)
+    {
+        slot.state.store(PipelineSlotAbandoned, std::memory_order_release);
+        return false;
+    }
+    // NGX already wrote the final DLSS and generated images into this
+    // presentation slot. The neural fence is now the only producer
+    // dependency; no native-resolution output copy is inserted.
+    direct_slot->state.store(PresentationSlotReady, std::memory_order_release);
+    slot.presentation_slot_index = -1;
+    slot.state.store(PipelineSlotAbandoned, std::memory_order_release);
+    if (g_performance_telemetry_enabled)
+    {
+        LARGE_INTEGER queued = {};
+        QueryPerformanceCounter(&queued);
+        g_proxy_request_qpc.store(queued.QuadPart, std::memory_order_release);
+    }
+    g_proxy_present_request_state.store(1, std::memory_order_release);
+    const HRESULT arm_result = g_neural_fence->SetEventOnCompletion(
+        direct_slot->neural_fence_value, g_proxy_present_event);
+    if (FAILED(arm_result) || !SetEvent(g_proxy_present_event))
+    {
+        Log("direct-output presenter wake failed: fence=%llu hr=0x%08X win32=%lu",
+            direct_slot->neural_fence_value, static_cast<unsigned int>(arm_result), GetLastError());
+        return false;
+    }
+    static std::atomic<bool> logged_direct_output{false};
+    if (!logged_direct_output.exchange(true, std::memory_order_acq_rel))
+        Log("direct NGX output handoff active: DLSS SR and FG write into presenter-owned textures; post-NGX output copies eliminated");
+    return true;
+}
+
+static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer, int slot_index)
+{
+    if (slot_index < 0 || slot_index >= static_cast<int>(kPipelineFrameSlotCount)) return false;
+    PipelineFrameSlot &slot = g_pipeline_slots[slot_index];
+    if (slot.presentation_slot_index >= 0)
+        return PublishDirectOutputSlot(slot_index);
+    ID3D12Resource *real_source = slot.real_output.Get();
+    ID3D12Resource *original_source = slot.original_input.Get();
     if (g_proxy_hidden || g_proxy_transition_hold || g_sr_frames.load() == 0 || real_source == nullptr ||
         original_source == nullptr || backbuffer == nullptr || !EnsureProxy(real_source) ||
         g_proxy_present_event == nullptr || g_proxy_present_thread == nullptr)
@@ -7910,44 +7983,6 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer, int slot_index)
         return false;
     }
     ++g_proxy_present_requests;
-
-    if (direct_output)
-    {
-        unsigned int pipeline_expected = PipelineSlotReady;
-        if (!slot.state.compare_exchange_strong(pipeline_expected, PipelineSlotPresentRecording,
-                std::memory_order_acq_rel, std::memory_order_acquire))
-            return false;
-        if (direct_slot->state.load(std::memory_order_acquire) != PresentationSlotNeuralRecording)
-        {
-            slot.state.store(PipelineSlotAbandoned, std::memory_order_release);
-            return false;
-        }
-        // NGX already wrote the final DLSS and generated images into this
-        // presentation slot. The neural fence is now the only producer
-        // dependency; no native-resolution output copy is inserted.
-        direct_slot->state.store(PresentationSlotReady, std::memory_order_release);
-        slot.presentation_slot_index = -1;
-        slot.state.store(PipelineSlotAbandoned, std::memory_order_release);
-        if (g_performance_telemetry_enabled)
-        {
-            LARGE_INTEGER queued = {};
-            QueryPerformanceCounter(&queued);
-            g_proxy_request_qpc.store(queued.QuadPart, std::memory_order_release);
-        }
-        g_proxy_present_request_state.store(1, std::memory_order_release);
-        const HRESULT arm_result = g_neural_fence->SetEventOnCompletion(
-            direct_slot->neural_fence_value, g_proxy_present_event);
-        if (FAILED(arm_result) || !SetEvent(g_proxy_present_event))
-        {
-            Log("direct-output presenter wake failed: fence=%llu hr=0x%08X win32=%lu",
-                direct_slot->neural_fence_value, static_cast<unsigned int>(arm_result), GetLastError());
-            return false;
-        }
-        static std::atomic<bool> logged_direct_output{false};
-        if (!logged_direct_output.exchange(true, std::memory_order_acq_rel))
-            Log("direct NGX output handoff active: DLSS SR and FG write into presenter-owned textures; post-NGX output copies eliminated");
-        return true;
-    }
 
     if (g_synchronous_proxy_presentation)
     {
@@ -7992,6 +8027,155 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer, int slot_index)
         return false;
     }
     return true;
+}
+
+static void ArmNeuralDispatcherForCompletion()
+{
+    if (!g_neural_dispatch_completion_event || !g_neural_fence || g_neural_fence_value == 0)
+        return;
+    const UINT64 completed = g_neural_fence->GetCompletedValue();
+    if (completed >= g_neural_fence_value)
+    {
+        SetEvent(g_neural_dispatch_completion_event);
+        return;
+    }
+    const HRESULT hr = g_neural_fence->SetEventOnCompletion(
+        g_neural_fence_value, g_neural_dispatch_completion_event);
+    if (FAILED(hr))
+        Log("completion-driven neural wake arm failed: fence=%llu hr=0x%08X",
+            g_neural_fence_value, static_cast<unsigned int>(hr));
+}
+
+static DWORD WINAPI NeuralDispatchThread(void *)
+{
+    const HANDLE waits[4] = {g_neural_dispatch_stop_event, g_capture_ready_event,
+        g_neural_dispatch_wake_event, g_neural_dispatch_completion_event};
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    Log("completion-driven D3D11 neural dispatcher started");
+    while (true)
+    {
+        const DWORD wait = WaitForMultipleObjects(4, waits, FALSE, INFINITE);
+        if (wait == WAIT_OBJECT_0) break;
+        if (wait < WAIT_OBJECT_0 + 1 || wait > WAIT_OBJECT_0 + 3) continue;
+        if (wait == WAIT_OBJECT_0 + 3)
+        {
+            LARGE_INTEGER completed = {};
+            if (QueryPerformanceCounter(&completed))
+                g_neural_dispatch_completion_qpc.store(
+                    completed.QuadPart, std::memory_order_release);
+        }
+
+        ObserveLegacyCaptureCompletions();
+        ReclaimPipelineFrameSlots();
+        ReclaimPresentationFrameSlots();
+        if (!g_capture_mailbox_was_enabled.load(std::memory_order_acquire) ||
+            !LegacyCaptureMailboxEnabled())
+            continue;
+
+        // Submit exactly one temporal NGX job at a time. Unlike the old path,
+        // readiness is driven by the fence/capture events rather than waiting
+        // for another game Present to happen after both became available.
+        if (DirectNeuralFramesInFlight() >= kLatestFrameNeuralFramesInFlight)
+        {
+            ArmNeuralDispatcherForCompletion();
+            continue;
+        }
+        if (!DirectOutputCapacityAvailable())
+            continue;
+
+        const int capture_slot = ReserveNewestReadyLegacyCapture();
+        if (capture_slot < 0)
+            continue;
+        const int pipeline_slot = AcquirePipelineFrameSlot();
+        if (pipeline_slot < 0)
+        {
+            ReturnReservedLegacyCapture(capture_slot);
+            ++g_neural_gpu_deferrals;
+            continue;
+        }
+
+        LARGE_INTEGER dispatch_begin = {};
+        QueryPerformanceCounter(&dispatch_begin);
+        if (!ExecuteOnPresentPipeline(nullptr, pipeline_slot, capture_slot, true))
+        {
+            unsigned int expected = PipelineSlotRecording;
+            g_pipeline_slots[pipeline_slot].state.compare_exchange_strong(expected,
+                PipelineSlotFree, std::memory_order_acq_rel, std::memory_order_acquire);
+            continue;
+        }
+        if (!PublishDirectOutputSlot(pipeline_slot))
+        {
+            g_pipeline_slots[pipeline_slot].state.store(
+                PipelineSlotAbandoned, std::memory_order_release);
+            ArmNeuralDispatcherForCompletion();
+            continue;
+        }
+
+        ++g_neural_dispatch_submissions;
+        const LONGLONG completion_qpc = g_neural_dispatch_completion_qpc.exchange(
+            0, std::memory_order_acq_rel);
+        if (completion_qpc != 0)
+        {
+            LARGE_INTEGER completion = {};
+            completion.QuadPart = completion_qpc;
+            const unsigned int gap = CounterDeltaMicroseconds(completion, dispatch_begin);
+            SmoothMicroseconds(g_neural_dispatch_gap_us, gap);
+            RecordPeakMicroseconds(g_neural_dispatch_gap_peak_us, gap);
+        }
+        ArmNeuralDispatcherForCompletion();
+    }
+    Log("completion-driven D3D11 neural dispatcher stopped");
+    return 0;
+}
+
+static bool EnsureNeuralDispatchThread()
+{
+    if (g_neural_dispatch_thread) return true;
+    if (!g_capture_ready_event) return false;
+    g_neural_dispatch_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_neural_dispatch_wake_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_neural_dispatch_completion_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_neural_dispatch_stop_event || !g_neural_dispatch_wake_event ||
+        !g_neural_dispatch_completion_event)
+    {
+        if (g_neural_dispatch_completion_event) CloseHandle(g_neural_dispatch_completion_event);
+        if (g_neural_dispatch_wake_event) CloseHandle(g_neural_dispatch_wake_event);
+        if (g_neural_dispatch_stop_event) CloseHandle(g_neural_dispatch_stop_event);
+        g_neural_dispatch_completion_event = nullptr;
+        g_neural_dispatch_wake_event = nullptr;
+        g_neural_dispatch_stop_event = nullptr;
+        return false;
+    }
+    g_neural_dispatch_thread = CreateThread(
+        nullptr, 0, NeuralDispatchThread, nullptr, 0, nullptr);
+    if (!g_neural_dispatch_thread)
+    {
+        CloseHandle(g_neural_dispatch_completion_event);
+        CloseHandle(g_neural_dispatch_wake_event);
+        CloseHandle(g_neural_dispatch_stop_event);
+        g_neural_dispatch_completion_event = nullptr;
+        g_neural_dispatch_wake_event = nullptr;
+        g_neural_dispatch_stop_event = nullptr;
+        return false;
+    }
+    return true;
+}
+
+static void StopNeuralDispatchThread()
+{
+    if (g_neural_dispatch_stop_event) SetEvent(g_neural_dispatch_stop_event);
+    if (g_neural_dispatch_thread)
+    {
+        WaitForSingleObject(g_neural_dispatch_thread, 2000);
+        CloseHandle(g_neural_dispatch_thread);
+    }
+    if (g_neural_dispatch_completion_event) CloseHandle(g_neural_dispatch_completion_event);
+    if (g_neural_dispatch_wake_event) CloseHandle(g_neural_dispatch_wake_event);
+    if (g_neural_dispatch_stop_event) CloseHandle(g_neural_dispatch_stop_event);
+    g_neural_dispatch_thread = nullptr;
+    g_neural_dispatch_completion_event = nullptr;
+    g_neural_dispatch_wake_event = nullptr;
+    g_neural_dispatch_stop_event = nullptr;
 }
 
 static bool EnsureStandaloneResources(ID3D12Resource *backbuffer)
@@ -8528,6 +8712,11 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         const UINT height = desc.texture.height;
         const DXGI_FORMAT format = static_cast<DXGI_FORMAT>(desc.texture.format);
         g_input_width = width; g_input_height = height;
+        if (api == reshade::api::device_api::d3d11 &&
+            g_capture_mailbox_was_enabled.load(std::memory_order_acquire) &&
+            g_neural_ready && (width != g_resource_input_width || height != g_resource_input_height ||
+                TypedInputFormat(format) != g_resource_input_format))
+            UpdateLegacyCaptureMailboxMode(false);
         if (!EnsureStandaloneResources(width, height, format)) return;
 
         const bool capture_mailbox = api == reshade::api::device_api::d3d11 &&
@@ -8536,6 +8725,16 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
             UpdateLegacyCaptureMailboxMode(capture_mailbox);
         if (capture_mailbox)
         {
+            if (EnsureNeuralDispatchThread())
+            {
+                CaptureLegacyFrameToMailbox(reinterpret_cast<void *>(backbuffer_resource.handle));
+                // The capture fence wakes the dispatcher when this copy becomes
+                // visible to D3D12. Do not make NGX wait for another Present.
+                return;
+            }
+
+            // Fail open to the proven Present-driven mailbox if a worker/event
+            // could not be created on this machine.
             CaptureLegacyFrameToMailbox(reinterpret_cast<void *>(backbuffer_resource.handle));
             const int capture_slot = ReserveNewestReadyLegacyCapture();
             if (capture_slot < 0) return;
@@ -9353,6 +9552,8 @@ static void DrawOverlay(reshade::api::effect_runtime *)
 
 static void OnDestroyDevice(reshade::api::device *device)
 {
+    if (device && device->get_api() == reshade::api::device_api::d3d11)
+        UpdateLegacyCaptureMailboxMode(false);
     for (const BackbufferView &entry : g_backbuffer_views)
         if (entry.rtv.handle) device->destroy_resource_view(entry.rtv);
     g_backbuffer_views.clear();
@@ -9541,6 +9742,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
         reshade::unregister_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
+        StopNeuralDispatchThread();
         if (g_proxy_present_stop_event) SetEvent(g_proxy_present_stop_event);
         if (g_proxy_present_event) SetEvent(g_proxy_present_event);
         if (g_proxy_present_thread)
