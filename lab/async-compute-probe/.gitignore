@@ -1,0 +1,8 @@
+*.dll
+*.exe
+*.exp
+*.lib
+*.log
+*.obj
+*.ppm
+*.json

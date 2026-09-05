@@ -33,7 +33,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.5-performance-lab-prototype"
+#define ADDON_VERSION "2.0.5-async-compute-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -466,6 +466,13 @@ static std::atomic<unsigned long long> g_current_guide_frames{0};
 static Microsoft::WRL::ComPtr<ID3D12Device> g_neural_device;
 static Microsoft::WRL::ComPtr<ID3D12CommandAllocator> g_neural_allocator;
 static Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> g_neural_list;
+static bool g_async_compute_requested;
+static bool g_async_compute_active;
+static bool g_async_compute_restart_required;
+static Microsoft::WRL::ComPtr<ID3D12CommandQueue> g_async_compute_queue;
+static Microsoft::WRL::ComPtr<ID3D12Fence> g_async_input_fence;
+static UINT64 g_async_input_fence_value;
+static HANDLE g_async_input_fence_event;
 static constexpr UINT kPipelineFrameSlotCount = 3;
 enum PipelineFrameSlotState : unsigned int
 {
@@ -480,6 +487,8 @@ struct PipelineFrameSlot
 {
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> capture_allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> capture_list;
     Microsoft::WRL::ComPtr<ID3D12Resource> real_output;
     Microsoft::WRL::ComPtr<ID3D12Resource> generated_output;
     Microsoft::WRL::ComPtr<ID3D12Resource> original_input;
@@ -487,6 +496,7 @@ struct PipelineFrameSlot
     std::atomic<unsigned int> state{PipelineSlotFree};
     UINT64 neural_fence_value = 0;
     std::atomic<UINT64> proxy_fence_value{0};
+    UINT64 async_input_fence_value = 0;
     unsigned long long sequence = 0;
     bool has_generated_frame = false;
 };
@@ -1331,14 +1341,21 @@ static void ResetPerformanceTelemetry()
     g_source_frame_last_summary_tick = 0;
 }
 
+static ID3D12CommandQueue *NeuralSubmissionQueue()
+{
+    return g_async_compute_active && g_async_compute_queue ?
+        g_async_compute_queue.Get() : g_command_queue;
+}
+
 static bool InitializeGpuTelemetry()
 {
     if (g_telemetry_query_heap && g_telemetry_readback && g_telemetry_timestamp_frequency != 0)
         return true;
-    if (!g_neural_device || !g_command_queue) return false;
+    ID3D12CommandQueue *queue = NeuralSubmissionQueue();
+    if (!g_neural_device || !queue) return false;
 
     UINT64 frequency = 0;
-    HRESULT hr = g_command_queue->GetTimestampFrequency(&frequency);
+    HRESULT hr = queue->GetTimestampFrequency(&frequency);
     D3D12_QUERY_HEAP_DESC query_desc = {};
     query_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
     query_desc.Count = kTelemetryQueryCount;
@@ -1607,6 +1624,22 @@ static bool BeginNeuralFrameCommands(UINT slot_index)
     return true;
 }
 
+static bool QueueAsyncInputDependency(PipelineFrameSlot &slot)
+{
+    if (!g_async_compute_active) return true;
+    if (!g_command_queue || !g_async_compute_queue || !g_async_input_fence) return false;
+    const UINT64 value = ++g_async_input_fence_value;
+    HRESULT hr = g_command_queue->Signal(g_async_input_fence.Get(), value);
+    if (SUCCEEDED(hr)) hr = g_async_compute_queue->Wait(g_async_input_fence.Get(), value);
+    if (FAILED(hr))
+    {
+        Fail("async compute input dependency", static_cast<unsigned int>(hr));
+        return false;
+    }
+    slot.async_input_fence_value = value;
+    return true;
+}
+
 static bool SubmitNeuralFrameCommands(UINT slot_index)
 {
     PipelineFrameSlot &slot = g_pipeline_slots[slot_index];
@@ -1620,9 +1653,16 @@ static bool SubmitNeuralFrameCommands(UINT slot_index)
         return false;
     }
     ID3D12CommandList *lists[] = {list};
-    g_command_queue->ExecuteCommandLists(1, lists);
+    if (!QueueAsyncInputDependency(slot))
+    {
+        g_active_neural_list = nullptr;
+        slot.state.store(PipelineSlotAbandoned, std::memory_order_release);
+        return false;
+    }
+    ID3D12CommandQueue *queue = NeuralSubmissionQueue();
+    queue->ExecuteCommandLists(1, lists);
     const UINT64 value = ++g_neural_fence_value;
-    hr = g_command_queue->Signal(g_neural_fence.Get(), value);
+    hr = queue->Signal(g_neural_fence.Get(), value);
     g_active_neural_list = nullptr;
     if (FAILED(hr))
     {
@@ -1683,9 +1723,10 @@ static bool SubmitNeuralCommands(bool wait)
     HRESULT hr = list->Close();
     if (FAILED(hr)) { Fail("neural command-list close", static_cast<unsigned int>(hr)); return false; }
     ID3D12CommandList *lists[] = {list};
-    g_command_queue->ExecuteCommandLists(1, lists);
+    ID3D12CommandQueue *queue = NeuralSubmissionQueue();
+    queue->ExecuteCommandLists(1, lists);
     const UINT64 value = ++g_neural_fence_value;
-    hr = g_command_queue->Signal(g_neural_fence.Get(), value);
+    hr = queue->Signal(g_neural_fence.Get(), value);
     if (FAILED(hr)) { Fail("neural queue signal", static_cast<unsigned int>(hr)); return false; }
     return !wait || WaitForNeuralGpu(kInitializationGpuWaitMs, true, "NGX initialization GPU fence");
 }
@@ -2278,6 +2319,66 @@ static bool CreateGuideTexture(UINT width, UINT height, DXGI_FORMAT format, cons
     return true;
 }
 
+static bool InitializeAsyncFallbackGuides()
+{
+    if (!g_async_compute_active) return true;
+    PipelineFrameSlot &slot = g_pipeline_slots[0];
+    if (!slot.capture_allocator || !slot.capture_list || !g_async_input_fence ||
+        !g_async_input_fence_event || !g_fallback_motion || !g_fallback_depth)
+        return false;
+
+    HRESULT hr = slot.capture_allocator->Reset();
+    if (SUCCEEDED(hr)) hr = slot.capture_list->Reset(slot.capture_allocator.Get(), nullptr);
+    D3D12_RESOURCE_BARRIER begin[2] = {};
+    D3D12_RESOURCE_BARRIER end[2] = {};
+    ID3D12Resource *resources[2] = {g_fallback_motion.Get(), g_fallback_depth.Get()};
+    for (UINT index = 0; index < 2; ++index)
+    {
+        begin[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        begin[index].Transition.pResource = resources[index];
+        begin[index].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        begin[index].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        begin[index].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        end[index] = begin[index];
+        end[index].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        end[index].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    }
+    if (SUCCEEDED(hr))
+    {
+        slot.capture_list->ResourceBarrier(2, begin);
+        D3D12_CPU_DESCRIPTOR_HANDLE motion_rtv = g_guide_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_CPU_DESCRIPTOR_HANDLE depth_rtv = motion_rtv;
+        depth_rtv.ptr += g_guide_rtv_stride;
+        const float motion_clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        const float depth_clear[4] = {g_depth_reversed ? 0.0f : 1.0f, 0.0f, 0.0f, 0.0f};
+        slot.capture_list->ClearRenderTargetView(motion_rtv, motion_clear, 0, nullptr);
+        slot.capture_list->ClearRenderTargetView(depth_rtv, depth_clear, 0, nullptr);
+        slot.capture_list->ResourceBarrier(2, end);
+        hr = slot.capture_list->Close();
+    }
+    if (SUCCEEDED(hr))
+    {
+        ID3D12CommandList *lists[] = {slot.capture_list.Get()};
+        g_command_queue->ExecuteCommandLists(1, lists);
+        const UINT64 value = ++g_async_input_fence_value;
+        hr = g_command_queue->Signal(g_async_input_fence.Get(), value);
+        if (SUCCEEDED(hr) && g_async_input_fence->GetCompletedValue() < value)
+        {
+            hr = g_async_input_fence->SetEventOnCompletion(value, g_async_input_fence_event);
+            if (SUCCEEDED(hr) && WaitForSingleObject(g_async_input_fence_event,
+                    kInitializationGpuWaitMs) != WAIT_OBJECT_0)
+                hr = HRESULT_FROM_WIN32(WAIT_TIMEOUT);
+        }
+    }
+    if (FAILED(hr))
+    {
+        Fail("async fallback guide initialization", static_cast<unsigned int>(hr));
+        return false;
+    }
+    Log("async fallback guides initialized once on graphics queue");
+    return true;
+}
+
 static void PublishOutput(ID3D12Resource *resource)
 {
     resource->AddRef();
@@ -2422,6 +2523,7 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
         slot.state.store(PipelineSlotFree, std::memory_order_release);
         slot.neural_fence_value = 0;
         slot.proxy_fence_value = 0;
+        slot.async_input_fence_value = 0;
     }
     g_pending_pipeline_slot = -1;
     g_post_reshade_color.Reset(); g_post_reshade_color_ready = false;
@@ -3089,19 +3191,62 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
     if (!g_neural_device)
     {
         HRESULT hr = g_command_queue->GetDevice(IID_PPV_ARGS(&g_neural_device));
-        if (SUCCEEDED(hr)) hr = g_neural_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_neural_allocator));
-        if (SUCCEEDED(hr)) hr = g_neural_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+        if (SUCCEEDED(hr) && g_async_compute_requested)
+        {
+            D3D12_COMMAND_QUEUE_DESC compute_desc = {};
+            compute_desc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+            hr = g_neural_device->CreateCommandQueue(&compute_desc,
+                IID_PPV_ARGS(&g_async_compute_queue));
+            if (SUCCEEDED(hr))
+                hr = g_neural_device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                    IID_PPV_ARGS(&g_async_input_fence));
+            if (SUCCEEDED(hr))
+            {
+                g_async_input_fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                if (!g_async_input_fence_event) hr = HRESULT_FROM_WIN32(GetLastError());
+            }
+            if (FAILED(hr))
+            {
+                Log("async compute infrastructure unavailable (0x%08X); using proven DIRECT path",
+                    static_cast<unsigned int>(hr));
+                if (g_async_input_fence_event)
+                {
+                    CloseHandle(g_async_input_fence_event);
+                    g_async_input_fence_event = nullptr;
+                }
+                g_async_input_fence.Reset();
+                g_async_compute_queue.Reset();
+                hr = S_OK;
+            }
+            else
+            {
+                g_async_compute_active = true;
+                Log("asynchronous NGX queue ready: graphics=%p compute=%p",
+                    g_command_queue, g_async_compute_queue.Get());
+            }
+        }
+        const D3D12_COMMAND_LIST_TYPE neural_type = g_async_compute_active ?
+            D3D12_COMMAND_LIST_TYPE_COMPUTE : D3D12_COMMAND_LIST_TYPE_DIRECT;
+        if (SUCCEEDED(hr)) hr = g_neural_device->CreateCommandAllocator(neural_type, IID_PPV_ARGS(&g_neural_allocator));
+        if (SUCCEEDED(hr)) hr = g_neural_device->CreateCommandList(0, neural_type,
             g_neural_allocator.Get(), nullptr, IID_PPV_ARGS(&g_neural_list));
         if (SUCCEEDED(hr)) hr = g_neural_list->Close();
         for (UINT index = 0; SUCCEEDED(hr) && index < kPipelineFrameSlotCount; ++index)
         {
             PipelineFrameSlot &slot = g_pipeline_slots[index];
-            hr = g_neural_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+            hr = g_neural_device->CreateCommandAllocator(neural_type,
                 IID_PPV_ARGS(&slot.allocator));
             if (SUCCEEDED(hr))
-                hr = g_neural_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                hr = g_neural_device->CreateCommandList(0, neural_type,
                     slot.allocator.Get(), nullptr, IID_PPV_ARGS(&slot.list));
             if (SUCCEEDED(hr)) hr = slot.list->Close();
+            if (SUCCEEDED(hr) && g_async_compute_active)
+                hr = g_neural_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    IID_PPV_ARGS(&slot.capture_allocator));
+            if (SUCCEEDED(hr) && g_async_compute_active)
+                hr = g_neural_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    slot.capture_allocator.Get(), nullptr, IID_PPV_ARGS(&slot.capture_list));
+            if (SUCCEEDED(hr) && g_async_compute_active) hr = slot.capture_list->Close();
         }
         if (SUCCEEDED(hr)) hr = g_neural_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_neural_fence));
         D3D12_DESCRIPTOR_HEAP_DESC guide_heap_desc = {};
@@ -3142,6 +3287,7 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
             slot.original_input.Reset();
         slot.neural_fence_value = 0;
         slot.proxy_fence_value = 0;
+        slot.async_input_fence_value = 0;
         slot.sequence = 0;
         slot.has_generated_frame = false;
         slot.state.store(PipelineSlotFree, std::memory_order_release);
@@ -3160,7 +3306,8 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
     const float motion_clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     const float depth_clear[4] = {g_depth_reversed ? 0.0f : 1.0f, 0.0f, 0.0f, 0.0f};
     if (!CreateGuideTexture(iw, ih, DXGI_FORMAT_R16G16_FLOAT, motion_clear, 0, g_fallback_motion) ||
-        !CreateGuideTexture(iw, ih, DXGI_FORMAT_R32_FLOAT, depth_clear, 1, g_fallback_depth)) return false;
+        !CreateGuideTexture(iw, ih, DXGI_FORMAT_R32_FLOAT, depth_clear, 1, g_fallback_depth) ||
+        !InitializeAsyncFallbackGuides()) return false;
     if (!InitializeNgx() || !CreateFeatures()) return false;
     PublishOutput(g_sr_stage.Get());
     g_neural_ready = true;
@@ -3723,6 +3870,50 @@ static D3D12_RESOURCE_BARRIER Transition(ID3D12Resource *resource,
     return barrier;
 }
 
+static bool CaptureAsyncD3D12Backbuffer(PipelineFrameSlot &slot,
+    ID3D12Resource *backbuffer, ID3D12Resource *destination)
+{
+    if (!g_async_compute_active) return true;
+    if (!backbuffer || !destination || !slot.capture_allocator || !slot.capture_list)
+        return false;
+    HRESULT hr = slot.capture_allocator->Reset();
+    if (SUCCEEDED(hr)) hr = slot.capture_list->Reset(slot.capture_allocator.Get(), nullptr);
+    if (FAILED(hr))
+    {
+        Fail("async graphics capture command-list reset", static_cast<unsigned int>(hr));
+        return false;
+    }
+    D3D12_RESOURCE_BARRIER begin[2] = {
+        Transition(backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        Transition(destination, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)
+    };
+    slot.capture_list->ResourceBarrier(2, begin);
+    D3D12_TEXTURE_COPY_LOCATION source = {};
+    source.pResource = backbuffer;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION target = {};
+    target.pResource = destination;
+    target.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    const D3D12_BOX source_box = {0, 0, 0,
+        g_resource_input_width, g_resource_input_height, 1};
+    slot.capture_list->CopyTextureRegion(&target, 0, 0, 0, &source, &source_box);
+    D3D12_RESOURCE_BARRIER end[2] = {
+        Transition(backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT),
+        Transition(destination, D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+    };
+    slot.capture_list->ResourceBarrier(2, end);
+    hr = slot.capture_list->Close();
+    if (FAILED(hr))
+    {
+        Fail("async graphics capture command-list close", static_cast<unsigned int>(hr));
+        return false;
+    }
+    ID3D12CommandList *lists[] = {slot.capture_list.Get()};
+    g_command_queue->ExecuteCommandLists(1, lists);
+    return true;
+}
+
 static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pipeline_slot = -1)
 {
     const bool legacy_input = backbuffer == nullptr;
@@ -3754,7 +3945,8 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     ID3D12Resource *generated_output = pipeline_slot.generated_output.Get();
     const bool ringed_d3d11_input = legacy_input &&
         g_present_api == reshade::api::device_api::d3d11;
-    ID3D12Resource *packed_color = ringed_d3d11_input ?
+    ID3D12Resource *packed_color = (ringed_d3d11_input ||
+        (g_async_compute_active && !legacy_input)) ?
         pipeline_slot.original_input.Get() : g_packed_color.Get();
     if (!packed_color)
     {
@@ -3789,6 +3981,13 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     ID3D12Resource *motion = use_external_guides ? g_captured_motion.Get() : g_fallback_motion.Get();
     ID3D12Resource *depth = use_external_guides ? g_captured_depth.Get() : g_fallback_depth.Get();
 
+    if (!legacy_input && g_async_compute_active &&
+        !CaptureAsyncD3D12Backbuffer(pipeline_slot, backbuffer, packed_color))
+    {
+        pipeline_slot.state.store(PipelineSlotFree, std::memory_order_release);
+        return false;
+    }
+
     if (!BeginNeuralFrameCommands(slot_index)) return false;
     ID3D12GraphicsCommandList *commands = NeuralCommandList();
     const bool record_gpu_telemetry = g_performance_telemetry_enabled && InitializeGpuTelemetry();
@@ -3798,7 +3997,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
             NeuralCommandList()->EndQuery(g_telemetry_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, index);
     };
     timestamp(0);
-    if (!legacy_input)
+    if (!legacy_input && !g_async_compute_active)
     {
         D3D12_RESOURCE_BARRIER copy_begin[2] = {
             Transition(backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -3845,7 +4044,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
         commands->ResourceBarrier(guide_count, guide_barriers);
     }
 
-    if (!use_external_guides)
+    if (!use_external_guides && !g_async_compute_active)
     {
         D3D12_RESOURCE_BARRIER guides_to_rtv[2] = {
             Transition(motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
@@ -3865,7 +4064,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
         };
         commands->ResourceBarrier(2, guides_to_srv);
     }
-    else if (g_stable_sr_history)
+    else if (use_external_guides && g_stable_sr_history && !g_async_compute_active)
     {
         // The stable SR path deliberately does not consume VORT motion. Keep
         // its dedicated motion texture deterministically zero after every
@@ -3990,7 +4189,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     }
     commands->ResourceBarrier(restore_count, restore);
 
-    if (!ringed_d3d11_input)
+    if (!ringed_d3d11_input && pipeline_slot.original_input.Get() != packed_color)
     {
         // Preserve the exact source frame used by this NGX submission. F10 and
         // overlay composition can sample it without racing the next capture.
@@ -4008,6 +4207,15 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
         };
         commands->ResourceBarrier(2, snapshot_end);
     }
+    else if (!legacy_input && g_async_compute_active)
+    {
+        // The per-slot capture texture is both the NGX input and the immutable
+        // raw-frame source used by F10. Hand it to the graphics compositor in
+        // COMMON state after compute finishes; no redundant snapshot is needed.
+        D3D12_RESOURCE_BARRIER input_to_common = Transition(packed_color,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        commands->ResourceBarrier(1, &input_to_common);
+    }
     timestamp(5);
     if (record_gpu_telemetry)
         commands->ResolveQueryData(g_telemetry_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
@@ -4022,7 +4230,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     if (legacy_input)
     {
         const UINT64 done = ++g_legacy_fence_value;
-        if (FAILED(g_command_queue->Signal(g_legacy_fence12.Get(), done)))
+        if (FAILED(NeuralSubmissionQueue()->Signal(g_legacy_fence12.Get(), done)))
         {
             pipeline_slot.state.store(PipelineSlotAbandoned, std::memory_order_release);
             return false;
@@ -6171,10 +6379,14 @@ static int ClaimOldestReadyPipelineSlot()
 {
     int selected = -1;
     unsigned long long oldest = ~0ull;
+    const UINT64 neural_completed = g_async_compute_active && g_neural_fence ?
+        g_neural_fence->GetCompletedValue() : ~0ull;
     for (UINT index = 0; index < kPipelineFrameSlotCount; ++index)
     {
         PipelineFrameSlot &slot = g_pipeline_slots[index];
-        if (slot.state.load(std::memory_order_acquire) == PipelineSlotReady && slot.sequence < oldest)
+        if (slot.state.load(std::memory_order_acquire) == PipelineSlotReady &&
+            (!g_async_compute_active || neural_completed >= slot.neural_fence_value) &&
+            slot.sequence < oldest)
         {
             selected = static_cast<int>(index);
             oldest = slot.sequence;
@@ -6184,6 +6396,25 @@ static int ClaimOldestReadyPipelineSlot()
     unsigned int expected = PipelineSlotReady;
     return g_pipeline_slots[selected].state.compare_exchange_strong(expected, PipelineSlotPresentRecording,
         std::memory_order_acq_rel, std::memory_order_acquire) ? selected : -1;
+}
+
+static void ArmAsyncProxyWakeForNeuralCompletion()
+{
+    if (!g_async_compute_active || !g_neural_fence || !g_proxy_present_event) return;
+    const UINT64 completed = g_neural_fence->GetCompletedValue();
+    UINT64 next_completion = ~0ull;
+    for (PipelineFrameSlot &slot : g_pipeline_slots)
+    {
+        if (slot.state.load(std::memory_order_acquire) == PipelineSlotReady &&
+            slot.neural_fence_value > completed)
+            next_completion = std::min(next_completion, slot.neural_fence_value);
+    }
+    if (next_completion == ~0ull) return;
+    const HRESULT hr = g_neural_fence->SetEventOnCompletion(
+        next_completion, g_proxy_present_event);
+    if (FAILED(hr))
+        Log("failed to arm async compositor wake for neural fence %llu: 0x%08X",
+            next_completion, static_cast<unsigned int>(hr));
 }
 
 static int AcquireProxyCommandSlot()
@@ -6223,6 +6454,13 @@ static bool PresentProxyFrameOnWorker(UINT slot_index)
         real_source
     };
     const UINT present_count = use_framegen ? 2u : 1u;
+    if (g_async_compute_active && g_synchronous_proxy_presentation &&
+        pipeline_slot.neural_fence_value != 0 &&
+        FAILED(g_command_queue->Wait(g_neural_fence.Get(), pipeline_slot.neural_fence_value)))
+    {
+        Log("proxy graphics queue failed to wait for async NGX output");
+        return false;
+    }
 
     LARGE_INTEGER wait_begin = {}, wait_end = {};
     // Command allocators, lists and descriptors are independently ringed. Do
@@ -6455,7 +6693,15 @@ static DWORD WINAPI ProxyPresentationThread(void *)
         while (true)
         {
             const int slot_index = ClaimOldestReadyPipelineSlot();
-            if (slot_index < 0) break;
+            if (slot_index < 0)
+            {
+                // A frame can be CPU-ready before its compute submission has
+                // reached the fence. Wake this worker from the fence itself;
+                // otherwise a full ring produces no new Present callback to
+                // signal the mailbox and the last displayed frame freezes.
+                ArmAsyncProxyWakeForNeuralCompletion();
+                break;
+            }
             g_proxy_present_request_state.store(2, std::memory_order_release);
 
             LARGE_INTEGER worker_begin = {}, worker_end = {};
@@ -7626,6 +7872,24 @@ static void DrawOverlay(reshade::api::effect_runtime *)
             g_nr_enabled ? "NR + DLSS SR + FG" : "DLSS SR + FG only");
     }
     ImGui::TextDisabled("Off skips NR evaluation; DLSS Super Resolution and optional Frame Generation remain active.");
+    bool async_compute = g_async_compute_requested;
+    if (ImGui::Checkbox("Asynchronous NGX compute (experimental)", &async_compute))
+    {
+        g_async_compute_requested = async_compute;
+        g_async_compute_restart_required = g_neural_device != nullptr &&
+            g_async_compute_requested != g_async_compute_active;
+        reshade::set_config_value(nullptr, section, "AsyncComputePipeline",
+            g_async_compute_requested ? "1" : "0");
+        Log("asynchronous NGX compute requested=%s active=%s restart_required=%s",
+            g_async_compute_requested ? "yes" : "no",
+            g_async_compute_active ? "yes" : "no",
+            g_async_compute_restart_required ? "yes" : "no");
+    }
+    ImGui::TextDisabled("Runs NR, DLSS/DLAA, and FG on a separate compute queue so game graphics can overlap it.");
+    ImGui::TextDisabled("Prototype option; disabled by default. Restart the game after changing it.%s",
+        g_async_compute_restart_required ? " RESTART REQUIRED." : "");
+    if (g_neural_ready)
+        ImGui::TextDisabled("Current NGX queue: %s", g_async_compute_active ? "asynchronous compute" : "graphics/direct");
     ImGui::TextUnformatted("DLSS-NR model:");
     bool model_changed = false;
     int selected_model = g_nr_model;
@@ -7952,6 +8216,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("StableSrHistory", "0", value, sizeof(value)); g_stable_sr_history = strcmp(value, "0") != 0;
         read_setting("VortGuides", "0", value, sizeof(value)); g_vort_guides_enabled = strcmp(value, "0") != 0;
         read_setting("NeuralRendering", "1", value, sizeof(value)); g_nr_enabled = strcmp(value, "0") != 0;
+        read_setting("AsyncComputePipeline", "0", value, sizeof(value)); g_async_compute_requested = strcmp(value, "0") != 0;
         read_setting("FrameGeneration", "1", value, sizeof(value)); g_framegen_enabled = strcmp(value, "0") != 0;
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
@@ -7976,9 +8241,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             reshade::set_config_value(nullptr, section, "SynchronousProxyPresentation", "1");
         }
         g_requested_synchronous_proxy_presentation = g_synchronous_proxy_presentation;
-        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s DLSS_render_preset=%s model=%d style=%u NR=%s NR-mask=%s strength=%.2f VORT=%s early_proxy=%s auto_presentation=%s windowed_virtualization=%s logical_client=%s input_coordinates=%s detached_output=%s detached_cursor=%s opaque_composition=%s presenter=%s telemetry=%s",
+        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s DLSS_render_preset=%s model=%d style=%u NR=%s async_compute=%s NR-mask=%s strength=%.2f VORT=%s early_proxy=%s auto_presentation=%s windowed_virtualization=%s logical_client=%s input_coordinates=%s detached_output=%s detached_cursor=%s opaque_composition=%s presenter=%s telemetry=%s",
             ADDON_VERSION, ProfileName(g_color_profile), DlssRenderPresetName(g_dlss_render_preset),
             g_nr_model, NrStyle(), g_nr_enabled ? "enabled" : "disabled",
+            g_async_compute_requested ? "requested" : "disabled",
             g_nr_rejection_mask_enabled ? "enabled" : "disabled", g_nr_rejection_mask_strength,
             g_vort_guides_enabled ? "enabled" : "disabled",
             g_early_proxy_initialization ? "enabled" : "disabled",
@@ -8097,11 +8363,18 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             slot.original_input.Reset();
             slot.list.Reset();
             slot.allocator.Reset();
+            slot.capture_list.Reset();
+            slot.capture_allocator.Reset();
             slot.state.store(PipelineSlotFree, std::memory_order_release);
         }
         g_active_neural_list = nullptr;
         g_neural_list.Reset(); g_neural_allocator.Reset(); g_neural_fence.Reset(); g_neural_device.Reset();
         if (g_neural_fence_event) CloseHandle(g_neural_fence_event);
+        if (g_async_input_fence_event) CloseHandle(g_async_input_fence_event);
+        g_async_input_fence_event = nullptr;
+        g_async_input_fence.Reset();
+        g_async_compute_queue.Reset();
+        g_async_compute_active = false;
         if (g_command_queue) g_command_queue->Release();
         CloseSharedPerformanceTelemetry();
         reshade::unregister_addon(module);
