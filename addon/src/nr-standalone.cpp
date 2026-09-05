@@ -556,6 +556,30 @@ static bool IsDlaaMode()
         g_resource_input_height == g_resource_output_height;
 }
 
+static bool IsNearNativeWindowedSurface(UINT input_width, UINT input_height,
+    UINT display_width, UINT display_height)
+{
+    if (input_width == 0 || input_height == 0 || display_width == 0 || display_height == 0 ||
+        input_width > display_width || input_height > display_height)
+        return false;
+
+    // DPI virtualization and ordinary non-client borders can make a game that
+    // was configured for native resolution expose a backbuffer a few percent
+    // smaller than the monitor. This margin is below conventional DLSS render
+    // scales, but covers maximized bordered windows at common DPI values.
+    const bool close_width = static_cast<UINT64>(input_width) * 100 >=
+        static_cast<UINT64>(display_width) * 97;
+    const bool close_height = static_cast<UINT64>(input_height) * 100 >=
+        static_cast<UINT64>(display_height) * 97;
+    const UINT64 input_aspect = static_cast<UINT64>(input_width) * display_height;
+    const UINT64 display_aspect = static_cast<UINT64>(display_width) * input_height;
+    const UINT64 aspect_delta = input_aspect > display_aspect ?
+        input_aspect - display_aspect : display_aspect - input_aspect;
+    const bool matching_aspect = aspect_delta * 1000 <=
+        std::max<UINT64>(input_aspect, display_aspect) * 5;
+    return close_width && close_height && matching_aspect;
+}
+
 static const char *SrModeName()
 {
     return IsDlaaMode() ? "DLAA" : "DLSS SR";
@@ -2786,7 +2810,11 @@ static bool ResourceContractIsStable(UINT iw, UINT ih, UINT ow, UINT oh, DXGI_FO
 static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format)
 {
     if (g_neural_failed || !g_command_queue) return false;
-    const UINT ow = g_output_width.load(), oh = g_output_height.load();
+    const UINT display_width = g_output_width.load(), display_height = g_output_height.load();
+    const bool near_native_window = IsNearNativeWindowedSurface(
+        iw, ih, display_width, display_height);
+    const UINT ow = near_native_window ? iw : display_width;
+    const UINT oh = near_native_window ? ih : display_height;
     input_format = TypedInputFormat(input_format);
     if (iw == 0 || ih == 0 || ow == 0 || oh == 0) return false;
     if (!ResourceContractIsStable(iw, ih, ow, oh, input_format)) return false;
@@ -2802,6 +2830,10 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
         return false;
     }
     if (g_neural_ready) return true;
+
+    if (near_native_window && (iw != display_width || ih != display_height))
+        Log("near-native window surface normalized to DLAA: game=%ux%u monitor=%ux%u; compositor handles final border/DPI stretch",
+            iw, ih, display_width, display_height);
 
     if (!g_neural_device)
     {
@@ -5501,12 +5533,8 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
         return false;
     }
     if (source != nullptr && (source_desc.Width != width || source_desc.Height != height))
-    {
-        static bool logged = false;
-        if (!logged) { Log("native presentation waiting: captured NR resource is %llux%u, expected %ux%u",
-            source_desc.Width, source_desc.Height, width, height); logged = true; }
-        return false;
-    }
+        Log("native compositor scaling processed surface %llux%u to presentation target %ux%u",
+            source_desc.Width, source_desc.Height, width, height);
 
     HMONITOR monitor = MonitorFromWindow(g_game_window, MONITOR_DEFAULTTONEAREST);
     MONITORINFOEXW monitor_info = {};
