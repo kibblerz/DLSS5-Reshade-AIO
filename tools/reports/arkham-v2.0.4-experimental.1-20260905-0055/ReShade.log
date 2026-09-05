@@ -1,0 +1,286 @@
+00:54:11:214 [360996] | INFO  | Initializing crosire's ReShade version '6.8.0.2155' (64-bit) loaded from 'C:\Program Files (x86)\Steam\steamapps\common\Batman Arkham Knight\Binaries\Win64\DXGI.dll' into 'C:\Program Files (x86)\Steam\steamapps\common\Batman Arkham Knight\Binaries\Win64\BatmanAK.exe' (0x4A2297E4) ...
+00:54:11:276 [360996] | INFO  | Registering hooks for 'user32.dll' ...
+00:54:11:276 [360996] | INFO  | > Libraries loaded.
+00:54:11:277 [360996] | INFO  | > Found 21 match(es). Installing ...
+00:54:11:334 [360996] | INFO  | Registering hooks for 'C:\WINDOWS\system32\dinput.dll' ...
+00:54:11:335 [360996] | INFO  | > Delayed.
+00:54:11:335 [360996] | INFO  | Registering hooks for 'C:\WINDOWS\system32\dinput8.dll' ...
+00:54:11:335 [360996] | INFO  | > Libraries loaded.
+00:54:11:335 [360996] | INFO  | > Found 2 match(es). Installing ...
+00:54:11:396 [360996] | INFO  | Registering hooks for 'C:\WINDOWS\system32\d2d1.dll' ...
+00:54:11:396 [360996] | INFO  | > Delayed.
+00:54:11:396 [360996] | INFO  | Registering hooks for 'C:\WINDOWS\system32\d3d9.dll' ...
+00:54:11:396 [360996] | INFO  | > Libraries loaded.
+00:54:11:396 [360996] | INFO  | > Found 11 match(es). Installing ...
+00:54:11:456 [360996] | INFO  | Registering hooks for 'C:\WINDOWS\system32\d3d10.dll' ...
+00:54:11:456 [360996] | INFO  | > Delayed.
+00:54:11:456 [360996] | INFO  | Registering hooks for 'C:\WINDOWS\system32\d3d10_1.dll' ...
+00:54:11:457 [360996] | INFO  | > Delayed.
+00:54:11:457 [360996] | INFO  | Registering hooks for 'C:\WINDOWS\system32\d3d11.dll' ...
+00:54:11:458 [360996] | INFO  | > Delayed.
+00:54:11:458 [360996] | INFO  | Registering hooks for 'C:\WINDOWS\system32\d3d12.dll' ...
+00:54:11:458 [360996] | INFO  | > Delayed.
+00:54:11:458 [360996] | INFO  | Registering hooks for 'C:\WINDOWS\system32\dxgi.dll' ...
+00:54:11:458 [360996] | INFO  | > Delayed until first call to an exported function.
+00:54:11:459 [360996] | INFO  | Registering hooks for 'openvr_api.dll' ...
+00:54:11:459 [360996] | INFO  | > Delayed.
+00:54:11:459 [360996] | INFO  | Initialized.
+00:54:11:459 [360996] | INFO  | Redirecting CreateDXGIFactory1(riid = {770AAE78-F26F-4DBA-A829-253C83D1B387}, ppFactory = 000000000057EEF0) ...
+00:54:11:460 [360996] | INFO  | Installing export hooks for 'C:\WINDOWS\system32\dxgi.dll' ...
+00:54:11:463 [360996] | INFO  | > Found 5 match(es). Installing ...
+00:54:11:871 [360996] | INFO  | Redirecting CreateDXGIFactory1(riid = {7B7166EC-21C7-44AE-B21A-C9AE321AE369}, ppFactory = 000000000057E438) ...
+00:54:11:942 [359256] | WARN  | Ignoring LoadLibrary('api-ms-win-appmodel-runtime-l1-1-2') call to avoid possible deadlock.
+00:54:11:942 [360996] | WARN  | Ignoring LoadLibrary('cryptnet.dll') call to avoid possible deadlock.
+00:54:11:944 [361620] | WARN  | Ignoring LoadLibrary('msasn1.dll') call to avoid possible deadlock.
+00:54:11:945 [361620] | WARN  | Ignoring LoadLibrary('cryptnet.dll') call to avoid possible deadlock.
+00:54:11:946 [360996] | WARN  | Ignoring LoadLibrary('devobj.dll') call to avoid possible deadlock.
+00:54:11:946 [361620] | WARN  | Ignoring LoadLibrary('wldp.dll') call to avoid possible deadlock.
+00:54:11:947 [360996] | WARN  | Ignoring LoadLibrary('kernel32.dll') call to avoid possible deadlock.
+00:54:11:950 [360352] | WARN  | Ignoring LoadLibrary('api-ms-win-appmodel-runtime-l1-1-2') call to avoid possible deadlock.
+00:54:11:950 [361568] | WARN  | Ignoring LoadLibrary('api-ms-win-appmodel-runtime-l1-1-2') call to avoid possible deadlock.
+00:54:11:991 [361620] | WARN  | Ignoring LoadLibrary('kernel32') call to avoid possible deadlock.
+00:54:11:991 [360996] | INFO  | Redirecting CreateDXGIFactory1(riid = {7B7166EC-21C7-44AE-B21A-C9AE321AE369}, ppFactory = 000000000057F948) ...
+00:54:11:993 [362132] | WARN  | Ignoring LoadLibrary('api-ms-win-appmodel-runtime-l1-1-2') call to avoid possible deadlock.
+00:54:11:994 [360996] | WARN  | Ignoring LoadLibrary('C:\WINDOWS\system32\nvapi64.dll') call to avoid possible deadlock.
+00:54:12:087 [360996] | INFO  | Redirecting RegisterClassExW(lpWndClassEx = 000000000057F750 { "LaunchUnrealUWindowsClient", style = 0x20 }) ...
+00:54:12:195 [358832] | INFO  | Redirecting RegisterClassW(lpWndClass = 000000001E2AFD30 { "SplashScreenClass", style = 0x3 }) ...
+00:54:12:195 [358832] | INFO  | > Adding 'CS_OWNDC' window class style flag to "SplashScreenClass".
+00:54:16:984 [360996] | INFO  | Redirecting DirectInput8Create(hinst = 00007FF76B650000, dwVersion = 800, riidltf = {BF798031-483A-4DA2-AA99-5D64ED369700}, ppvOut = 00007FF76F146DC8, pUnkOuter = 0000000000000000) ...
+00:54:17:064 [360996] | INFO  | Redirecting IDirectInput8W::CreateDevice(this = 000000000DCFE3F0, rguid = {6F1D2B60-D5A0-11CF-BFC7-444553540000}, lplpDirectInputDevice = 00007FF76F146DC0, pUnkOuter = 0000000000000000) ...
+00:54:18:155 [360996] | INFO  | Installing delayed hooks for 'C:\WINDOWS\system32\d3d11.dll' (Just loaded via LoadLibrary('d3d11.dll')) ...
+00:54:18:155 [360996] | INFO  | > Found 3 match(es). Installing ...
+00:54:18:225 [360996] | INFO  | Redirecting D3D11CreateDevice(pAdapter = 0000000019ED1080, DriverType = 0, Software = 0000000000000000, Flags = 0, pFeatureLevels = 0000000006BED01C, FeatureLevels = 1, SDKVersion = 7, ppDevice = 0000000006BECF5C, pFeatureLevel = 000000000057CD58, ppImmediateContext = 000000006AA84430) ...
+00:54:18:225 [360996] | INFO  | > Passing on to D3D11CreateDeviceAndSwapChain:
+00:54:18:225 [360996] | INFO  | Redirecting D3D11CreateDeviceAndSwapChain(pAdapter = 0000000019ED1080, DriverType = 0, Software = 0000000000000000, Flags = 0, pFeatureLevels = 0000000006BED01C, FeatureLevels = 1, SDKVersion = 7, pSwapChainDesc = 0000000000000000, ppSwapChain = 0000000000000000, ppDevice = 0000000006BECF5C, pFeatureLevel = 000000000057CD58, ppImmediateContext = 000000006AA84430) ...
+00:54:18:225 [360996] | INFO  | Searching for add-ons (*.addon, *.addon64) in 'C:\Program Files (x86)\Steam\steamapps\common\Batman Arkham Knight\Binaries\Win64' ...
+00:54:18:226 [360996] | INFO  | Loading add-on from 'C:\Program Files (x86)\Steam\steamapps\common\Batman Arkham Knight\Binaries\Win64\standalone-dlssnr.addon64' ...
+00:54:18:231 [360996] | INFO  | Registered add-on "Standalone DLSS-NR + SR 2.0.4-experimental.1" v0.0.0.0 using ReShade API version 20.
+00:54:18:232 [360996] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] Standalone DLSS-NR + SR 2.0.4-experimental.1 attached; requested profile=Auto DLSS_render_preset=K model=3 style=2 NR=enabled NR-mask=disabled strength=1.00 VORT=disabled early_proxy=disabled auto_presentation=enabled windowed_virtualization=disabled logical_client=disabled input_coordinates=native-client detached_output=disabled detached_cursor=visible opaque_composition=disabled presenter=asynchronous telemetry=enabled
+00:54:18:234 [360996] | INFO  | Installing delayed hooks for 'C:\WINDOWS\system32\d3d12.dll' (Just loaded via LoadLibrary('C:\Program Files (x86)\Steam\steamapps\common\Batman Arkham Knight\Binaries\Win64\standalone-dlssnr.addon64')) ...
+00:54:18:235 [360996] | INFO  | > Found 8 match(es). Installing ...
+00:54:18:484 [360996] | WARN  | Ignoring LoadLibrary('msasn1.dll') call to avoid possible deadlock.
+00:54:18:485 [360996] | WARN  | Ignoring LoadLibrary('cryptnet.dll') call to avoid possible deadlock.
+00:54:18:725 [360996] | INFO  | Redirecting CreateDXGIFactory1(riid = {770AAE78-F26F-4DBA-A829-253C83D1B387}, ppFactory = 00000000005799F8) ...
+00:54:18:757 [360996] | INFO  | Using feature level b000.
+00:54:20:416 [360996] | INFO  | Redirecting IDXGIFactory::CreateSwapChain(this = 0000000019EC0AE0, pDevice = 000000007F443C10, pDesc = 000000000057D0C0, ppSwapChain = 000000006AA844A8) ...
+00:54:20:416 [360996] | INFO  | > Dumping swap chain description:
+00:54:20:416 [360996] | INFO  |   +-----------------------------------------+-----------------------------------------+
+00:54:20:416 [360996] | INFO  |   | Parameter                               | Value                                   |
+00:54:20:416 [360996] | INFO  |   +-----------------------------------------+-----------------------------------------+
+00:54:20:417 [360996] | INFO  |   | Width                                   | 2560                                    |
+00:54:20:417 [360996] | INFO  |   | Height                                  | 1440                                    |
+00:54:20:417 [360996] | INFO  |   | RefreshRate                             | 0                   0                   |
+00:54:20:417 [360996] | INFO  |   | Format                                  | DXGI_FORMAT_R8G8B8A8_UNORM              |
+00:54:20:417 [360996] | INFO  |   | ScanlineOrdering                        | 0                                       |
+00:54:20:418 [360996] | INFO  |   | Scaling                                 | 0                                       |
+00:54:20:418 [360996] | INFO  |   | SampleCount                             | 1                                       |
+00:54:20:418 [360996] | INFO  |   | SampleQuality                           | 0                                       |
+00:54:20:418 [360996] | INFO  |   | BufferUsage                             | 0x430                                   |
+00:54:20:418 [360996] | INFO  |   | BufferCount                             | 1                                       |
+00:54:20:418 [360996] | INFO  |   | OutputWindow                            | 0000000001C70AAC                        |
+00:54:20:418 [360996] | INFO  |   | Windowed                                | TRUE                                    |
+00:54:20:418 [360996] | INFO  |   | SwapEffect                              | 0                                       |
+00:54:20:419 [360996] | INFO  |   | Flags                                   | 0x2                                     |
+00:54:20:419 [360996] | INFO  |   +-----------------------------------------+-----------------------------------------+
+00:54:20:424 [360996] | INFO  | Running on NVIDIA GeForce RTX 4080 Driver 616.56.
+00:54:20:622 [360996] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] color profile resolved at init_swapchain: requested=Auto swapchain=sRGB nonlinear / BT.709 fmt=28 active=sRGB
+00:54:20:622 [360996] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] adopted primary swapchain: render=2560x1440 client=1914x1040 monitor=3840x2160 hwnd=0000000001C70AAC mode=reduced borderless/windowed
+00:54:20:624 [360996] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] current-frame guide handles: VORT=MISSING feed=MISSING mv=MISSING depth=MISSING sr_mask=optional/missing nr_mask=optional/missing strength=optional/missing depth_reversed=1
+00:54:20:624 [360996] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] same-frame optical-flow path unavailable; internal zero-motion fallback will be used
+00:54:20:624 [360996] | INFO  | Recreated runtime environment on runtime 000000018E4A9790 ('C:\Program Files (x86)\Steam\steamapps\common\Batman Arkham Knight\Binaries\Win64\ReShade.ini').
+00:54:20:654 [359316] | INFO  | Redirecting ID3D11Device::CreateDeferredContext(this = 000000007F443C10, ContextFlags = 0, ppDeferredContext = 000000006AA87130) ...
+00:54:20:664 [359228] | INFO  | Redirecting ID3D11Device::CreateDeferredContext(this = 000000007F443C10, ContextFlags = 0, ppDeferredContext = 000000006AA87F70) ...
+00:54:20:675 [359328] | INFO  | Redirecting ID3D11Device::CreateDeferredContext(this = 000000007F443C10, ContextFlags = 0, ppDeferredContext = 000000006AA87A70) ...
+00:54:20:686 [359324] | INFO  | Redirecting ID3D11Device::CreateDeferredContext(this = 000000007F443C10, ContextFlags = 0, ppDeferredContext = 000000006AA877F0) ...
+00:54:20:697 [360476] | INFO  | Redirecting ID3D11Device::CreateDeferredContext(this = 000000007F443C10, ContextFlags = 0, ppDeferredContext = 000000006AA873B0) ...
+00:54:20:863 [359288] | INFO  | Redirecting D3D12CreateDevice(pAdapter = 0000000019FA65D0, MinimumFeatureLevel = b000, riid = {189819F1-1DB6-4B57-BE54-1821339B85F7}, ppDevice = 000000003684F188) ...
+00:54:20:867 [359288] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0x80000000, riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000003684EAF8) ...
+00:54:20:927 [359288] | INFO  | Redirecting CreateDXGIFactory1(riid = {770AAE78-F26F-4DBA-A829-253C83D1B387}, ppFactory = 000000003684CD28) ...
+00:54:20:979 [359288] | INFO  | Redirecting ID3D12Device::CreateCommandQueue(this = 0000000195FEB000, pDesc = 000000003684F1A8, riid = {0EC870A6-5D7E-4C22-8CFC-5BAAE07616ED}, ppCommandQueue = 00007FFA6BDC7D60) ...
+00:54:20:979 [359288] | INFO  | > Dumping command queue description:
+00:54:20:979 [359288] | INFO  |   +-----------------------------------------+-----------------------------------------+
+00:54:20:979 [359288] | INFO  |   | Parameter                               | Value                                   |
+00:54:20:979 [359288] | INFO  |   +-----------------------------------------+-----------------------------------------+
+00:54:20:980 [359288] | INFO  |   | Type                                    | 0                                       |
+00:54:20:980 [359288] | INFO  |   | Priority                                | 0                                       |
+00:54:20:980 [359288] | INFO  |   | Flags                                   | 0                                       |
+00:54:20:980 [359288] | INFO  |   | NodeMask                                | 0                                       |
+00:54:20:980 [359288] | INFO  |   +-----------------------------------------+-----------------------------------------+
+00:54:21:008 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] observed D3D12 graphics queue: reshade=00000001073EB0D8 native=0000000154B6BD50
+00:54:21:008 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] legacy interop session ready: api=D3D11 D3D11=000000001A209C40 D3D12 queue=00000001073EB0D0 shared fence=000000018F97DA80
+00:54:21:009 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] presentation contract candidate: 2560x1440 -> 3840x2160 fmt=28; waiting for stability
+00:54:21:009 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] current-frame guide handles: VORT=MISSING feed=MISSING mv=MISSING depth=MISSING sr_mask=optional/missing nr_mask=optional/missing strength=optional/missing depth_reversed=1
+00:54:21:009 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] same-frame optical-flow path unavailable; internal zero-motion fallback will be used
+00:54:21:029 [355436] | INFO  | Successfully compiled 'C:\Program Files (x86)\Steam\steamapps\common\Batman Arkham Knight\Binaries\Win64\reshade-shaders\Shaders\DLSS5_AIO_Feed.fx' in 0.018000 s.
+00:54:21:962 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance telemetry ready: asynchronous D3D12 timestamps at 1000000000 Hz
+00:54:21:963 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] legacy D3D12->D3D11 texture failed: 0x80070057; trying D3D11->D3D12
+00:54:21:965 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] legacy shared texture using D3D11->D3D12 fallback: 2560x1440 fmt=28
+00:54:21:966 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] legacy D3D12->D3D11 texture failed: 0x80070057; trying D3D11->D3D12
+00:54:21:967 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] legacy shared texture using D3D11->D3D12 fallback: 2560x1440 fmt=28
+00:54:21:968 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] legacy D3D12->D3D11 texture failed: 0x80070057; trying D3D11->D3D12
+00:54:21:969 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] legacy shared texture using D3D11->D3D12 fallback: 2560x1440 fmt=28
+00:54:21:970 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] legacy D3D12->D3D11 texture failed: 0x80070057; trying D3D11->D3D12
+00:54:21:971 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] legacy shared texture using D3D11->D3D12 fallback: 2560x1440 fmt=28
+00:54:21:972 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] legacy D3D12->D3D11 texture failed: 0x80070057; trying D3D11->D3D12
+00:54:21:973 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] legacy shared texture using D3D11->D3D12 fallback: 2560x1440 fmt=34
+00:54:21:974 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] legacy D3D12->D3D11 texture failed: 0x80070057; trying D3D11->D3D12
+00:54:21:975 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] legacy shared texture using D3D11->D3D12 fallback: 2560x1440 fmt=41
+00:54:21:976 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] legacy D3D12->D3D11 texture failed: 0x80070057; trying D3D11->D3D12
+00:54:21:976 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] legacy shared texture using D3D11->D3D12 fallback: 2560x1440 fmt=61
+00:54:21:978 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] legacy D3D12->D3D11 texture failed: 0x80070057; trying D3D11->D3D12
+00:54:21:979 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] legacy shared texture using D3D11->D3D12 fallback: 2560x1440 fmt=61
+00:54:21:979 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] legacy shared frame resources ready: api=D3D11 2560x1440 fmt=28
+00:54:21:988 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] runtime set candidate: C:\Program Files (x86)\Steam\steamapps\common\Batman Arkham Knight\Binaries\Win64\ [NR=yes SR=yes FG=yes bridge=yes]
+00:54:21:989 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] selected coherent standalone runtime set: C:\Program Files (x86)\Steam\steamapps\common\Batman Arkham Knight\Binaries\Win64\
+00:54:21:989 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] runtime dependency: C:\Program Files (x86)\Steam\steamapps\common\Batman Arkham Knight\Binaries\Win64\nvngx_dlssnr.dll (165830144 bytes)
+00:54:21:989 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] runtime dependency: C:\Program Files (x86)\Steam\steamapps\common\Batman Arkham Knight\Binaries\Win64\nvngx_dlss.dll (58956400 bytes)
+00:54:21:989 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] runtime dependency: C:\Program Files (x86)\Steam\steamapps\common\Batman Arkham Knight\Binaries\Win64\nvngx.dll (10240 bytes)
+00:54:21:990 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] runtime dependency: C:\Program Files (x86)\Steam\steamapps\common\Batman Arkham Knight\Binaries\Win64\nvngx_dlssg.dll (7519856 bytes)
+00:54:22:016 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] NGX core: LoadLibraryExW(C:\WINDOWS\system32\DriverStore\FileRepository\nvmdi.inf_amd64_2a2ad8a2999ce85b\_nvngx.dll) -> 00007FFA16EE0000 error=0
+00:54:22:767 [359288] | WARN  | Ignoring LoadLibrary('api-ms-win-core-synch-l1-2-0') call to avoid possible deadlock.
+00:54:22:966 [359288] | INFO  | Redirecting CreateDXGIFactory1(riid = {7B7166EC-21C7-44AE-B21A-C9AE321AE369}, ppFactory = 000000003684D690) ...
+00:54:23:236 [359288] | WARN  | Ignoring LoadLibrary('msasn1.dll') call to avoid possible deadlock.
+00:54:23:237 [364280] | WARN  | Ignoring LoadLibrary('cryptnet.dll') call to avoid possible deadlock.
+00:54:23:238 [364280] | WARN  | Ignoring LoadLibrary('cryptbase.dll') call to avoid possible deadlock.
+00:54:23:238 [359288] | WARN  | Ignoring LoadLibrary('wldp.dll') call to avoid possible deadlock.
+00:54:23:239 [359288] | WARN  | Ignoring LoadLibrary('drvstore.dll') call to avoid possible deadlock.
+00:54:23:240 [364280] | WARN  | Ignoring LoadLibrary('devobj.dll') call to avoid possible deadlock.
+00:54:23:376 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] driver-core Init(app=0x876232C) = 0x00000001 (Success)
+00:54:23:516 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] NR snippet Init_Ext = 0x00000001 (Success)
+00:54:23:518 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] DLSS SR snippet Init_Ext = 0x00000001 (Success)
+00:54:23:519 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] DLSS-G snippet Init_Ext = 0x00000001 (Success)
+00:54:23:520 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] driver-core GetCapabilityParameters = 0x00000001 (Success), ptr=000000100F8D36E0
+00:54:23:520 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] NR PopulateParameters_Impl = 0x00000001 (Success)
+00:54:23:520 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] NR scaling callback get=0x00000001 ptr=00007FF990C22E80
+00:54:23:520 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] NR creation PopulateParameters_Impl = 0x00000001 (Success)
+00:54:23:521 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] NR provider scaling ratio result=0x00000001 (Success), resolved=1.000000
+00:54:24:025 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] CreateFeature(feature=18) = 0x00000001 (Success), handle=00000010101C36A0
+00:54:24:126 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] CreateFeature(feature=SuperSampling) = 0x00000001 (Success), handle=00000001874A0210 mode=DLSS SR quality=2 (Quality) render_preset=K(11)
+00:54:24:126 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] DLSS-G PopulateParameters_Impl = 0x00000001 (Success)
+00:54:24:200 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] CreateFeature(feature=FrameGeneration) = 0x00000001 (Success), handle=000000100D8172B0
+00:54:24:200 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] standalone contract ready: NR=feature 18 active at 2560x1440, DLSS SR (Quality preset K) -> 3840x2160, DLSS-G=ready, model=3 style=2, profile=sRGB
+00:54:24:201 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] resources ready on present: compact packed/NR=2560x1440, DLSS SR=3840x2160, input fmt=28 result fmt=28; fallback guides=2560x1440; buffered pipeline slots=3
+00:54:24:201 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] resolution configuration active without restart: input=2560x1440 output=3840x2160 mode=DLSS SR
+00:54:24:242 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] on-present frame 1: NR=Success, DLSS SR=Success, model=3, NR-reset=1, NR-guides=fallback, NR-control-mask=none strength=1.00, SR-history=temporal/VORT, DLSS history mask=none, input=2560x1440, output=3840x2160
+00:54:24:242 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] proxy target monitor: device=\\.\DISPLAY10 desktop=3840x2160 refresh=120Hz position=(0,0)-(3840,2160) primary=yes
+00:54:24:242 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] same-window compositor initialization: mode=Present fallback source=3840x2160 source_format=28 present_format=28 queue=00000001073EB0D0 game_window=0000000001C70AAC target_window=0000000001C70AAC
+00:54:24:243 [359288] | INFO  | Redirecting CreateDXGIFactory1(riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000003684EC00) ...
+00:54:24:245 [359288] | INFO  | Redirecting IDXGIFactory2::CreateSwapChainForComposition(this = 000000101AC88600, pDevice = 00000001073EB0D0, pDesc = 000000003684ECC8, pRestrictToOutput = 0000000000000000, ppSwapChain = ) ...
+00:54:24:246 [359288] | INFO  | > Dumping swap chain description:
+00:54:24:246 [359288] | INFO  |   +-----------------------------------------+-----------------------------------------+
+00:54:24:246 [359288] | INFO  |   | Parameter                               | Value                                   |
+00:54:24:246 [359288] | INFO  |   +-----------------------------------------+-----------------------------------------+
+00:54:24:246 [359288] | INFO  |   | Width                                   | 3840                                    |
+00:54:24:246 [359288] | INFO  |   | Height                                  | 2160                                    |
+00:54:24:246 [359288] | INFO  |   | Format                                  | DXGI_FORMAT_R8G8B8A8_UNORM              |
+00:54:24:247 [359288] | INFO  |   | Stereo                                  | FALSE                                   |
+00:54:24:247 [359288] | INFO  |   | SampleCount                             | 1                                       |
+00:54:24:247 [359288] | INFO  |   | SampleQuality                           | 0                                       |
+00:54:24:247 [359288] | INFO  |   | BufferUsage                             | 0x20                                    |
+00:54:24:247 [359288] | INFO  |   | BufferCount                             | 3                                       |
+00:54:24:247 [359288] | INFO  |   | SwapEffect                              | 3                                       |
+00:54:24:247 [359288] | INFO  |   | AlphaMode                               | 1                                       |
+00:54:24:247 [359288] | INFO  |   | Flags                                   | 0x40                                    |
+00:54:24:248 [359288] | INFO  |   +-----------------------------------------+-----------------------------------------+
+00:54:24:257 [359288] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0, riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000003684E4A0) ...
+00:54:24:259 [359288] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0, riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000003684E4A0) ...
+00:54:24:263 [359288] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0, riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000003684E4A0) ...
+00:54:24:265 [359288] | INFO  | Redirecting CreateDXGIFactory2(Flags = 0, riid = {1BC6EA02-EF36-464F-BF0C-21CA39E5168A}, ppFactory = 000000003684E4A0) ...
+00:54:24:270 [359288] | INFO  | Running on NVIDIA GeForce RTX 4080 Driver 616.56.
+00:54:24:272 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] ignored helper swapchain: hwnd=0000000000000000 surface=3840x2160
+00:54:24:276 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] ignored helper ReShade runtime: hwnd=0000000000000000 surface=3840x2160
+00:54:24:276 [359288] | INFO  | Recreated runtime environment on runtime 000000018E4B94E0 ('C:\Program Files (x86)\Steam\steamapps\common\Batman Arkham Knight\Binaries\Win64\ReShade2.ini').
+00:54:24:278 [359288] | INFO  | Redirecting IDXGISwapChain3::SetColorSpace1(ColorSpace = 0) ...
+00:54:24:278 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] native proxy sRGB/BT.709 color space: hr=0x00000000
+00:54:24:280 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] proxy telemetry ready: compositor GPU timestamps at 1000000000 Hz
+00:54:24:323 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] same-window compositor ready: 3840x2160 source_format=28 present_format=28 game_hwnd=0000000001C70AAC target_hwnd=0000000001C70AAC ownership=attached/game-HWND alpha=premultiplied input_owner=game DWM_paced=yes presenter=asynchronous/worker buffers=3 max_latency=2
+00:54:24:324 [364352] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] async proxy presentation worker started
+00:54:24:325 [364352] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] ignored HWND-less composition swapchain Present
+00:54:24:334 [364352] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] post-ReShade native presentation active; effects and overlay are available to the proxy compositor
+00:54:24:338 [364356] | INFO  | Successfully compiled 'C:\Program Files (x86)\Steam\steamapps\common\Batman Arkham Knight\Binaries\Win64\reshade-shaders\Shaders\DLSS5_AIO_Feed.fx' in 0.012000 s.
+00:54:25:004 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] on-present frame 2: NR=Success, DLSS SR=Success, model=3, NR-reset=0, NR-guides=fallback, NR-control-mask=none strength=1.00, SR-history=temporal/VORT, DLSS history mask=none, input=2560x1440, output=3840x2160
+00:54:25:005 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance telemetry: source=4 fps avg=133.117ms p99=3042.397ms max=3042.397ms; proxy=0 fps; addon CPU current=2.368ms avg=261.519ms peak=2363.837ms; GPU prep=0.041ms NR=9.000ms DLSS SR=1.704ms FG=2.334ms cleanup=0.000ms total=13.082ms; skips neural=0 proxy=0; async coalesced=0 timeouts=0
+00:54:25:005 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance guides: GPU VORT=0.000ms feed/masks=0.000ms total=0.000ms samples=0 available=0; CPU record VORT=0.000ms feed=0.000ms flush=0.000ms
+00:54:25:006 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance proxy: GPU generated=0.000ms real=0.000ms pair=0.000ms samples=0 available=0; CPU mailbox=0.005ms fence_wait=0.000ms swap_wait=0.000ms Present=9.574ms worker=10.480ms peak=10.480ms; requests=1 completed=1 coalesced=0 timeouts=0 display_backpressure=0; neural deferrals presenter=0 GPU=0
+00:54:25:006 [364352] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] ignored HWND-less composition swapchain Present
+00:54:25:020 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] on-present frame 3: NR=Success, DLSS SR=Success, model=3, NR-reset=0, NR-guides=fallback, NR-control-mask=none strength=1.00, SR-history=temporal/VORT, DLSS history mask=none, input=2560x1440, output=3840x2160
+00:54:25:022 [364352] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] ignored HWND-less composition swapchain Present
+00:54:25:024 [364352] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] experimental DLSS-G presentation active: generated frame then real frame, uncapped flip cadence, tearing=unavailable
+00:54:25:026 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] on-present frame 4: NR=Success, DLSS SR=Success, model=3, NR-reset=0, NR-guides=fallback, NR-control-mask=none strength=1.00, SR-history=temporal/VORT, DLSS history mask=none, input=2560x1440, output=3840x2160
+00:54:25:029 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] D3D11 capture skipped: all shared input slots are occupied (skip=1)
+00:54:25:034 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] D3D11 capture skipped: all shared input slots are occupied (skip=2)
+00:54:25:042 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] D3D11 capture skipped: all shared input slots are occupied (skip=3)
+00:54:25:045 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] D3D11 capture skipped: all shared input slots are occupied (skip=4)
+00:54:25:048 [364352] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] native proxy activated after 3 consecutive completed frames
+00:54:25:054 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] source capture discontinuity observed without forcing an NGX history reset: previous=33 current=38 gap=4 count=1
+00:54:25:106 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] on-present frame 5: NR=Success, DLSS SR=Success, model=3, NR-reset=0, NR-guides=fallback, NR-control-mask=none strength=1.00, SR-history=temporal/VORT, DLSS history mask=none, input=2560x1440, output=3840x2160
+00:54:25:111 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] on-present frame 6: NR=Success, DLSS SR=Success, model=3, NR-reset=0, NR-guides=fallback, NR-control-mask=none strength=1.00, SR-history=temporal/VORT, DLSS history mask=none, input=2560x1440, output=3840x2160
+00:54:25:114 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] on-present frame 7: NR=Success, DLSS SR=Success, model=3, NR-reset=0, NR-guides=fallback, NR-control-mask=none strength=1.00, SR-history=temporal/VORT, DLSS history mask=none, input=2560x1440, output=3840x2160
+00:54:25:120 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] on-present frame 8: NR=Success, DLSS SR=Success, model=3, NR-reset=0, NR-guides=fallback, NR-control-mask=none strength=1.00, SR-history=temporal/VORT, DLSS history mask=none, input=2560x1440, output=3840x2160
+00:54:25:122 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] D3D11 capture skipped: all shared input slots are occupied (skip=5)
+00:54:25:127 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] D3D11 capture skipped: all shared input slots are occupied (skip=6)
+00:54:25:133 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] D3D11 capture skipped: all shared input slots are occupied (skip=7)
+00:54:25:137 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] D3D11 capture skipped: all shared input slots are occupied (skip=8)
+00:54:25:144 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] source capture discontinuity observed without forcing an NGX history reset: previous=41 current=46 gap=4 count=2
+00:54:25:187 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] source capture discontinuity observed without forcing an NGX history reset: previous=46 current=55 gap=8 count=3
+00:54:25:213 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] source capture discontinuity observed without forcing an NGX history reset: previous=55 current=61 gap=5 count=4
+00:54:25:232 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] source capture discontinuity observed without forcing an NGX history reset: previous=62 current=65 gap=2 count=5
+00:54:25:277 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] source capture discontinuity observed without forcing an NGX history reset: previous=65 current=75 gap=9 count=6
+00:54:25:301 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] source capture discontinuity observed without forcing an NGX history reset: previous=75 current=80 gap=4 count=7
+00:54:25:326 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] source capture discontinuity observed without forcing an NGX history reset: previous=81 current=86 gap=4 count=8
+00:54:28:566 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] D3D11 capture skipped: all shared input slots are occupied (skip=600)
+00:54:29:995 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance telemetry: source=190 fps avg=5.517ms p99=8.942ms max=31.396ms; proxy=78 fps; addon CPU current=0.955ms avg=0.231ms peak=2363.837ms; GPU prep=0.032ms NR=8.874ms DLSS SR=1.632ms FG=2.267ms cleanup=0.000ms total=12.806ms; skips neural=806 proxy=0; async coalesced=0 timeouts=0
+00:54:29:996 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance guides: GPU VORT=0.000ms feed/masks=0.000ms total=0.000ms samples=0 available=0; CPU record VORT=0.000ms feed=0.000ms flush=0.000ms
+00:54:29:996 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance proxy: GPU generated=0.135ms real=0.083ms pair=11.446ms samples=82 available=1; CPU mailbox=12.623ms fence_wait=0.000ms swap_wait=11.636ms Present=0.222ms worker=24.626ms peak=58.653ms; requests=211 completed=211 coalesced=0 timeouts=0 display_backpressure=0; neural deferrals presenter=0 GPU=806
+00:54:31:399 [364352] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] async proxy presenter timed out waiting for a swapchain slot (timeout=1)
+00:54:31:399 [364352] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] async proxy presentation request dropped safely (skip=1 slot=2)
+00:54:32:904 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] D3D11 capture skipped: all shared input slots are occupied (skip=1200)
+00:54:34:994 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance telemetry: source=174 fps avg=5.911ms p99=9.572ms max=10.091ms; proxy=78 fps; addon CPU current=0.017ms avg=0.213ms peak=2363.837ms; GPU prep=0.025ms NR=8.840ms DLSS SR=1.803ms FG=2.180ms cleanup=0.000ms total=12.850ms; skips neural=1481 proxy=1; async coalesced=0 timeouts=1
+00:54:34:995 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance guides: GPU VORT=0.000ms feed/masks=0.000ms total=0.000ms samples=0 available=0; CPU record VORT=0.000ms feed=0.000ms flush=0.000ms
+00:54:34:995 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance proxy: GPU generated=0.083ms real=0.065ms pair=17.524ms samples=155 available=1; CPU mailbox=8.455ms fence_wait=0.000ms swap_wait=11.169ms Present=0.147ms worker=22.991ms peak=58.653ms; requests=402 completed=400 coalesced=0 timeouts=1 display_backpressure=0; neural deferrals presenter=0 GPU=1481
+00:54:40:019 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance telemetry: source=30 fps avg=18.098ms p99=35.140ms max=341.603ms; proxy=60 fps; addon CPU current=0.684ms avg=0.779ms peak=2363.837ms; GPU prep=0.006ms NR=7.640ms DLSS SR=2.337ms FG=2.206ms cleanup=0.001ms total=12.185ms; skips neural=1673 proxy=1; async coalesced=0 timeouts=1
+00:54:40:019 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance guides: GPU VORT=0.000ms feed/masks=0.000ms total=0.000ms samples=0 available=0; CPU record VORT=0.000ms feed=0.000ms flush=0.000ms
+00:54:40:020 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance proxy: GPU generated=0.095ms real=0.110ms pair=0.219ms samples=271 available=1; CPU mailbox=0.009ms fence_wait=0.000ms swap_wait=0.004ms Present=0.238ms worker=0.657ms peak=58.653ms; requests=549 completed=548 coalesced=0 timeouts=1 display_backpressure=0; neural deferrals presenter=0 GPU=1673
+00:54:45:017 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance telemetry: source=30 fps avg=33.037ms p99=34.182ms max=35.140ms; proxy=60 fps; addon CPU current=0.774ms avg=0.950ms peak=2363.837ms; GPU prep=0.006ms NR=7.482ms DLSS SR=1.881ms FG=2.904ms cleanup=0.001ms total=12.269ms; skips neural=1673 proxy=1; async coalesced=0 timeouts=1
+00:54:45:017 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance guides: GPU VORT=0.000ms feed/masks=0.000ms total=0.000ms samples=0 available=0; CPU record VORT=0.000ms feed=0.000ms flush=0.000ms
+00:54:45:017 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance proxy: GPU generated=0.099ms real=0.111ms pair=0.224ms samples=422 available=1; CPU mailbox=0.008ms fence_wait=0.000ms swap_wait=0.004ms Present=0.153ms worker=0.536ms peak=58.653ms; requests=700 completed=699 coalesced=0 timeouts=1 display_backpressure=0; neural deferrals presenter=0 GPU=1673
+00:54:49:936 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] D3D11 capture skipped: all shared input slots are occupied (skip=1800)
+00:54:50:011 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance telemetry: source=118 fps avg=11.744ms p99=33.602ms max=58.004ms; proxy=87 fps; addon CPU current=1.452ms avg=0.663ms peak=2363.837ms; GPU prep=0.006ms NR=8.874ms DLSS SR=1.813ms FG=2.072ms cleanup=0.001ms total=12.760ms; skips neural=1805 proxy=1; async coalesced=0 timeouts=1
+00:54:50:011 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance guides: GPU VORT=0.000ms feed/masks=0.000ms total=0.000ms samples=0 available=0; CPU record VORT=0.000ms feed=0.000ms flush=0.000ms
+00:54:50:011 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance proxy: GPU generated=0.075ms real=0.083ms pair=14.456ms samples=544 available=1; CPU mailbox=6.666ms fence_wait=0.000ms swap_wait=8.456ms Present=0.157ms worker=20.261ms peak=58.653ms; requests=871 completed=869 coalesced=0 timeouts=1 display_backpressure=0; neural deferrals presenter=0 GPU=1805
+00:54:55:009 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance telemetry: source=120 fps avg=8.433ms p99=10.634ms max=11.179ms; proxy=90 fps; addon CPU current=1.725ms avg=0.766ms peak=2363.837ms; GPU prep=0.006ms NR=8.874ms DLSS SR=1.813ms FG=2.072ms cleanup=0.001ms total=12.760ms; skips neural=2173 proxy=1; async coalesced=0 timeouts=1
+00:54:55:010 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance guides: GPU VORT=0.000ms feed/masks=0.000ms total=0.000ms samples=0 available=0; CPU record VORT=0.000ms feed=0.000ms flush=0.000ms
+00:54:55:010 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance proxy: GPU generated=0.067ms real=0.083ms pair=13.445ms samples=627 available=1; CPU mailbox=5.804ms fence_wait=0.000ms swap_wait=7.993ms Present=0.164ms worker=19.159ms peak=58.653ms; requests=1091 completed=1089 coalesced=0 timeouts=1 display_backpressure=0; neural deferrals presenter=0 GPU=2173
+00:54:57:144 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] source capture discontinuity observed without forcing an NGX history reset: previous=3547 current=3549 gap=1 count=600
+00:54:57:504 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] primary ReShade overlay opened; same-window compositor transparent for direct game-window input
+00:55:00:014 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance telemetry: source=64 fps avg=12.994ms p99=16.917ms max=20.960ms; proxy=132 fps; addon CPU current=1.000ms avg=1.025ms peak=2363.837ms; GPU prep=0.006ms NR=8.874ms DLSS SR=1.813ms FG=2.072ms cleanup=0.001ms total=12.760ms; skips neural=2363 proxy=1; async coalesced=0 timeouts=1
+00:55:00:014 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance guides: GPU VORT=0.000ms feed/masks=0.000ms total=0.000ms samples=0 available=0; CPU record VORT=0.000ms feed=0.000ms flush=0.000ms
+00:55:00:015 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance proxy: GPU generated=0.115ms real=0.115ms pair=0.243ms samples=749 available=1; CPU mailbox=0.009ms fence_wait=0.000ms swap_wait=3.903ms Present=0.179ms worker=7.927ms peak=58.653ms; requests=1364 completed=1363 coalesced=0 timeouts=1 display_backpressure=0; neural deferrals presenter=0 GPU=2363
+00:55:05:015 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance telemetry: source=66 fps avg=15.326ms p99=17.244ms max=17.552ms; proxy=130 fps; addon CPU current=0.869ms avg=0.877ms peak=2363.837ms; GPU prep=0.006ms NR=8.874ms DLSS SR=1.813ms FG=2.072ms cleanup=0.001ms total=12.760ms; skips neural=2363 proxy=1; async coalesced=0 timeouts=1
+00:55:05:015 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance guides: GPU VORT=0.000ms feed/masks=0.000ms total=0.000ms samples=0 available=0; CPU record VORT=0.000ms feed=0.000ms flush=0.000ms
+00:55:05:016 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance proxy: GPU generated=0.115ms real=0.115ms pair=0.242ms samples=912 available=1; CPU mailbox=0.009ms fence_wait=0.000ms swap_wait=4.268ms Present=0.175ms worker=8.677ms peak=58.653ms; requests=1689 completed=1688 coalesced=0 timeouts=1 display_backpressure=0; neural deferrals presenter=0 GPU=2363
+00:55:05:493 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] primary ReShade overlay closed; same-window compositor restored for direct game-window input
+00:55:05:995 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] D3D11 capture skipped: all shared input slots are occupied (skip=2400)
+00:55:07:260 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] on-present frame 1800: NR=Success, DLSS SR=Success, model=3, NR-reset=0, NR-guides=fallback, NR-control-mask=none strength=1.00, SR-history=temporal/VORT, DLSS history mask=none, input=2560x1440, output=3840x2160
+00:55:10:008 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance telemetry: source=112 fps avg=8.802ms p99=11.188ms max=11.728ms; proxy=81 fps; addon CPU current=0.014ms avg=0.348ms peak=2363.837ms; GPU prep=0.006ms NR=8.874ms DLSS SR=1.813ms FG=2.072ms cleanup=0.001ms total=12.760ms; skips neural=2693 proxy=1; async coalesced=0 timeouts=1
+00:55:10:008 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance guides: GPU VORT=0.000ms feed/masks=0.000ms total=0.000ms samples=0 available=0; CPU record VORT=0.000ms feed=0.000ms flush=0.000ms
+00:55:10:009 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance proxy: GPU generated=0.096ms real=0.070ms pair=14.569ms samples=1001 available=1; CPU mailbox=8.295ms fence_wait=0.000ms swap_wait=10.575ms Present=0.165ms worker=21.233ms peak=58.653ms; requests=1916 completed=1914 coalesced=0 timeouts=1 display_backpressure=0; neural deferrals presenter=0 GPU=2693
+00:55:14:555 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] D3D11 capture skipped: all shared input slots are occupied (skip=3000)
+00:55:15:005 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance telemetry: source=96 fps avg=9.599ms p99=12.693ms max=13.188ms; proxy=82 fps; addon CPU current=0.013ms avg=0.562ms peak=2363.837ms; GPU prep=0.006ms NR=8.874ms DLSS SR=1.813ms FG=2.072ms cleanup=0.001ms total=12.760ms; skips neural=3023 proxy=1; async coalesced=0 timeouts=1
+00:55:15:006 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance guides: GPU VORT=0.000ms feed/masks=0.000ms total=0.000ms samples=0 available=0; CPU record VORT=0.000ms feed=0.000ms flush=0.000ms
+00:55:15:007 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance proxy: GPU generated=0.125ms real=0.099ms pair=14.765ms samples=1079 available=1; CPU mailbox=5.886ms fence_wait=0.000ms swap_wait=8.875ms Present=0.157ms worker=21.059ms peak=58.653ms; requests=2124 completed=2121 coalesced=0 timeouts=1 display_backpressure=0; neural deferrals presenter=0 GPU=3023
+00:55:20:010 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance telemetry: source=112 fps avg=8.714ms p99=12.943ms max=14.052ms; proxy=74 fps; addon CPU current=1.217ms avg=0.416ms peak=2363.837ms; GPU prep=0.006ms NR=8.874ms DLSS SR=1.813ms FG=2.072ms cleanup=0.001ms total=12.760ms; skips neural=3366 proxy=1; async coalesced=0 timeouts=1
+00:55:20:010 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance guides: GPU VORT=0.000ms feed/masks=0.000ms total=0.000ms samples=0 available=0; CPU record VORT=0.000ms feed=0.000ms flush=0.000ms
+00:55:20:010 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance proxy: GPU generated=0.240ms real=0.078ms pair=15.947ms samples=1151 available=1; CPU mailbox=7.982ms fence_wait=0.000ms swap_wait=11.599ms Present=0.152ms worker=24.216ms peak=58.653ms; requests=2319 completed=2318 coalesced=0 timeouts=1 display_backpressure=0; neural deferrals presenter=0 GPU=3366
+00:55:22:993 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] D3D11 capture skipped: all shared input slots are occupied (skip=3600)
+00:55:25:007 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance telemetry: source=48 fps avg=12.224ms p99=39.878ms max=638.806ms; proxy=54 fps; addon CPU current=0.012ms avg=0.371ms peak=2363.837ms; GPU prep=0.006ms NR=8.999ms DLSS SR=2.076ms FG=1.983ms cleanup=0.001ms total=13.059ms; skips neural=3692 proxy=1; async coalesced=0 timeouts=1
+00:55:25:007 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance guides: GPU VORT=0.000ms feed/masks=0.000ms total=0.000ms samples=0 available=0; CPU record VORT=0.000ms feed=0.000ms flush=0.000ms
+00:55:25:008 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance proxy: GPU generated=0.071ms real=0.276ms pair=9.064ms samples=1212 available=1; CPU mailbox=10.703ms fence_wait=0.000ms swap_wait=9.205ms Present=1.013ms worker=19.705ms peak=58.653ms; requests=2474 completed=2472 coalesced=0 timeouts=1 display_backpressure=0; neural deferrals presenter=0 GPU=3692
+00:55:27:442 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] source capture discontinuity observed without forcing an NGX history reset: previous=6601 current=6603 gap=1 count=1200
+00:55:29:028 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] D3D11 capture skipped: all shared input slots are occupied (skip=4200)
+00:55:30:010 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance telemetry: source=188 fps avg=5.564ms p99=8.595ms max=9.402ms; proxy=78 fps; addon CPU current=0.012ms avg=0.166ms peak=2363.837ms; GPU prep=0.006ms NR=9.837ms DLSS SR=1.963ms FG=1.926ms cleanup=0.001ms total=13.728ms; skips neural=4348 proxy=1; async coalesced=0 timeouts=1
+00:55:30:010 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance guides: GPU VORT=0.000ms feed/masks=0.000ms total=0.000ms samples=0 available=0; CPU record VORT=0.000ms feed=0.000ms flush=0.000ms
+00:55:30:010 [359288] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] performance proxy: GPU generated=0.074ms real=0.122ms pair=16.992ms samples=1291 available=1; CPU mailbox=10.718ms fence_wait=0.000ms swap_wait=11.946ms Present=0.141ms worker=24.254ms peak=58.653ms; requests=2676 completed=2674 coalesced=0 timeouts=1 display_backpressure=0; neural deferrals presenter=0 GPU=4348
+00:55:30:892 [360996] | INFO  | Redirecting IDXGISwapChain::SetFullscreenState(this = 0000000187EB1E70, Fullscreen = FALSE, pTarget = 0000000000000000) ...
+00:55:30:894 [360996] | INFO  | Destroyed runtime environment on runtime 000000018E4A9790 ('C:\Program Files (x86)\Steam\steamapps\common\Batman Arkham Knight\Binaries\Win64\ReShade.ini').
+00:55:31:261 [360996] | INFO  | [Standalone DLSS-NR + SR 2.0.4-experimental.1] startup recovery marker cleared: clean process shutdown

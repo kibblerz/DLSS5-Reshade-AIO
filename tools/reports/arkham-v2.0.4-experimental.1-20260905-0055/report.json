@@ -1,0 +1,22 @@
+{
+  "GeneratedUtc": "2026-09-05T04:57:18.6523690Z",
+  "TelemetrySegments": [],
+  "PresentMonSwapchains": [],
+  "AddonLogs": [
+    {
+      "File": "ReShade.log",
+      "Samples": 14,
+      "SourceFps": 96.57142857142857,
+      "ProxyFps": 77.42857142857143,
+      "AddonCpuMs": 0.7937142857142857,
+      "GpuPrepMs": 0.011714285714285719,
+      "GpuNrMs": 8.770714285714284,
+      "GpuSrMs": 1.863357142857143,
+      "GpuFgMs": 2.164571428571428,
+      "GpuCleanupMs": 0.000785714285714286,
+      "GpuTotalMs": 12.80707142857143,
+      "FinalNeuralSkips": 4348.0,
+      "FinalProxySkips": 1.0
+    }
+  ]
+}
