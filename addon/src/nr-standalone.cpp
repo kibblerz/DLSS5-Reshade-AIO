@@ -33,7 +33,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.5-async-pacing-prototype"
+#define ADDON_VERSION "2.0.5-async-pacing-dpi-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -7607,6 +7607,20 @@ static void OnInitSwapchain(reshade::api::swapchain *swapchain, bool)
         client_height + 2 < static_cast<LONG>(g_output_height.load());
     const bool client_tracks_surface = std::abs(client_width - static_cast<LONG>(width)) <= 2 &&
         std::abs(client_height - static_cast<LONG>(height)) <= 2;
+    // GetClientRect can be DPI-virtualized for older games even though the
+    // swapchain dimensions remain physical pixels. Batman Arkham Knight, for
+    // example, exposes a 2560x1440 backbuffer through a roughly 1914x1040
+    // client at 150% desktop scaling. Treat a uniformly scaled, similarly
+    // shaped client as tracking the surface rather than attaching a native 4K
+    // visual to that reduced HWND and leaving a clipped "glass pane".
+    const long long client_surface_area = static_cast<long long>(
+        std::max<LONG>(0, client_width)) * height;
+    const long long client_surface_aspect_error = std::llabs(
+        static_cast<long long>(client_width) * height -
+        static_cast<long long>(client_height) * width);
+    const bool client_tracks_surface_shape = client_width > 0 && client_height > 0 &&
+        client_surface_area > 0 &&
+        client_surface_aspect_error * 100 <= client_surface_area * 6;
     const LONG_PTR window_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
     const bool eligible_top_level = GetAncestor(hwnd, GA_ROOT) == hwnd &&
         (window_style & WS_CHILD) == 0;
@@ -7618,7 +7632,8 @@ static void OnInitSwapchain(reshade::api::swapchain *swapchain, bool)
     // detached compositor. Vulkan selects the same prepared presenter even at
     // native size so later mode changes can migrate without rebuilding it.
     const bool reduced_window_needs_detached = eligible_top_level &&
-        reduced_surface && reduced_client && client_tracks_surface;
+        reduced_surface && reduced_client &&
+        (client_tracks_surface || client_tracks_surface_shape);
     if (g_auto_windowed_virtualization && !g_windowed_virtualization_enabled &&
         (api == reshade::api::device_api::vulkan || reduced_window_needs_detached) &&
         !g_auto_detached_presentation_active.exchange(true))
@@ -7626,9 +7641,10 @@ static void OnInitSwapchain(reshade::api::swapchain *swapchain, bool)
         g_windowed_render_width = width;
         g_windowed_render_height = height;
         g_windowed_virtualization_window = hwnd;
-        Log("non-invasive automatic presenter selected: render=%ux%u client=%ldx%ld output=%ux%u api=%u host=detached game_window=untouched",
+        Log("non-invasive automatic presenter selected: render=%ux%u client=%ldx%ld output=%ux%u api=%u host=detached game_window=untouched client_match=%s",
             width, height, client_width, client_height, g_output_width.load(), g_output_height.load(),
-            static_cast<unsigned int>(api));
+            static_cast<unsigned int>(api),
+            client_tracks_surface ? "exact" : "DPI-scaled/aspect");
     }
 
     // Clean up an older automatic attached transaction if the runtime changes
