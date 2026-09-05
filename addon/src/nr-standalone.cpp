@@ -34,7 +34,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.14-pipelined-fg-prototype"
+#define ADDON_VERSION "2.0.15-phase-scheduled-fg-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -519,7 +519,9 @@ static std::atomic<unsigned long long> g_async_fg_overlap_frames{0};
 static std::atomic<unsigned long long> g_async_fg_busy_bypasses{0};
 static std::atomic<unsigned long long> g_async_fg_deadline_drops{0};
 static std::atomic<unsigned long long> g_async_fg_completed_in_time{0};
+static std::atomic<unsigned long long> g_async_fg_phase_waits{0};
 static std::atomic<bool> g_async_fg_reset_required{true};
+static std::atomic<bool> g_async_fg_phase_released{true};
 static Microsoft::WRL::ComPtr<ID3D12Fence> g_async_input_fence;
 static UINT64 g_async_input_fence_value;
 static HANDLE g_async_input_fence_event;
@@ -1504,7 +1506,7 @@ static void ResetPerformanceTelemetry()
     g_neural_dispatch_completion_qpc = 0;
     g_async_fg_submissions = 0; g_async_fg_overlap_frames = 0;
     g_async_fg_busy_bypasses = 0; g_async_fg_deadline_drops = 0;
-    g_async_fg_completed_in_time = 0;
+    g_async_fg_completed_in_time = 0; g_async_fg_phase_waits = 0;
     g_telemetry_samples = 0;
     g_guide_telemetry_samples = 0; g_proxy_telemetry_samples = 0;
     g_gpu_telemetry_available = false; g_guide_gpu_telemetry_available = false;
@@ -1773,14 +1775,6 @@ static UINT64 AsyncFgOutstandingJobs()
     if (!g_async_fg_fence || g_async_fg_fence_value == 0) return 0;
     const UINT64 completed = g_async_fg_fence->GetCompletedValue();
     return completed >= g_async_fg_fence_value ? 0 : g_async_fg_fence_value - completed;
-}
-
-static bool AsyncFgSubmissionCapacityAvailable()
-{
-    // One FG job may be executing while the next waits on its reconstruction
-    // fence. This keeps every real frame eligible at normal throughput without
-    // allowing slow FG work to form an unbounded latency queue.
-    return AsyncFgOutstandingJobs() < 2;
 }
 
 static LONGLONG AsyncFgDeadlineIntervalQpc()
@@ -4892,6 +4886,7 @@ static bool SubmitSplitFrameGeneration(PresentationFrameSlot &slot,
     }
     slot.fg_fence_value = fg_fence_value;
     slot.fg_telemetry_pending = telemetry;
+    g_async_fg_phase_released = false;
     ++g_async_fg_submissions;
     if (g_neural_fence->GetCompletedValue() < reconstruction_fence_value)
         ++g_async_fg_overlap_frames;
@@ -5159,7 +5154,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     const bool split_fg_path = evaluate_fg && completion_driven_dispatch &&
         mailbox_d3d11_input && SplitFrameGenerationEnabled() &&
         direct_reservation.index >= 0;
-    bool split_fg = split_fg_path && AsyncFgSubmissionCapacityAvailable();
+    bool split_fg = split_fg_path && AsyncFgGpuIdle();
     if (split_fg_path && !split_fg)
     {
         // A late generated frame has no value after its associated real frame.
@@ -7077,10 +7072,10 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
             g_neural_dispatch_submissions.load(),
             g_neural_dispatch_gap_us.load() / 1000.0f,
             g_neural_dispatch_gap_peak_us.load() / 1000.0f);
-        Log("performance pipelined FG: active=%u submissions=%llu outstanding=%llu overlap=%llu completed-in-window=%llu queue-pressure-bypasses=%llu deadline-drops=%llu FG_GPU=%.3fms reconstruction_GPU=%.3fms",
+        Log("performance phase-scheduled FG: active=%u submissions=%llu outstanding=%llu phase-waits=%llu completed-in-window=%llu queue-pressure-bypasses=%llu deadline-drops=%llu FG_GPU=%.3fms reconstruction_GPU=%.3fms",
             SplitFrameGenerationEnabled() ? 1u : 0u,
             g_async_fg_submissions.load(), AsyncFgOutstandingJobs(),
-            g_async_fg_overlap_frames.load(),
+            g_async_fg_phase_waits.load(),
             g_async_fg_completed_in_time.load(), g_async_fg_busy_bypasses.load(),
             g_async_fg_deadline_drops.load(),
             g_gpu_fg_us.load() / 1000.0f, g_gpu_total_us.load() / 1000.0f);
@@ -7678,6 +7673,9 @@ static int ClaimOldestReadyPresentationSlot()
             // retired by its own fence and is never displayed out of order.
             slot.has_generated_frame = false;
             g_async_fg_reset_required = true;
+            g_async_fg_phase_released = true;
+            if (g_neural_dispatch_wake_event)
+                SetEvent(g_neural_dispatch_wake_event);
             const unsigned long long drops = ++g_async_fg_deadline_drops;
             if (drops <= 8 || drops % 120 == 0)
                 Log("opportunistic FG missed display deadline; presenting real frame (drop=%llu sequence=%llu)",
@@ -8426,6 +8424,31 @@ static void ArmNeuralDispatcherForCompletion()
             g_neural_fence_value, static_cast<unsigned int>(hr));
 }
 
+static bool HoldNeuralDispatcherForFgPhase()
+{
+    if (AsyncFgGpuIdle())
+    {
+        g_async_fg_phase_released = true;
+        return false;
+    }
+    if (g_async_fg_phase_released.load(std::memory_order_acquire))
+        return false;
+    if (!g_async_fg_fence || !g_neural_dispatch_wake_event)
+        return false;
+
+    ++g_async_fg_phase_waits;
+    const HRESULT hr = g_async_fg_fence->SetEventOnCompletion(
+        g_async_fg_fence_value, g_neural_dispatch_wake_event);
+    if (FAILED(hr))
+    {
+        Log("phase-scheduled FG wake arm failed: fence=%llu hr=0x%08X; releasing neural work",
+            g_async_fg_fence_value, static_cast<unsigned int>(hr));
+        g_async_fg_phase_released = true;
+        return false;
+    }
+    return true;
+}
+
 static DWORD WINAPI NeuralDispatchThread(void *)
 {
     const HANDLE waits[4] = {g_neural_dispatch_stop_event, g_capture_ready_event,
@@ -8450,6 +8473,13 @@ static DWORD WINAPI NeuralDispatchThread(void *)
         ReclaimPresentationFrameSlots();
         if (!g_capture_mailbox_was_enabled.load(std::memory_order_acquire) ||
             !LegacyCaptureMailboxEnabled())
+            continue;
+
+        // NR/SR and FG use the same GPU execution resources. Let FG finish its
+        // short phase before admitting the next reconstruction, avoiding the
+        // severe cache/compute contention seen with simultaneous NGX queues.
+        // A presenter deadline miss explicitly releases this hold below.
+        if (HoldNeuralDispatcherForFgPhase())
             continue;
 
         // Submit exactly one temporal NGX job at a time. Unlike the old path,
