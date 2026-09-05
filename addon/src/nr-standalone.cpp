@@ -33,7 +33,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.8-bounded-neural-prototype"
+#define ADDON_VERSION "2.0.9-capture-mailbox-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -225,6 +225,14 @@ static std::atomic<unsigned long long> g_fg_admission_inflight_deferrals{0};
 static std::atomic<unsigned long long> g_fg_admission_capacity_deferrals{0};
 static LONGLONG g_fg_admission_next_qpc;
 static LONGLONG g_fg_admission_frequency;
+static std::atomic<unsigned long long> g_capture_mailbox_submissions{0};
+static std::atomic<unsigned long long> g_capture_mailbox_no_slot{0};
+static std::atomic<unsigned long long> g_capture_mailbox_stale_drops{0};
+static std::atomic<unsigned long long> g_capture_mailbox_consumed{0};
+static std::atomic<unsigned int> g_capture_mailbox_age_us{0};
+static std::atomic<unsigned int> g_capture_mailbox_age_peak_us{0};
+static std::atomic<unsigned int> g_capture_mailbox_source_age{0};
+static LONGLONG g_capture_mailbox_next_qpc;
 static std::atomic<unsigned long long> g_neural_presenter_deferrals{0};
 static std::atomic<unsigned long long> g_neural_gpu_deferrals{0};
 static std::atomic<unsigned long long> g_source_frame_sequence{0};
@@ -533,9 +541,51 @@ struct PipelineFrameSlot
     UINT64 async_input_fence_value = 0;
     unsigned long long sequence = 0;
     bool has_generated_frame = false;
+    bool input_dependency_satisfied = false;
     int presentation_slot_index = -1;
 };
 static PipelineFrameSlot g_pipeline_slots[kPipelineFrameSlotCount];
+static constexpr UINT kLegacyCaptureSlotCount = 5;
+enum LegacyCaptureSlotState : unsigned int
+{
+    LegacyCaptureSlotFree = 0,
+    LegacyCaptureSlotRecording = 1,
+    LegacyCaptureSlotQueued = 2,
+    LegacyCaptureSlotReserved = 3,
+    LegacyCaptureSlotNeuralReading = 4,
+};
+struct LegacyCaptureSlot
+{
+    Microsoft::WRL::ComPtr<ID3D12Resource> input12;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> input11;
+    std::atomic<unsigned int> state{LegacyCaptureSlotFree};
+    UINT64 capture_fence_value = 0;
+    UINT64 neural_fence_value = 0;
+    unsigned long long sequence = 0;
+    LARGE_INTEGER submitted_qpc = {};
+};
+static LegacyCaptureSlot g_legacy_capture_slots[kLegacyCaptureSlotCount];
+static UINT g_next_legacy_capture_slot;
+struct ScopedLegacyCaptureReservation
+{
+    int index = -1;
+    ~ScopedLegacyCaptureReservation()
+    {
+        if (index < 0 || index >= static_cast<int>(kLegacyCaptureSlotCount)) return;
+        unsigned int expected = LegacyCaptureSlotReserved;
+        g_legacy_capture_slots[index].state.compare_exchange_strong(expected,
+            LegacyCaptureSlotQueued, std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+    void Commit(UINT64 neural_fence_value)
+    {
+        if (index < 0 || index >= static_cast<int>(kLegacyCaptureSlotCount)) return;
+        LegacyCaptureSlot &slot = g_legacy_capture_slots[index];
+        slot.neural_fence_value = neural_fence_value;
+        slot.state.store(LegacyCaptureSlotNeuralReading, std::memory_order_release);
+        ++g_capture_mailbox_consumed;
+        index = -1;
+    }
+};
 enum PresentationFrameSlotState : unsigned int
 {
     PresentationSlotFree = 0,
@@ -1408,6 +1458,10 @@ static void ResetPerformanceTelemetry()
     g_fg_admission_deferrals = 0; g_fg_admission_inflight_deferrals = 0;
     g_fg_admission_capacity_deferrals = 0;
     g_fg_admission_next_qpc = 0;
+    g_capture_mailbox_submissions = 0; g_capture_mailbox_no_slot = 0;
+    g_capture_mailbox_stale_drops = 0; g_capture_mailbox_consumed = 0;
+    g_capture_mailbox_age_us = 0; g_capture_mailbox_age_peak_us = 0;
+    g_capture_mailbox_source_age = 0; g_capture_mailbox_next_qpc = 0;
     g_telemetry_samples = 0;
     g_guide_telemetry_samples = 0; g_proxy_telemetry_samples = 0;
     g_gpu_telemetry_available = false; g_guide_gpu_telemetry_available = false;
@@ -1662,6 +1716,99 @@ static bool DirectOutputHandoffEnabled()
         !g_synchronous_proxy_presentation;
 }
 
+static bool LegacyCaptureMailboxEnabled()
+{
+    return g_present_api == reshade::api::device_api::d3d11 &&
+        DirectOutputHandoffEnabled() && EffectiveFramegenEnabled() &&
+        !g_framegen_failed && !g_vort_guides_enabled;
+}
+
+static void ReclaimLegacyCaptureSlots()
+{
+    const UINT64 neural_completed = g_neural_fence ?
+        g_neural_fence->GetCompletedValue() : 0;
+    for (LegacyCaptureSlot &slot : g_legacy_capture_slots)
+    {
+        unsigned int state = slot.state.load(std::memory_order_acquire);
+        if (state == LegacyCaptureSlotNeuralReading &&
+            slot.neural_fence_value != 0 && neural_completed >= slot.neural_fence_value &&
+            slot.state.compare_exchange_strong(state, LegacyCaptureSlotFree,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+            slot.capture_fence_value = 0;
+            slot.neural_fence_value = 0;
+        }
+    }
+}
+
+static int ReserveNewestReadyLegacyCapture()
+{
+    if (!g_legacy_fence12) return -1;
+    ReclaimLegacyCaptureSlots();
+    const UINT64 capture_completed = g_legacy_fence12->GetCompletedValue();
+    int selected = -1;
+    unsigned long long newest_sequence = 0;
+    for (UINT index = 0; index < kLegacyCaptureSlotCount; ++index)
+    {
+        LegacyCaptureSlot &slot = g_legacy_capture_slots[index];
+        if (slot.state.load(std::memory_order_acquire) == LegacyCaptureSlotQueued &&
+            slot.capture_fence_value != 0 && capture_completed >= slot.capture_fence_value &&
+            slot.sequence >= newest_sequence)
+        {
+            selected = static_cast<int>(index);
+            newest_sequence = slot.sequence;
+        }
+    }
+    if (selected < 0) return -1;
+
+    unsigned int expected = LegacyCaptureSlotQueued;
+    if (!g_legacy_capture_slots[selected].state.compare_exchange_strong(expected,
+            LegacyCaptureSlotReserved, std::memory_order_acq_rel, std::memory_order_acquire))
+        return -1;
+
+    // The mailbox deliberately keeps only the freshest completed capture.
+    for (UINT index = 0; index < kLegacyCaptureSlotCount; ++index)
+    {
+        if (index == static_cast<UINT>(selected)) continue;
+        LegacyCaptureSlot &slot = g_legacy_capture_slots[index];
+        unsigned int queued = LegacyCaptureSlotQueued;
+        if (slot.capture_fence_value != 0 && capture_completed >= slot.capture_fence_value &&
+            slot.sequence < newest_sequence &&
+            slot.state.compare_exchange_strong(queued, LegacyCaptureSlotFree,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+            ++g_capture_mailbox_stale_drops;
+            slot.capture_fence_value = 0;
+            slot.neural_fence_value = 0;
+        }
+    }
+
+    LegacyCaptureSlot &slot = g_legacy_capture_slots[selected];
+    if (g_performance_telemetry_enabled)
+    {
+        LARGE_INTEGER now = {};
+        if (QueryPerformanceCounter(&now))
+        {
+            const unsigned int age = CounterDeltaMicroseconds(slot.submitted_qpc, now);
+            SmoothMicroseconds(g_capture_mailbox_age_us, age);
+            RecordPeakMicroseconds(g_capture_mailbox_age_peak_us, age);
+        }
+    }
+    const unsigned long long current = g_source_frame_sequence.load(std::memory_order_acquire);
+    g_capture_mailbox_source_age.store(static_cast<unsigned int>(
+        std::min<unsigned long long>(current >= slot.sequence ? current - slot.sequence : 0,
+            UINT_MAX)), std::memory_order_relaxed);
+    return selected;
+}
+
+static void ReturnReservedLegacyCapture(int index)
+{
+    if (index < 0 || index >= static_cast<int>(kLegacyCaptureSlotCount)) return;
+    unsigned int expected = LegacyCaptureSlotReserved;
+    g_legacy_capture_slots[index].state.compare_exchange_strong(expected,
+        LegacyCaptureSlotQueued, std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
 static void ReclaimPipelineFrameSlots()
 {
     const UINT64 neural_completed = g_neural_fence ? g_neural_fence->GetCompletedValue() : 0;
@@ -1704,6 +1851,7 @@ static int AcquirePipelineFrameSlot()
             g_next_pipeline_slot = (index + 1) % kPipelineFrameSlotCount;
             g_pipeline_slots[index].neural_fence_value = 0;
             g_pipeline_slots[index].proxy_fence_value.store(0, std::memory_order_release);
+            g_pipeline_slots[index].input_dependency_satisfied = false;
             g_pipeline_slots[index].presentation_slot_index = -1;
             return static_cast<int>(index);
         }
@@ -1858,6 +2006,16 @@ static bool BeginNeuralFrameCommands(UINT slot_index)
 static bool QueueAsyncInputDependency(PipelineFrameSlot &slot)
 {
     if (!g_async_compute_active) return true;
+    if (slot.input_dependency_satisfied)
+    {
+        // Preserve an explicit cross-API GPU dependency even though the CPU has
+        // already observed this capture fence. Because it is complete, this
+        // wait establishes resource visibility without creating queue latency.
+        return slot.async_input_fence_value == 0 ||
+            (g_legacy_fence12 && g_async_compute_queue &&
+                SUCCEEDED(g_async_compute_queue->Wait(
+                    g_legacy_fence12.Get(), slot.async_input_fence_value)));
+    }
     if (!g_command_queue || !g_async_compute_queue || !g_async_input_fence) return false;
     const UINT64 value = ++g_async_input_fence_value;
     HRESULT hr = g_command_queue->Signal(g_async_input_fence.Get(), value);
@@ -2687,6 +2845,26 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
         }
     }
 
+    ReclaimLegacyCaptureSlots();
+    const UINT64 legacy_completed = g_legacy_fence12 ? g_legacy_fence12->GetCompletedValue() : 0;
+    for (LegacyCaptureSlot &slot : g_legacy_capture_slots)
+    {
+        unsigned int state = slot.state.load(std::memory_order_acquire);
+        if (state == LegacyCaptureSlotQueued && slot.capture_fence_value != 0 &&
+            legacy_completed >= slot.capture_fence_value)
+        {
+            slot.state.compare_exchange_strong(state, LegacyCaptureSlotFree,
+                std::memory_order_acq_rel, std::memory_order_acquire);
+            state = slot.state.load(std::memory_order_acquire);
+        }
+        if (state != LegacyCaptureSlotFree)
+        {
+            Log("resolution reconfiguration deferred: capture mailbox slot still active (state=%u sequence=%llu)",
+                state, slot.sequence);
+            return false;
+        }
+    }
+
     // The async presenter may still be between selecting a slot and submitting
     // its sampling commands. Defer retirement until that short CPU section is
     // complete; the per-slot proxy fence then covers GPU ownership.
@@ -2767,6 +2945,7 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
         slot.neural_fence_value = 0;
         slot.proxy_fence_value = 0;
         slot.async_input_fence_value = 0;
+        slot.input_dependency_satisfied = false;
         slot.presentation_slot_index = -1;
     }
     for (PresentationFrameSlot &slot : g_presentation_slots)
@@ -2784,6 +2963,8 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
         slot.ready_qpc = {};
     }
     g_next_presentation_slot = 0;
+    g_next_legacy_capture_slot = 0;
+    g_capture_mailbox_next_qpc = 0;
     g_pending_pipeline_slot = -1;
     g_post_reshade_color.Reset(); g_post_reshade_color_ready = false;
     g_packed_color.Reset();
@@ -2814,6 +2995,18 @@ static void ReleaseLegacyFrameResources()
     g_legacy_input9.Reset(); g_legacy_post9.Reset();
     g_legacy_input9_11.Reset(); g_legacy_post9_11.Reset();
     g_legacy_input11.Reset(); g_legacy_post11.Reset(); g_legacy_post12.Reset();
+    for (LegacyCaptureSlot &slot : g_legacy_capture_slots)
+    {
+        slot.input11.Reset();
+        slot.input12.Reset();
+        slot.capture_fence_value = 0;
+        slot.neural_fence_value = 0;
+        slot.sequence = 0;
+        slot.submitted_qpc = {};
+        slot.state.store(LegacyCaptureSlotFree, std::memory_order_release);
+    }
+    g_next_legacy_capture_slot = 0;
+    g_capture_mailbox_next_qpc = 0;
     for (PipelineFrameSlot &slot : g_pipeline_slots)
     {
         slot.legacy_input11.Reset();
@@ -3240,6 +3433,18 @@ static bool BuildLegacyFrameResources(UINT width, UINT height, DXGI_FORMAT forma
                     slot.original_input, slot.legacy_input11))
                 return false;
         }
+        for (LegacyCaptureSlot &slot : g_legacy_capture_slots)
+        {
+            if (!CreateSharedPair11(width, height, format, slot.input12, slot.input11))
+                return false;
+            slot.capture_fence_value = 0;
+            slot.neural_fence_value = 0;
+            slot.sequence = 0;
+            slot.submitted_qpc = {};
+            slot.state.store(LegacyCaptureSlotFree, std::memory_order_release);
+        }
+        g_next_legacy_capture_slot = 0;
+        g_capture_mailbox_next_qpc = 0;
         // Preserve legacy readiness probes; actual frame copies and NGX reads
         // select the independently owned resource for the acquired slot.
         g_packed_color = g_pipeline_slots[0].original_input;
@@ -3344,6 +3549,96 @@ static bool CopyLegacyFrameToD3D12(void *native_resource, bool post_effects, int
     if (FAILED(g_legacy_context4->Signal(g_legacy_fence11.Get(), value))) return false;
     g_legacy_context11->Flush();
     if (FAILED(g_command_queue->Wait(g_legacy_fence12.Get(), value))) return false;
+    return true;
+}
+
+static bool CaptureLegacyFrameToMailbox(void *native_resource)
+{
+    if (!LegacyCaptureMailboxEnabled() || !native_resource || !g_legacy_context11 ||
+        !g_legacy_context4 || !g_legacy_fence11 || !g_legacy_fence12)
+        return false;
+
+    LARGE_INTEGER now = {};
+    if (QueryPerformanceCounter(&now) && g_proxy_refresh_hz >= 24)
+    {
+        if (g_fg_admission_frequency <= 0)
+        {
+            LARGE_INTEGER frequency = {};
+            if (QueryPerformanceFrequency(&frequency) && frequency.QuadPart > 0)
+                g_fg_admission_frequency = frequency.QuadPart;
+        }
+        if (g_fg_admission_frequency > 0)
+        {
+            if (g_capture_mailbox_next_qpc != 0 && now.QuadPart < g_capture_mailbox_next_qpc)
+                return false;
+        }
+    }
+
+    ReclaimLegacyCaptureSlots();
+    int selected = -1;
+    for (UINT offset = 0; offset < kLegacyCaptureSlotCount; ++offset)
+    {
+        const UINT index = (g_next_legacy_capture_slot + offset) % kLegacyCaptureSlotCount;
+        unsigned int expected = LegacyCaptureSlotFree;
+        if (g_legacy_capture_slots[index].state.compare_exchange_strong(expected,
+                LegacyCaptureSlotRecording, std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+            selected = static_cast<int>(index);
+            g_next_legacy_capture_slot = (index + 1) % kLegacyCaptureSlotCount;
+            break;
+        }
+    }
+    if (selected < 0)
+    {
+        ++g_capture_mailbox_no_slot;
+        return false;
+    }
+
+    LegacyCaptureSlot &slot = g_legacy_capture_slots[selected];
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> source11;
+    HRESULT hr = reinterpret_cast<IUnknown *>(native_resource)->QueryInterface(
+        IID_PPV_ARGS(&source11));
+    if (SUCCEEDED(hr) && slot.input11)
+        g_legacy_context11->CopyResource(slot.input11.Get(), source11.Get());
+    else if (SUCCEEDED(hr))
+        hr = E_POINTER;
+    const UINT64 value = ++g_legacy_fence_value;
+    if (SUCCEEDED(hr)) hr = g_legacy_context4->Signal(g_legacy_fence11.Get(), value);
+    if (SUCCEEDED(hr)) g_legacy_context11->Flush();
+    if (FAILED(hr))
+    {
+        slot.state.store(LegacyCaptureSlotFree, std::memory_order_release);
+        Log("D3D11 capture mailbox submission failed: 0x%08X", static_cast<unsigned int>(hr));
+        return false;
+    }
+
+    slot.capture_fence_value = value;
+    slot.neural_fence_value = 0;
+    slot.sequence = g_source_frame_sequence.load(std::memory_order_acquire);
+    slot.submitted_qpc = now;
+    slot.state.store(LegacyCaptureSlotQueued, std::memory_order_release);
+    ++g_capture_mailbox_submissions;
+
+    if (g_fg_admission_frequency > 0 && now.QuadPart != 0 && g_proxy_refresh_hz >= 24)
+    {
+        const LONGLONG interval = std::max<LONGLONG>(1,
+            (g_fg_admission_frequency * 2 + g_proxy_refresh_hz / 2) /
+                static_cast<LONGLONG>(g_proxy_refresh_hz));
+        if (g_capture_mailbox_next_qpc == 0 ||
+            now.QuadPart - g_capture_mailbox_next_qpc > interval * 2)
+            g_capture_mailbox_next_qpc = now.QuadPart + interval;
+        else
+        {
+            do
+                g_capture_mailbox_next_qpc += interval;
+            while (g_capture_mailbox_next_qpc <= now.QuadPart);
+        }
+    }
+
+    static std::atomic<bool> logged_capture_mailbox{false};
+    if (!logged_capture_mailbox.exchange(true, std::memory_order_acq_rel))
+        Log("D3D11 capture mailbox active: slots=%u target=%.1fHz; NGX consumes only completed newest inputs",
+            kLegacyCaptureSlotCount, g_proxy_refresh_hz * 0.5f);
     return true;
 }
 
@@ -3547,6 +3842,7 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
         slot.neural_fence_value = 0;
         slot.proxy_fence_value = 0;
         slot.async_input_fence_value = 0;
+        slot.input_dependency_satisfied = false;
         slot.sequence = 0;
         slot.has_generated_frame = false;
         slot.presentation_slot_index = -1;
@@ -4197,9 +4493,17 @@ static bool CaptureAsyncD3D12Backbuffer(PipelineFrameSlot &slot,
     return true;
 }
 
-static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pipeline_slot = -1)
+static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pipeline_slot = -1,
+    int prepared_capture_slot = -1)
 {
     const bool legacy_input = backbuffer == nullptr;
+    ScopedLegacyCaptureReservation capture_reservation;
+    capture_reservation.index = prepared_capture_slot;
+    const bool mailbox_d3d11_input = prepared_capture_slot >= 0 &&
+        prepared_capture_slot < static_cast<int>(kLegacyCaptureSlotCount) &&
+        g_legacy_capture_slots[prepared_capture_slot].state.load(std::memory_order_acquire) ==
+            LegacyCaptureSlotReserved;
+    if (prepared_capture_slot >= 0 && !mailbox_d3d11_input) return false;
     if ((!legacy_input && !EnsureStandaloneResources(backbuffer)) || (legacy_input && !g_neural_ready)) return false;
     if (g_feature_recreate_requested.load())
     {
@@ -4224,21 +4528,28 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
         return false;
     PipelineFrameSlot &pipeline_slot = g_pipeline_slots[slot_index];
     if (pipeline_slot.state.load(std::memory_order_acquire) != PipelineSlotRecording) return false;
+    pipeline_slot.input_dependency_satisfied = mailbox_d3d11_input;
+    if (mailbox_d3d11_input)
+        pipeline_slot.async_input_fence_value =
+            g_legacy_capture_slots[prepared_capture_slot].capture_fence_value;
     ID3D12Resource *real_output = pipeline_slot.real_output.Get();
     ID3D12Resource *generated_output = pipeline_slot.generated_output.Get();
     ID3D12Resource *original_snapshot = pipeline_slot.original_input.Get();
     ScopedPresentationReservation direct_reservation;
-    const bool ringed_d3d11_input = legacy_input &&
+    const bool ringed_d3d11_input = legacy_input && !mailbox_d3d11_input &&
         g_present_api == reshade::api::device_api::d3d11;
-    ID3D12Resource *packed_color = (ringed_d3d11_input ||
-        (g_async_compute_active && !legacy_input)) ?
-        pipeline_slot.original_input.Get() : g_packed_color.Get();
+    ID3D12Resource *packed_color = mailbox_d3d11_input ?
+        g_legacy_capture_slots[prepared_capture_slot].input12.Get() :
+        ((ringed_d3d11_input || (g_async_compute_active && !legacy_input)) ?
+            pipeline_slot.original_input.Get() : g_packed_color.Get());
     if (!packed_color)
     {
         pipeline_slot.state.store(PipelineSlotFree, std::memory_order_release);
         return false;
     }
-    const unsigned long long source_sequence = g_source_frame_sequence.load(std::memory_order_acquire);
+    const unsigned long long source_sequence = mailbox_d3d11_input ?
+        g_legacy_capture_slots[prepared_capture_slot].sequence :
+        g_source_frame_sequence.load(std::memory_order_acquire);
     if (g_last_neural_source_sequence != 0 && source_sequence > g_last_neural_source_sequence + 1)
     {
         const unsigned long long discontinuities = ++g_temporal_discontinuities;
@@ -4252,7 +4563,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     bool use_external_guides = false;
     if (!legacy_input)
         use_external_guides = RenderCurrentFrameGuides(backbuffer);
-    else if (g_present_api == reshade::api::device_api::d3d11)
+    else if (g_present_api == reshade::api::device_api::d3d11 && !mailbox_d3d11_input)
     {
         use_external_guides = g_legacy_guides_ready && CapturedGuidesMatchInput();
         g_legacy_guides_ready = false;
@@ -4528,6 +4839,8 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
         commands->ResolveQueryData(g_telemetry_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
             0, kTelemetryQueryCount, g_telemetry_readback.Get(), 0);
     if (!SubmitNeuralFrameCommands(slot_index)) return false;
+    if (mailbox_d3d11_input)
+        capture_reservation.Commit(pipeline_slot.neural_fence_value);
     if (direct_reservation.index >= 0)
     {
         pipeline_slot.presentation_slot_index = direct_reservation.index;
@@ -6308,6 +6621,13 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
             g_fg_admission_deferrals.load(), g_fg_admission_inflight_deferrals.load(),
             g_fg_admission_capacity_deferrals.load(),
             EffectiveFramegenEnabled() && g_show_neural_output ? g_proxy_refresh_hz * 0.5f : 0.0f);
+        Log("performance capture mailbox: active=%u slots=%u submissions=%llu consumed=%llu stale_drops=%llu no_slot=%llu capture->selected=%.3fms peak=%.3fms source_age=%u frames",
+            LegacyCaptureMailboxEnabled() ? 1u : 0u, kLegacyCaptureSlotCount,
+            g_capture_mailbox_submissions.load(), g_capture_mailbox_consumed.load(),
+            g_capture_mailbox_stale_drops.load(), g_capture_mailbox_no_slot.load(),
+            g_capture_mailbox_age_us.load() / 1000.0f,
+            g_capture_mailbox_age_peak_us.load() / 1000.0f,
+            g_capture_mailbox_source_age.load());
         if (g_windowed_virtualization_active.load() || DetachedPresentationEnabled())
             Log("presentation compatibility: host=%s window_virtualization=%s logical_client=%s input_coordinates=%s render=%ux%u output=%ux%u resolution_intents=%llu WM_SIZE=%llu client_queries=%llu coordinate_APIs=%llu mouse_messages=%llu cursor_queries=%llu cursor_warps=%llu cursor_clips=%llu resize_pins=%llu",
                 DetachedPresentationEnabled() ? "detached" : "attached",
@@ -8052,12 +8372,11 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     }
     g_home_down = home;
     g_alt_x_down = alt_x;
-    if (!AdmitNewestFrameForFgPair())
-        return;
     const reshade::api::resource backbuffer_resource = swapchain->get_current_back_buffer();
     if (!backbuffer_resource.handle) return;
     if (api == reshade::api::device_api::d3d12)
     {
+        if (!AdmitNewestFrameForFgPair()) return;
         auto *backbuffer = reinterpret_cast<ID3D12Resource *>(backbuffer_resource.handle);
         const D3D12_RESOURCE_DESC backbuffer_desc = backbuffer->GetDesc();
         g_input_width = static_cast<UINT>(backbuffer_desc.Width);
@@ -8077,35 +8396,66 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         const DXGI_FORMAT format = static_cast<DXGI_FORMAT>(desc.texture.format);
         g_input_width = width; g_input_height = height;
         if (!EnsureStandaloneResources(width, height, format)) return;
-        const int prepared_slot = api == reshade::api::device_api::d3d11 ?
-            AcquirePipelineFrameSlot() : -1;
-        if (api == reshade::api::device_api::d3d11 && prepared_slot < 0)
+
+        if (api == reshade::api::device_api::d3d11 && LegacyCaptureMailboxEnabled())
         {
-            ++g_neural_gpu_deferrals;
-            const unsigned long long skipped = ++g_neural_busy_frame_skips;
-            if (skipped <= 8 || skipped % 600 == 0)
-                Log("D3D11 capture skipped: all shared input slots are occupied (skip=%llu)", skipped);
-            return;
-        }
-        if (api == reshade::api::device_api::d3d11)
-            RenderLegacyCurrentFrameGuides(backbuffer_resource);
-        if (!CopyLegacyFrameToD3D12(reinterpret_cast<void *>(backbuffer_resource.handle), false,
-                prepared_slot) ||
-            !ExecuteOnPresentPipeline(nullptr, prepared_slot))
-        {
-            if (prepared_slot >= 0)
+            CaptureLegacyFrameToMailbox(reinterpret_cast<void *>(backbuffer_resource.handle));
+            const int capture_slot = ReserveNewestReadyLegacyCapture();
+            if (capture_slot < 0) return;
+            if (!AdmitNewestFrameForFgPair())
+            {
+                ReturnReservedLegacyCapture(capture_slot);
+                return;
+            }
+            const int prepared_slot = AcquirePipelineFrameSlot();
+            if (prepared_slot < 0)
+            {
+                ReturnReservedLegacyCapture(capture_slot);
+                ++g_neural_gpu_deferrals;
+                return;
+            }
+            if (!ExecuteOnPresentPipeline(nullptr, prepared_slot, capture_slot))
             {
                 unsigned int expected = PipelineSlotRecording;
-                g_pipeline_slots[prepared_slot].state.compare_exchange_strong(expected, PipelineSlotFree,
-                    std::memory_order_acq_rel, std::memory_order_acquire);
+                g_pipeline_slots[prepared_slot].state.compare_exchange_strong(expected,
+                    PipelineSlotFree, std::memory_order_acq_rel, std::memory_order_acquire);
+                return;
             }
-            if (!g_neural_failed) SetStatus("waiting for a valid %s shared frame",
-                api == reshade::api::device_api::d3d11 ? "D3D11" : "D3D9");
-            return;
+        }
+        else
+        {
+            if (!AdmitNewestFrameForFgPair()) return;
+            const int prepared_slot = api == reshade::api::device_api::d3d11 ?
+                AcquirePipelineFrameSlot() : -1;
+            if (api == reshade::api::device_api::d3d11 && prepared_slot < 0)
+            {
+                ++g_neural_gpu_deferrals;
+                const unsigned long long skipped = ++g_neural_busy_frame_skips;
+                if (skipped <= 8 || skipped % 600 == 0)
+                    Log("D3D11 capture skipped: all shared input slots are occupied (skip=%llu)", skipped);
+                return;
+            }
+            if (api == reshade::api::device_api::d3d11)
+                RenderLegacyCurrentFrameGuides(backbuffer_resource);
+            if (!CopyLegacyFrameToD3D12(reinterpret_cast<void *>(backbuffer_resource.handle), false,
+                    prepared_slot) ||
+                !ExecuteOnPresentPipeline(nullptr, prepared_slot))
+            {
+                if (prepared_slot >= 0)
+                {
+                    unsigned int expected = PipelineSlotRecording;
+                    g_pipeline_slots[prepared_slot].state.compare_exchange_strong(expected,
+                        PipelineSlotFree, std::memory_order_acq_rel, std::memory_order_acquire);
+                }
+                if (!g_neural_failed) SetStatus("waiting for a valid %s shared frame",
+                    api == reshade::api::device_api::d3d11 ? "D3D11" : "D3D9");
+                return;
+            }
         }
     }
     else
     {
+        if (!AdmitNewestFrameForFgPair()) return;
         const auto desc = swapchain->get_device()->get_resource_desc(backbuffer_resource);
         const UINT width = static_cast<UINT>(desc.texture.width);
         const UINT height = desc.texture.height;
