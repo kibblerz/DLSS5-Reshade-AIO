@@ -34,7 +34,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.25-common-phase-scheduled-fg-prototype"
+#define ADDON_VERSION "2.0.26-no-auto-serialized-async-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -9701,10 +9701,9 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::Text("Active presentation mode: %s",
         g_synchronous_proxy_presentation ? "serialized compatibility" : "asynchronous performance");
     ImGui::TextWrapped("Try serialized mode if the game crashes, freezes, or produces a black screen when the processed output starts or after changing resolution. It is safer for some games such as GTA V, but may reduce performance. Restart after changing it.");
-    ImGui::TextWrapped("If the game crashes before this menu can open, launch it again while holding F8. The addon will select serialized safe mode before the first frame. It also does this automatically after detecting that the previous game session did not shut down cleanly.");
+    ImGui::TextWrapped("If the game crashes before this menu can open, launch it again while holding F8 to deliberately select serialized safe mode before the first frame. A previous crash is logged for diagnosis but never changes presentation mode automatically.");
     if (g_startup_recovery_forced)
-        ImGui::TextWrapped("Safe startup is active now because %s.",
-            g_startup_recovery_detected ? "the previous game session did not shut down cleanly" : "F8 was held during launch");
+        ImGui::TextWrapped("Safe startup is active now because F8 was held during launch.");
 
     ImGui::TextDisabled("Vulkan: select a real reduced windowed resolution in-game; the native proxy supplies borderless output.");
 
@@ -10075,8 +10074,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         { FILE *file = nullptr; if (fopen_s(&file, g_log_path, "w") == 0 && file) fclose(file); }
 
         g_startup_recovery_detected = BeginStartupRecoveryTracking(local);
-        g_startup_recovery_forced = g_startup_recovery_detected ||
-            (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+        // An unclean prior shutdown is useful diagnostic information, but must not
+        // silently change the present path. Serialized startup is an explicit F8
+        // recovery action only.
+        g_startup_recovery_forced = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
 
         if (!reshade::register_addon(module))
         {
@@ -10159,9 +10160,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             g_opaque_composition ? "enabled" : "disabled",
             g_synchronous_proxy_presentation ? "serialized" : "asynchronous",
             g_performance_telemetry_enabled ? "enabled" : "disabled");
+        if (g_startup_recovery_detected)
+            Log("previous game session did not shut down cleanly; preserving configured presentation mode (automatic serialized recovery disabled): state=%s",
+                g_startup_recovery_path[0] != '\0' ? g_startup_recovery_path : "marker unavailable");
         if (g_startup_recovery_forced)
-            Log("serialized safe startup forced before first Present: reason=%s state=%s",
-                g_startup_recovery_detected ? "previous game session did not shut down cleanly" : "F8 held during launch",
+            Log("serialized safe startup forced before first Present: reason=F8 held during launch state=%s",
                 g_startup_recovery_path[0] != '\0' ? g_startup_recovery_path : "marker unavailable");
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::register_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
