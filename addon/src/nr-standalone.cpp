@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -33,7 +34,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.12-split-fg-prototype"
+#define ADDON_VERSION "2.0.14-pipelined-fg-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -515,6 +516,10 @@ static UINT64 g_async_fg_fence_value;
 static UINT64 g_async_fg_timestamp_frequency;
 static std::atomic<unsigned long long> g_async_fg_submissions{0};
 static std::atomic<unsigned long long> g_async_fg_overlap_frames{0};
+static std::atomic<unsigned long long> g_async_fg_busy_bypasses{0};
+static std::atomic<unsigned long long> g_async_fg_deadline_drops{0};
+static std::atomic<unsigned long long> g_async_fg_completed_in_time{0};
+static std::atomic<bool> g_async_fg_reset_required{true};
 static Microsoft::WRL::ComPtr<ID3D12Fence> g_async_input_fence;
 static UINT64 g_async_input_fence_value;
 static HANDLE g_async_input_fence_event;
@@ -633,6 +638,7 @@ struct PresentationFrameSlot
     bool has_original_frame = false;
     LARGE_INTEGER submitted_qpc = {};
     LARGE_INTEGER ready_qpc = {};
+    LARGE_INTEGER fg_deadline_qpc = {};
 };
 static PresentationFrameSlot g_presentation_slots[kPresentationFrameSlotCount];
 struct ScopedPresentationReservation
@@ -1497,6 +1503,8 @@ static void ResetPerformanceTelemetry()
     g_neural_dispatch_gap_us = 0; g_neural_dispatch_gap_peak_us = 0;
     g_neural_dispatch_completion_qpc = 0;
     g_async_fg_submissions = 0; g_async_fg_overlap_frames = 0;
+    g_async_fg_busy_bypasses = 0; g_async_fg_deadline_drops = 0;
+    g_async_fg_completed_in_time = 0;
     g_telemetry_samples = 0;
     g_guide_telemetry_samples = 0; g_proxy_telemetry_samples = 0;
     g_gpu_telemetry_available = false; g_guide_gpu_telemetry_available = false;
@@ -1760,6 +1768,43 @@ static bool AsyncFgGpuIdle()
         g_async_fg_fence->GetCompletedValue() >= g_async_fg_fence_value;
 }
 
+static UINT64 AsyncFgOutstandingJobs()
+{
+    if (!g_async_fg_fence || g_async_fg_fence_value == 0) return 0;
+    const UINT64 completed = g_async_fg_fence->GetCompletedValue();
+    return completed >= g_async_fg_fence_value ? 0 : g_async_fg_fence_value - completed;
+}
+
+static bool AsyncFgSubmissionCapacityAvailable()
+{
+    // One FG job may be executing while the next waits on its reconstruction
+    // fence. This keeps every real frame eligible at normal throughput without
+    // allowing slow FG work to form an unbounded latency queue.
+    return AsyncFgOutstandingJobs() < 2;
+}
+
+static LONGLONG AsyncFgDeadlineIntervalQpc()
+{
+    if (g_proxy_pacing_qpc_frequency <= 0)
+    {
+        LARGE_INTEGER frequency = {};
+        if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0)
+            return 0;
+        g_proxy_pacing_qpc_frequency = frequency.QuadPart;
+    }
+
+    // An intermediate has at most one real-frame period to remain useful.
+    // Two output refresh intervals approximate that period when FG targets 2x.
+    // Clamp the grace period so very low-refresh displays do not accumulate
+    // perceptible input latency and very high-refresh displays still give NGX
+    // a practical chance to complete.
+    LONGLONG interval = g_proxy_pacing_interval_qpc > 0 ?
+        g_proxy_pacing_interval_qpc * 2 : g_proxy_pacing_qpc_frequency / 60;
+    const LONGLONG minimum = std::max<LONGLONG>(1, g_proxy_pacing_qpc_frequency * 8 / 1000);
+    const LONGLONG maximum = std::max<LONGLONG>(minimum, g_proxy_pacing_qpc_frequency * 20 / 1000);
+    return std::clamp(interval, minimum, maximum);
+}
+
 static bool DirectOutputHandoffEnabled()
 {
     return g_async_compute_active && g_proxy_explicit_pacing_active &&
@@ -1941,7 +1986,7 @@ static void ReclaimPipelineFrameSlots()
         {
             const PresentationFrameSlot &presentation =
                 g_presentation_slots[slot.presentation_slot_index];
-            if (presentation.has_generated_frame && presentation.fg_fence_value != 0 &&
+            if (presentation.fg_fence_value != 0 &&
                 g_async_fg_fence &&
                 g_async_fg_fence->GetCompletedValue() < presentation.fg_fence_value)
                 abandoned_complete = false;
@@ -1997,7 +2042,9 @@ static void ReclaimPresentationFrameSlots()
     for (PresentationFrameSlot &slot : g_presentation_slots)
     {
         unsigned int state = slot.state.load(std::memory_order_acquire);
-        if (state == PresentationSlotPresenting && completed >= slot.fence_value &&
+        const bool fg_complete = slot.fg_fence_value == 0 || !g_async_fg_fence ||
+            g_async_fg_fence->GetCompletedValue() >= slot.fg_fence_value;
+        if (state == PresentationSlotPresenting && completed >= slot.fence_value && fg_complete &&
             slot.state.compare_exchange_strong(state, PresentationSlotFree,
                 std::memory_order_acq_rel, std::memory_order_acquire))
         {
@@ -2034,6 +2081,7 @@ static int AcquirePresentationFrameSlot()
             slot.has_original_frame = false;
             slot.submitted_qpc = {};
             slot.ready_qpc = {};
+            slot.fg_deadline_qpc = {};
             return static_cast<int>(index);
         }
     }
@@ -3147,6 +3195,7 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
         slot.has_original_frame = false;
         slot.submitted_qpc = {};
         slot.ready_qpc = {};
+        slot.fg_deadline_qpc = {};
     }
     g_next_presentation_slot = 0;
     g_next_legacy_capture_slot = 0;
@@ -4129,6 +4178,7 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
         slot.has_original_frame = false;
         slot.submitted_qpc = {};
         slot.ready_qpc = {};
+        slot.fg_deadline_qpc = {};
         slot.state.store(PresentationSlotFree, std::memory_order_release);
         // In the direct handoff path these are NGX output targets, not copy
         // destinations. They remain presentation-owned until the compositor's
@@ -5106,8 +5156,19 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     NVSDK_NGX_Result fg_result = static_cast<NVSDK_NGX_Result>(0xBAD00004);
     bool evaluate_fg = EffectiveFramegenEnabled() && !g_framegen_failed && g_fg_feature &&
         NVSDK_NGX_SUCCEED(nr_result) && NVSDK_NGX_SUCCEED(sr_result);
-    bool split_fg = evaluate_fg && completion_driven_dispatch && mailbox_d3d11_input &&
-        SplitFrameGenerationEnabled() && direct_reservation.index >= 0;
+    const bool split_fg_path = evaluate_fg && completion_driven_dispatch &&
+        mailbox_d3d11_input && SplitFrameGenerationEnabled() &&
+        direct_reservation.index >= 0;
+    bool split_fg = split_fg_path && AsyncFgSubmissionCapacityAvailable();
+    if (split_fg_path && !split_fg)
+    {
+        // A late generated frame has no value after its associated real frame.
+        // Keep the FG queue bounded to one job and let this reconstruction be
+        // presented at real cadence instead of extending the latency queue.
+        evaluate_fg = false;
+        g_async_fg_reset_required = true;
+        ++g_async_fg_busy_bypasses;
+    }
     pipeline_slot.fg_split_submission = split_fg;
     if (evaluate_fg && !split_fg)
     {
@@ -5206,11 +5267,14 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     {
         PresentationFrameSlot &presentation =
             g_presentation_slots[direct_reservation.index];
+        const bool fg_reset = reset || g_fg_frames.load() == 0 ||
+            g_async_fg_reset_required.exchange(false, std::memory_order_acq_rel);
         if (!SubmitSplitFrameGeneration(presentation, real_output, generated_output,
-                depth, motion, reset || g_fg_frames.load() == 0,
+                depth, motion, fg_reset,
                 pipeline_slot.neural_fence_value, fg_result))
         {
             Log("split FG submission failed; frame generation disabled, reconstructed real frames remain available");
+            g_async_fg_reset_required = true;
             g_framegen_failed = true;
             evaluate_fg = false;
             split_fg = false;
@@ -7013,9 +7077,12 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
             g_neural_dispatch_submissions.load(),
             g_neural_dispatch_gap_us.load() / 1000.0f,
             g_neural_dispatch_gap_peak_us.load() / 1000.0f);
-        Log("performance split FG: active=%u submissions=%llu queued-before-reconstruction-complete=%llu FG_GPU=%.3fms reconstruction_GPU=%.3fms",
+        Log("performance pipelined FG: active=%u submissions=%llu outstanding=%llu overlap=%llu completed-in-window=%llu queue-pressure-bypasses=%llu deadline-drops=%llu FG_GPU=%.3fms reconstruction_GPU=%.3fms",
             SplitFrameGenerationEnabled() ? 1u : 0u,
-            g_async_fg_submissions.load(), g_async_fg_overlap_frames.load(),
+            g_async_fg_submissions.load(), AsyncFgOutstandingJobs(),
+            g_async_fg_overlap_frames.load(),
+            g_async_fg_completed_in_time.load(), g_async_fg_busy_bypasses.load(),
+            g_async_fg_deadline_drops.load(),
             g_gpu_fg_us.load() / 1000.0f, g_gpu_total_us.load() / 1000.0f);
         if (g_windowed_virtualization_active.load() || DetachedPresentationEnabled())
             Log("presentation compatibility: host=%s window_virtualization=%s logical_client=%s input_coordinates=%s render=%ux%u output=%ux%u resolution_intents=%llu WM_SIZE=%llu client_queries=%llu coordinate_APIs=%llu mouse_messages=%llu cursor_queries=%llu cursor_warps=%llu cursor_clips=%llu resize_pins=%llu",
@@ -7580,11 +7647,8 @@ static int ClaimOldestReadyPresentationSlot()
     for (UINT index = 0; index < kPresentationFrameSlotCount; ++index)
     {
         PresentationFrameSlot &slot = g_presentation_slots[index];
-        const bool producer_complete = slot.has_generated_frame && slot.fg_fence_value != 0 ?
-            fg_completed >= slot.fg_fence_value :
-            slot.neural_fence_value != 0 && neural_completed >= slot.neural_fence_value;
         if (slot.state.load(std::memory_order_acquire) == PresentationSlotReady &&
-            producer_complete && slot.sequence < oldest)
+            slot.sequence < oldest)
         {
             selected = static_cast<int>(index);
             oldest = slot.sequence;
@@ -7592,6 +7656,34 @@ static int ClaimOldestReadyPresentationSlot()
     }
     if (selected < 0) return -1;
     PresentationFrameSlot &slot = g_presentation_slots[selected];
+    const bool real_complete = slot.neural_fence_value != 0 &&
+        neural_completed >= slot.neural_fence_value;
+    if (!real_complete) return -1;
+
+    if (slot.has_generated_frame && slot.fg_fence_value != 0)
+    {
+        if (fg_completed >= slot.fg_fence_value)
+            ++g_async_fg_completed_in_time;
+        else
+        {
+            LARGE_INTEGER now = {};
+            QueryPerformanceCounter(&now);
+            if (slot.fg_deadline_qpc.QuadPart == 0)
+                slot.fg_deadline_qpc.QuadPart = now.QuadPart + AsyncFgDeadlineIntervalQpc();
+            if (now.QuadPart < slot.fg_deadline_qpc.QuadPart)
+                return -1;
+
+            // The real reconstruction is ready and its intermediate missed the
+            // bounded display window. Present real now; the late FG write is
+            // retired by its own fence and is never displayed out of order.
+            slot.has_generated_frame = false;
+            g_async_fg_reset_required = true;
+            const unsigned long long drops = ++g_async_fg_deadline_drops;
+            if (drops <= 8 || drops % 120 == 0)
+                Log("opportunistic FG missed display deadline; presenting real frame (drop=%llu sequence=%llu)",
+                    drops, slot.sequence);
+        }
+    }
     unsigned int expected = PresentationSlotReady;
     if (!slot.state.compare_exchange_strong(expected, PresentationSlotPresentRecording,
             std::memory_order_acq_rel, std::memory_order_acquire))
@@ -7606,6 +7698,35 @@ static int ClaimOldestReadyPresentationSlot()
         ++g_direct_handoff_samples;
     }
     return selected;
+}
+
+static DWORD NextAsyncPresentationDeadlineTimeoutMs()
+{
+    if (!g_neural_fence || !g_async_fg_fence || g_proxy_pacing_qpc_frequency <= 0)
+        return INFINITE;
+    LARGE_INTEGER now = {};
+    QueryPerformanceCounter(&now);
+    const UINT64 neural_completed = g_neural_fence->GetCompletedValue();
+    const UINT64 fg_completed = g_async_fg_fence->GetCompletedValue();
+    LONGLONG earliest = (std::numeric_limits<LONGLONG>::max)();
+    for (PresentationFrameSlot &slot : g_presentation_slots)
+    {
+        if (slot.state.load(std::memory_order_acquire) != PresentationSlotReady ||
+            !slot.has_generated_frame || slot.fg_fence_value == 0 ||
+            fg_completed >= slot.fg_fence_value || slot.neural_fence_value == 0 ||
+            neural_completed < slot.neural_fence_value)
+            continue;
+        if (slot.fg_deadline_qpc.QuadPart == 0)
+            return 0;
+        earliest = std::min(earliest, slot.fg_deadline_qpc.QuadPart);
+    }
+    if (earliest == (std::numeric_limits<LONGLONG>::max)()) return INFINITE;
+    if (earliest <= now.QuadPart) return 0;
+    const unsigned long long remaining = static_cast<unsigned long long>(earliest - now.QuadPart);
+    return static_cast<DWORD>(std::min<unsigned long long>(
+        (remaining * 1000ULL + static_cast<unsigned long long>(g_proxy_pacing_qpc_frequency) - 1) /
+            static_cast<unsigned long long>(g_proxy_pacing_qpc_frequency),
+        static_cast<unsigned long long>(INFINITE - 1)));
 }
 
 static void ArmAsyncProxyWakeForNeuralCompletion()
@@ -7624,14 +7745,14 @@ static void ArmAsyncProxyWakeForNeuralCompletion()
     {
         if (slot.state.load(std::memory_order_acquire) != PresentationSlotReady)
             continue;
+        if (slot.neural_fence_value > completed)
+            next_completion = std::min(next_completion, slot.neural_fence_value);
         if (slot.has_generated_frame && slot.fg_fence_value != 0 && g_async_fg_fence)
         {
             if (g_async_fg_fence->GetCompletedValue() < slot.fg_fence_value)
                 g_async_fg_fence->SetEventOnCompletion(
                     slot.fg_fence_value, g_proxy_present_event);
         }
-        else if (slot.neural_fence_value > completed)
-            next_completion = std::min(next_completion, slot.neural_fence_value);
     }
     if (next_completion == ~0ull) return;
     const HRESULT hr = g_neural_fence->SetEventOnCompletion(
@@ -8040,12 +8161,14 @@ static DWORD WINAPI ProxyPresentationThread(void *)
     Log("async proxy presentation worker started");
     while (true)
     {
-        const DWORD wait = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+        const DWORD wait = WaitForMultipleObjects(2, waits, FALSE,
+            NextAsyncPresentationDeadlineTimeoutMs());
         if (wait == WAIT_OBJECT_0) break;
-        if (wait != WAIT_OBJECT_0 + 1) continue;
+        if (wait != WAIT_OBJECT_0 + 1 && wait != WAIT_TIMEOUT) continue;
 
         while (true)
         {
+            ReclaimPresentationFrameSlots();
             const int direct_slot_index = ClaimOldestReadyPresentationSlot();
             if (direct_slot_index >= 0)
             {
@@ -8202,17 +8325,20 @@ static bool PublishDirectOutputSlot(int slot_index)
         g_proxy_request_qpc.store(queued.QuadPart, std::memory_order_release);
     }
     g_proxy_present_request_state.store(1, std::memory_order_release);
-    ID3D12Fence *ready_fence = direct_slot->has_generated_frame &&
-        direct_slot->fg_fence_value != 0 && g_async_fg_fence ?
-        g_async_fg_fence.Get() : g_neural_fence.Get();
-    const UINT64 ready_value = ready_fence == g_async_fg_fence.Get() ?
-        direct_slot->fg_fence_value : direct_slot->neural_fence_value;
-    const HRESULT arm_result = ready_fence ? ready_fence->SetEventOnCompletion(
-        ready_value, g_proxy_present_event) : E_POINTER;
-    if (FAILED(arm_result) || !SetEvent(g_proxy_present_event))
+    const HRESULT neural_arm_result = g_neural_fence ?
+        g_neural_fence->SetEventOnCompletion(
+            direct_slot->neural_fence_value, g_proxy_present_event) : E_POINTER;
+    HRESULT fg_arm_result = S_OK;
+    if (direct_slot->has_generated_frame && direct_slot->fg_fence_value != 0 &&
+        g_async_fg_fence)
+        fg_arm_result = g_async_fg_fence->SetEventOnCompletion(
+            direct_slot->fg_fence_value, g_proxy_present_event);
+    if (FAILED(neural_arm_result) || FAILED(fg_arm_result) ||
+        !SetEvent(g_proxy_present_event))
     {
-        Log("direct-output presenter wake failed: fence=%llu hr=0x%08X win32=%lu",
-            ready_value, static_cast<unsigned int>(arm_result), GetLastError());
+        Log("direct-output presenter wake failed: neural=%llu hr=0x%08X FG=%llu hr=0x%08X win32=%lu",
+            direct_slot->neural_fence_value, static_cast<unsigned int>(neural_arm_result),
+            direct_slot->fg_fence_value, static_cast<unsigned int>(fg_arm_result), GetLastError());
         return false;
     }
     static std::atomic<bool> logged_direct_output{false};
