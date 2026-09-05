@@ -33,7 +33,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.6-copy-queue-handoff-prototype"
+#define ADDON_VERSION "2.0.5-decoupled-presentation-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -214,12 +214,6 @@ static bool g_proxy_last_accepted_was_generated;
 static std::atomic<unsigned int> g_cpu_shared_telemetry_us{0};
 static std::atomic<unsigned long long> g_proxy_present_requests{0};
 static std::atomic<unsigned long long> g_proxy_present_completed{0};
-static std::atomic<unsigned int> g_handoff_submit_to_copy_us{0};
-static std::atomic<unsigned int> g_handoff_submit_to_copy_peak_us{0};
-static std::atomic<unsigned int> g_handoff_copy_to_present_us{0};
-static std::atomic<unsigned int> g_handoff_submit_to_present_us{0};
-static std::atomic<unsigned long long> g_handoff_samples{0};
-static std::atomic<unsigned long long> g_handoff_copy_queue_drops{0};
 static std::atomic<unsigned long long> g_neural_presenter_deferrals{0};
 static std::atomic<unsigned long long> g_neural_gpu_deferrals{0};
 static std::atomic<unsigned long long> g_source_frame_sequence{0};
@@ -496,12 +490,6 @@ static UINT64 g_async_input_fence_value;
 static HANDLE g_async_input_fence_event;
 static constexpr UINT kPipelineFrameSlotCount = 3;
 static constexpr UINT kPresentationFrameSlotCount = 3;
-static Microsoft::WRL::ComPtr<ID3D12CommandQueue> g_output_copy_queue;
-static Microsoft::WRL::ComPtr<ID3D12Fence> g_output_copy_fence;
-static UINT64 g_output_copy_fence_value;
-static bool g_output_copy_queue_active;
-static Microsoft::WRL::ComPtr<ID3D12CommandAllocator> g_output_copy_allocators[kPipelineFrameSlotCount];
-static Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> g_output_copy_lists[kPipelineFrameSlotCount];
 enum PipelineFrameSlotState : unsigned int
 {
     PipelineSlotFree = 0,
@@ -524,11 +512,9 @@ struct PipelineFrameSlot
     std::atomic<unsigned int> state{PipelineSlotFree};
     UINT64 neural_fence_value = 0;
     std::atomic<UINT64> proxy_fence_value{0};
-    std::atomic<UINT64> output_copy_fence_value{0};
     UINT64 async_input_fence_value = 0;
     unsigned long long sequence = 0;
     bool has_generated_frame = false;
-    LARGE_INTEGER submitted_qpc = {};
 };
 static PipelineFrameSlot g_pipeline_slots[kPipelineFrameSlotCount];
 enum PresentationFrameSlotState : unsigned int
@@ -545,12 +531,8 @@ struct PresentationFrameSlot
     Microsoft::WRL::ComPtr<ID3D12Resource> original_input;
     std::atomic<unsigned int> state{PresentationSlotFree};
     UINT64 fence_value = 0;
-    UINT64 output_copy_fence_value = 0;
     unsigned long long sequence = 0;
     bool has_generated_frame = false;
-    bool has_original_frame = false;
-    LARGE_INTEGER submitted_qpc = {};
-    LARGE_INTEGER copy_ready_qpc = {};
 };
 static PresentationFrameSlot g_presentation_slots[kPresentationFrameSlotCount];
 static UINT g_next_presentation_slot;
@@ -1635,25 +1617,16 @@ static void ReclaimPipelineFrameSlots()
 {
     const UINT64 neural_completed = g_neural_fence ? g_neural_fence->GetCompletedValue() : 0;
     const UINT64 proxy_completed = g_proxy_fence ? g_proxy_fence->GetCompletedValue() : 0;
-    const UINT64 copy_completed = g_output_copy_fence ? g_output_copy_fence->GetCompletedValue() : 0;
     for (PipelineFrameSlot &slot : g_pipeline_slots)
     {
         unsigned int state = slot.state.load(std::memory_order_acquire);
-        const UINT64 copy_fence = slot.output_copy_fence_value.load(std::memory_order_acquire);
         const bool completed = state == PipelineSlotAbandoned ?
             neural_completed >= slot.neural_fence_value :
             state == PipelineSlotPresenting &&
-                (copy_fence != 0 ? copy_completed >= copy_fence :
-                    proxy_completed >= slot.proxy_fence_value.load(std::memory_order_acquire));
+                proxy_completed >= slot.proxy_fence_value.load(std::memory_order_acquire);
         if (completed)
-        {
-            if (slot.state.compare_exchange_strong(state, PipelineSlotFree,
-                    std::memory_order_acq_rel, std::memory_order_acquire))
-            {
-                slot.output_copy_fence_value.store(0, std::memory_order_release);
-                slot.proxy_fence_value.store(0, std::memory_order_release);
-            }
-        }
+            slot.state.compare_exchange_strong(state, PipelineSlotFree,
+                std::memory_order_acq_rel, std::memory_order_acquire);
     }
 }
 
@@ -1668,8 +1641,6 @@ static int AcquirePipelineFrameSlot()
                 std::memory_order_acq_rel, std::memory_order_acquire))
         {
             g_next_pipeline_slot = (index + 1) % kPipelineFrameSlotCount;
-            g_pipeline_slots[index].output_copy_fence_value.store(0, std::memory_order_release);
-            g_pipeline_slots[index].proxy_fence_value.store(0, std::memory_order_release);
             return static_cast<int>(index);
         }
     }
@@ -1683,14 +1654,8 @@ static void ReclaimPresentationFrameSlots()
     {
         unsigned int state = slot.state.load(std::memory_order_acquire);
         if (state == PresentationSlotPresenting && completed >= slot.fence_value)
-        {
-            if (slot.state.compare_exchange_strong(state, PresentationSlotFree,
-                    std::memory_order_acq_rel, std::memory_order_acquire))
-            {
-                slot.output_copy_fence_value = 0;
-                slot.fence_value = 0;
-            }
-        }
+            slot.state.compare_exchange_strong(state, PresentationSlotFree,
+                std::memory_order_acq_rel, std::memory_order_acquire);
     }
 }
 
@@ -1705,10 +1670,6 @@ static int AcquirePresentationFrameSlot()
                 PresentationSlotRecording, std::memory_order_acq_rel, std::memory_order_acquire))
         {
             g_next_presentation_slot = (index + 1) % kPresentationFrameSlotCount;
-            g_presentation_slots[index].output_copy_fence_value = 0;
-            g_presentation_slots[index].has_original_frame = false;
-            g_presentation_slots[index].submitted_qpc = {};
-            g_presentation_slots[index].copy_ready_qpc = {};
             return static_cast<int>(index);
         }
     }
@@ -3353,47 +3314,6 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
                 g_async_compute_active = true;
                 Log("asynchronous NGX queue ready: graphics=%p compute=%p",
                     g_command_queue, g_async_compute_queue.Get());
-
-                // Keep completed neural output copies off the game's graphics
-                // queue. A COPY queue can wait directly on the neural fence,
-                // transfer the immutable presentation textures, and release
-                // the expensive NGX slot without a CPU wake-up in between.
-                D3D12_COMMAND_QUEUE_DESC copy_desc = {};
-                copy_desc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
-                HRESULT copy_hr = g_neural_device->CreateCommandQueue(&copy_desc,
-                    IID_PPV_ARGS(&g_output_copy_queue));
-                if (SUCCEEDED(copy_hr))
-                    copy_hr = g_neural_device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
-                        IID_PPV_ARGS(&g_output_copy_fence));
-                for (UINT index = 0; SUCCEEDED(copy_hr) && index < kPipelineFrameSlotCount; ++index)
-                {
-                    copy_hr = g_neural_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY,
-                        IID_PPV_ARGS(&g_output_copy_allocators[index]));
-                    if (SUCCEEDED(copy_hr))
-                        copy_hr = g_neural_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY,
-                            g_output_copy_allocators[index].Get(), nullptr,
-                            IID_PPV_ARGS(&g_output_copy_lists[index]));
-                    if (SUCCEEDED(copy_hr)) copy_hr = g_output_copy_lists[index]->Close();
-                }
-                if (FAILED(copy_hr))
-                {
-                    for (UINT index = 0; index < kPipelineFrameSlotCount; ++index)
-                    {
-                        g_output_copy_lists[index].Reset();
-                        g_output_copy_allocators[index].Reset();
-                    }
-                    g_output_copy_fence.Reset();
-                    g_output_copy_queue.Reset();
-                    Log("dedicated output copy queue unavailable (0x%08X); retaining graphics-queue handoff",
-                        static_cast<unsigned int>(copy_hr));
-                }
-                else
-                {
-                    g_output_copy_fence_value = 0;
-                    g_output_copy_queue_active = true;
-                    Log("dedicated output copy queue ready: compute=%p copy=%p graphics=%p",
-                        g_async_compute_queue.Get(), g_output_copy_queue.Get(), g_command_queue);
-                }
             }
         }
         const D3D12_COMMAND_LIST_TYPE neural_type = g_async_compute_active ?
@@ -3458,11 +3378,9 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
             slot.original_input.Reset();
         slot.neural_fence_value = 0;
         slot.proxy_fence_value = 0;
-        slot.output_copy_fence_value = 0;
         slot.async_input_fence_value = 0;
         slot.sequence = 0;
         slot.has_generated_frame = false;
-        slot.submitted_qpc = {};
         slot.state.store(PipelineSlotFree, std::memory_order_release);
         if (!CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, slot.real_output) ||
             !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, slot.generated_output) ||
@@ -3476,12 +3394,8 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
         slot.generated_output.Reset();
         slot.original_input.Reset();
         slot.fence_value = 0;
-        slot.output_copy_fence_value = 0;
         slot.sequence = 0;
         slot.has_generated_frame = false;
-        slot.has_original_frame = false;
-        slot.submitted_qpc = {};
-        slot.copy_ready_qpc = {};
         slot.state.store(PresentationSlotFree, std::memory_order_release);
         if (!CreateTexture(ow, oh, result_format, false, D3D12_RESOURCE_STATE_COMMON, slot.real_output) ||
             !CreateTexture(ow, oh, result_format, false, D3D12_RESOURCE_STATE_COMMON, slot.generated_output) ||
@@ -4414,8 +4328,6 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
         commands->ResolveQueryData(g_telemetry_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
             0, kTelemetryQueryCount, g_telemetry_readback.Get(), 0);
     if (!SubmitNeuralFrameCommands(slot_index)) return false;
-    if (g_performance_telemetry_enabled)
-        QueryPerformanceCounter(&pipeline_slot.submitted_qpc);
     g_last_neural_source_sequence = source_sequence;
     if (record_gpu_telemetry)
     {
@@ -6166,15 +6078,6 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
             g_proxy_present_coalesced.load(), g_proxy_present_timeouts.load(),
             g_proxy_display_backpressure_drops.load(),
             g_neural_presenter_deferrals.load(), g_neural_gpu_deferrals.load());
-        Log("performance handoff: mode=%s submit->copy_ready=%.3fms peak=%.3fms copy_ready->present=%.3fms submit->present=%.3fms samples=%llu copy_queue_drops=%llu copy_fence=%llu/%llu",
-            g_output_copy_queue_active ? "dedicated-copy-queue" : "graphics-queue",
-            g_handoff_submit_to_copy_us.load() / 1000.0f,
-            g_handoff_submit_to_copy_peak_us.load() / 1000.0f,
-            g_handoff_copy_to_present_us.load() / 1000.0f,
-            g_handoff_submit_to_present_us.load() / 1000.0f,
-            g_handoff_samples.load(), g_handoff_copy_queue_drops.load(),
-            g_output_copy_fence ? g_output_copy_fence->GetCompletedValue() : 0,
-            g_output_copy_fence_value);
         if (g_windowed_virtualization_active.load() || DetachedPresentationEnabled())
             Log("presentation compatibility: host=%s window_virtualization=%s logical_client=%s input_coordinates=%s render=%ux%u output=%ux%u resolution_intents=%llu WM_SIZE=%llu client_queries=%llu coordinate_APIs=%llu mouse_messages=%llu cursor_queries=%llu cursor_warps=%llu cursor_clips=%llu resize_pins=%llu",
                 DetachedPresentationEnabled() ? "detached" : "attached",
@@ -6775,10 +6678,7 @@ static int StagePipelineFrameForPresentation(UINT pipeline_slot_index)
     if (presentation_slot_index < 0)
         return -1;
     PresentationFrameSlot &presentation = g_presentation_slots[presentation_slot_index];
-    const bool dedicated_copy = g_output_copy_queue_active && g_output_copy_queue &&
-        g_output_copy_fence && g_neural_fence && g_async_compute_active;
-    int command_slot_index = dedicated_copy ? static_cast<int>(pipeline_slot_index) :
-        AcquireProxyCommandSlot();
+    const int command_slot_index = AcquireProxyCommandSlot();
     if (command_slot_index < 0)
     {
         presentation.state.store(PresentationSlotFree, std::memory_order_release);
@@ -6786,10 +6686,8 @@ static int StagePipelineFrameForPresentation(UINT pipeline_slot_index)
     }
 
     const UINT command_slot = static_cast<UINT>(command_slot_index);
-    ID3D12CommandAllocator *allocator = dedicated_copy ?
-        g_output_copy_allocators[command_slot].Get() : g_proxy_allocators[command_slot].Get();
-    ID3D12GraphicsCommandList *list = dedicated_copy ?
-        g_output_copy_lists[command_slot].Get() : g_proxy_lists[command_slot].Get();
+    ID3D12CommandAllocator *allocator = g_proxy_allocators[command_slot].Get();
+    ID3D12GraphicsCommandList *list = g_proxy_lists[command_slot].Get();
     if (!allocator || !list || FAILED(allocator->Reset()) || FAILED(list->Reset(allocator, nullptr)))
     {
         presentation.state.store(PresentationSlotFree, std::memory_order_release);
@@ -6802,39 +6700,30 @@ static int StagePipelineFrameForPresentation(UINT pipeline_slot_index)
         {pipeline.original_input.Get(), presentation.original_input.Get()},
         {pipeline.generated_output.Get(), presentation.generated_output.Get()},
     };
-    // The original image is only needed by F10 bypass or post-ReShade menu
-    // composition. During ordinary processed output, bind the copied real
-    // frame as the unused Original SRV and avoid another full-frame transfer.
-    const bool copy_original = !dedicated_copy || !g_show_neural_output ||
-        g_reshade_overlay_open.load(std::memory_order_acquire);
-    CopyEntry active_copies[3] = {};
-    UINT copy_count = 0;
-    active_copies[copy_count++] = copies[0];
-    if (copy_original) active_copies[copy_count++] = copies[1];
-    if (pipeline.has_generated_frame) active_copies[copy_count++] = copies[2];
+    const UINT copy_count = pipeline.has_generated_frame ? 3u : 2u;
     D3D12_RESOURCE_BARRIER begin[6] = {};
     D3D12_RESOURCE_BARRIER end[6] = {};
     UINT barrier_count = 0;
     for (UINT index = 0; index < copy_count; ++index)
     {
-        if (!active_copies[index].source || !active_copies[index].destination)
+        if (!copies[index].source || !copies[index].destination)
         {
             list->Close();
             presentation.state.store(PresentationSlotFree, std::memory_order_release);
             return -1;
         }
-        begin[barrier_count] = Transition(active_copies[index].source,
+        begin[barrier_count] = Transition(copies[index].source,
             D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        end[barrier_count++] = Transition(active_copies[index].source,
+        end[barrier_count++] = Transition(copies[index].source,
             D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-        begin[barrier_count] = Transition(active_copies[index].destination,
+        begin[barrier_count] = Transition(copies[index].destination,
             D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-        end[barrier_count++] = Transition(active_copies[index].destination,
+        end[barrier_count++] = Transition(copies[index].destination,
             D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
     }
     list->ResourceBarrier(barrier_count, begin);
     for (UINT index = 0; index < copy_count; ++index)
-        list->CopyResource(active_copies[index].destination, active_copies[index].source);
+        list->CopyResource(copies[index].destination, copies[index].source);
     list->ResourceBarrier(barrier_count, end);
     if (FAILED(list->Close()))
     {
@@ -6843,100 +6732,27 @@ static int StagePipelineFrameForPresentation(UINT pipeline_slot_index)
     }
 
     ID3D12CommandList *lists[] = {list};
-    UINT64 copy_fence = 0;
-    HRESULT submit_result = S_OK;
-    if (dedicated_copy)
-    {
-        submit_result = g_output_copy_queue->Wait(g_neural_fence.Get(), pipeline.neural_fence_value);
-        if (SUCCEEDED(submit_result))
-            g_output_copy_queue->ExecuteCommandLists(1, lists);
-        if (SUCCEEDED(submit_result))
-        {
-            copy_fence = ++g_output_copy_fence_value;
-            submit_result = g_output_copy_queue->Signal(g_output_copy_fence.Get(), copy_fence);
-        }
-    }
-    else
-    {
-        g_command_queue->ExecuteCommandLists(1, lists);
-        copy_fence = ++g_proxy_fence_value;
-        submit_result = g_command_queue->Signal(g_proxy_fence.Get(), copy_fence);
-    }
-    if (FAILED(submit_result))
+    g_command_queue->ExecuteCommandLists(1, lists);
+    const UINT64 copy_fence = ++g_proxy_fence_value;
+    if (FAILED(g_command_queue->Signal(g_proxy_fence.Get(), copy_fence)))
     {
         presentation.state.store(PresentationSlotFree, std::memory_order_release);
         return -1;
     }
-    if (!dedicated_copy)
-        g_proxy_command_fence_values[command_slot] = copy_fence;
-    presentation.fence_value = dedicated_copy ? 0 : copy_fence;
-    presentation.output_copy_fence_value = dedicated_copy ? copy_fence : 0;
+    g_proxy_command_fence_values[command_slot] = copy_fence;
+    presentation.fence_value = copy_fence;
     presentation.sequence = pipeline.sequence;
     presentation.has_generated_frame = pipeline.has_generated_frame;
-    presentation.has_original_frame = copy_original;
-    presentation.submitted_qpc = pipeline.submitted_qpc;
     presentation.state.store(PresentationSlotReady, std::memory_order_release);
 
-    // The neural resources retire when the copy queue consumes them. Display
-    // pacing subsequently owns only the dedicated immutable copies.
-    pipeline.output_copy_fence_value.store(dedicated_copy ? copy_fence : 0,
-        std::memory_order_release);
-    pipeline.proxy_fence_value.store(dedicated_copy ? 0 : copy_fence,
-        std::memory_order_release);
+    // The neural resources are no longer needed after this copy reaches the
+    // graphics queue. Presentation timing now owns only the dedicated copies.
+    pipeline.proxy_fence_value.store(copy_fence, std::memory_order_release);
     pipeline.state.store(PipelineSlotPresenting, std::memory_order_release);
-    if (dedicated_copy && g_proxy_present_event)
-        g_output_copy_fence->SetEventOnCompletion(copy_fence, g_proxy_present_event);
-    static std::atomic<bool> logged_copy_handoff{false};
-    if (!logged_copy_handoff.exchange(true, std::memory_order_acq_rel))
-        Log("%s presentation handoff active: neural outputs copy into immutable display textures before pacing",
-            dedicated_copy ? "dedicated COPY-queue" : "graphics-queue");
+    static std::atomic<bool> logged_decoupled_presentation{false};
+    if (!logged_decoupled_presentation.exchange(true, std::memory_order_acq_rel))
+        Log("decoupled presentation active: NGX slots retire after output copy; refresh pacing owns dedicated textures");
     return presentation_slot_index;
-}
-
-static int FindOldestCompletedPresentationSlot()
-{
-    int selected = -1;
-    unsigned long long oldest = ~0ull;
-    const UINT64 copy_completed = g_output_copy_fence ?
-        g_output_copy_fence->GetCompletedValue() : 0;
-    for (UINT index = 0; index < kPresentationFrameSlotCount; ++index)
-    {
-        PresentationFrameSlot &slot = g_presentation_slots[index];
-        const UINT64 copy_fence = slot.output_copy_fence_value;
-        if (slot.state.load(std::memory_order_acquire) == PresentationSlotReady &&
-            (copy_fence == 0 || copy_completed >= copy_fence) && slot.sequence < oldest)
-        {
-            selected = static_cast<int>(index);
-            oldest = slot.sequence;
-        }
-    }
-    if (selected >= 0 && g_performance_telemetry_enabled)
-    {
-        PresentationFrameSlot &slot = g_presentation_slots[selected];
-        QueryPerformanceCounter(&slot.copy_ready_qpc);
-        const unsigned int handoff = CounterDeltaMicroseconds(
-            slot.submitted_qpc, slot.copy_ready_qpc);
-        SmoothMicroseconds(g_handoff_submit_to_copy_us, handoff);
-        RecordPeakMicroseconds(g_handoff_submit_to_copy_peak_us, handoff);
-        ++g_handoff_samples;
-    }
-    return selected;
-}
-
-static void ArmAsyncProxyWakeForOutputCopy()
-{
-    if (!g_output_copy_queue_active || !g_output_copy_fence || !g_proxy_present_event)
-        return;
-    const UINT64 completed = g_output_copy_fence->GetCompletedValue();
-    UINT64 next_completion = ~0ull;
-    for (PresentationFrameSlot &slot : g_presentation_slots)
-    {
-        if (slot.state.load(std::memory_order_acquire) == PresentationSlotReady &&
-            slot.output_copy_fence_value > completed)
-            next_completion = std::min(next_completion, slot.output_copy_fence_value);
-    }
-    if (next_completion != ~0ull)
-        g_output_copy_fence->SetEventOnCompletion(next_completion, g_proxy_present_event);
 }
 
 static bool PresentProxySourcesOnWorker(ID3D12Resource *real_source,
@@ -7204,28 +7020,11 @@ static bool PresentStagedFrameOnWorker(UINT slot_index)
     if (!slot.state.compare_exchange_strong(expected, PresentationSlotRecording,
             std::memory_order_acq_rel, std::memory_order_acquire))
         return false;
-    LARGE_INTEGER present_begin = {};
-    if (g_performance_telemetry_enabled && slot.output_copy_fence_value != 0)
-    {
-        QueryPerformanceCounter(&present_begin);
-        SmoothMicroseconds(g_handoff_copy_to_present_us,
-            CounterDeltaMicroseconds(slot.copy_ready_qpc, present_begin));
-        SmoothMicroseconds(g_handoff_submit_to_present_us,
-            CounterDeltaMicroseconds(slot.submitted_qpc, present_begin));
-    }
-    ID3D12Resource *original = slot.has_original_frame ?
-        slot.original_input.Get() : slot.real_output.Get();
     const bool presented = PresentProxySourcesOnWorker(slot.real_output.Get(),
-        slot.generated_output.Get(), original, slot.has_generated_frame);
+        slot.generated_output.Get(), slot.original_input.Get(), slot.has_generated_frame);
     slot.fence_value = g_proxy_fence_value;
     slot.state.store(PresentationSlotPresenting, std::memory_order_release);
     return presented;
-}
-
-static bool DedicatedCopyHandoffEnabled()
-{
-    return g_output_copy_queue_active && g_async_compute_active &&
-        g_proxy_explicit_pacing_active && !g_synchronous_proxy_presentation;
 }
 
 static DWORD WINAPI ProxyPresentationThread(void *)
@@ -7237,44 +7036,6 @@ static DWORD WINAPI ProxyPresentationThread(void *)
         const DWORD wait = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
         if (wait == WAIT_OBJECT_0) break;
         if (wait != WAIT_OBJECT_0 + 1) continue;
-
-        if (DedicatedCopyHandoffEnabled())
-        {
-            while (true)
-            {
-                const int presentation_slot_index = FindOldestCompletedPresentationSlot();
-                if (presentation_slot_index < 0)
-                {
-                    ArmAsyncProxyWakeForOutputCopy();
-                    break;
-                }
-                g_proxy_present_request_state.store(2, std::memory_order_release);
-                LARGE_INTEGER worker_begin = {}, worker_end = {};
-                if (g_performance_telemetry_enabled) QueryPerformanceCounter(&worker_begin);
-                const bool presented = PresentStagedFrameOnWorker(
-                    static_cast<UINT>(presentation_slot_index));
-                if (presented)
-                    ++g_proxy_present_completed;
-                else
-                {
-                    const unsigned long long skipped = ++g_proxy_busy_frame_skips;
-                    if (skipped <= 8 || skipped % 120 == 0)
-                        Log("copy-queue presentation request dropped safely (skip=%llu output_slot=%d)",
-                            skipped, presentation_slot_index);
-                }
-                if (g_performance_telemetry_enabled)
-                {
-                    QueryPerformanceCounter(&worker_end);
-                    const unsigned int duration = CounterDeltaMicroseconds(worker_begin, worker_end);
-                    SmoothMicroseconds(g_cpu_proxy_worker_us, duration);
-                    RecordPeakMicroseconds(g_cpu_proxy_worker_peak_us, duration);
-                }
-                ReclaimPipelineFrameSlots();
-                ReclaimPresentationFrameSlots();
-            }
-            g_proxy_present_request_state.store(0, std::memory_order_release);
-            continue;
-        }
 
         while (true)
         {
@@ -7370,25 +7131,6 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer, int slot_index)
         return false;
     }
     ++g_proxy_present_requests;
-
-    if (DedicatedCopyHandoffEnabled())
-    {
-        unsigned int expected = PipelineSlotReady;
-        if (!slot.state.compare_exchange_strong(expected, PipelineSlotPresentRecording,
-                std::memory_order_acq_rel, std::memory_order_acquire))
-            return false;
-        const int presentation_slot_index = StagePipelineFrameForPresentation(
-            static_cast<UINT>(slot_index));
-        if (presentation_slot_index < 0)
-        {
-            ++g_handoff_copy_queue_drops;
-            slot.state.store(PipelineSlotAbandoned, std::memory_order_release);
-            return false;
-        }
-        g_proxy_present_request_state.store(1, std::memory_order_release);
-        SetEvent(g_proxy_present_event);
-        return true;
-    }
 
     if (g_synchronous_proxy_presentation)
     {
@@ -9029,14 +8771,6 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         if (g_async_input_fence_event) CloseHandle(g_async_input_fence_event);
         g_async_input_fence_event = nullptr;
         g_async_input_fence.Reset();
-        for (UINT index = 0; index < kPipelineFrameSlotCount; ++index)
-        {
-            g_output_copy_lists[index].Reset();
-            g_output_copy_allocators[index].Reset();
-        }
-        g_output_copy_fence.Reset();
-        g_output_copy_queue.Reset();
-        g_output_copy_queue_active = false;
         g_async_compute_queue.Reset();
         g_async_compute_active = false;
         if (g_command_queue) g_command_queue->Release();
