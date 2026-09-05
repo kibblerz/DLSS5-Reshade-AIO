@@ -33,7 +33,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.5-async-pacing-dpi-prototype"
+#define ADDON_VERSION "2.0.5-explicit-pacing-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -95,6 +95,12 @@ static HANDLE g_proxy_frame_latency_waitable;
 static HANDLE g_proxy_present_event;
 static HANDLE g_proxy_present_stop_event;
 static HANDLE g_proxy_present_thread;
+static HANDLE g_proxy_pacing_timer;
+static LONGLONG g_proxy_pacing_qpc_frequency;
+static LONGLONG g_proxy_pacing_interval_qpc;
+static LONGLONG g_proxy_next_present_qpc;
+static UINT g_proxy_refresh_hz;
+static bool g_proxy_explicit_pacing_active;
 static bool g_synchronous_proxy_presentation;
 static bool g_requested_synchronous_proxy_presentation;
 // 0 = idle, 1 = a completed pipeline frame is waiting, 2 = the presenter is
@@ -201,6 +207,8 @@ static std::atomic<unsigned int> g_proxy_output_interval_avg_us{0};
 static std::atomic<unsigned int> g_proxy_output_interval_peak_us{0};
 static std::atomic<unsigned int> g_proxy_generated_to_real_us{0};
 static std::atomic<unsigned int> g_proxy_real_to_generated_us{0};
+static std::atomic<unsigned int> g_cpu_proxy_pacing_wait_us{0};
+static std::atomic<unsigned long long> g_proxy_pacing_late_frames{0};
 static LARGE_INTEGER g_proxy_last_accepted_present_qpc;
 static bool g_proxy_last_accepted_was_generated;
 static std::atomic<unsigned int> g_cpu_shared_telemetry_us{0};
@@ -1335,7 +1343,8 @@ static void ResetPerformanceTelemetry()
     g_cpu_proxy_present_us = 0; g_cpu_proxy_worker_us = 0; g_cpu_proxy_worker_peak_us = 0;
     g_proxy_output_interval_us = 0; g_proxy_output_interval_avg_us = 0;
     g_proxy_output_interval_peak_us = 0; g_proxy_generated_to_real_us = 0;
-    g_proxy_real_to_generated_us = 0;
+    g_proxy_real_to_generated_us = 0; g_cpu_proxy_pacing_wait_us = 0;
+    g_proxy_pacing_late_frames = 0;
     g_telemetry_samples = 0;
     g_guide_telemetry_samples = 0; g_proxy_telemetry_samples = 0;
     g_gpu_telemetry_available = false; g_guide_gpu_telemetry_available = false;
@@ -5848,6 +5857,54 @@ static void UpdateOutputFps()
     g_output_fps_sample_start = now;
 }
 
+static bool WaitForExplicitProxyPacing()
+{
+    if (!g_proxy_explicit_pacing_active || g_proxy_pacing_timer == nullptr ||
+        g_proxy_pacing_qpc_frequency <= 0 || g_proxy_pacing_interval_qpc <= 0 ||
+        g_proxy_next_present_qpc <= 0)
+        return true;
+
+    LARGE_INTEGER now = {};
+    QueryPerformanceCounter(&now);
+    const LONGLONG remaining_qpc = g_proxy_next_present_qpc - now.QuadPart;
+    if (remaining_qpc <= 0)
+    {
+        // Never attempt to recover a missed deadline by submitting multiple
+        // frames back-to-back. The accepted Present below reanchors the next
+        // deadline to one complete refresh interval in the future.
+        if (-remaining_qpc > g_proxy_pacing_interval_qpc / 4)
+            ++g_proxy_pacing_late_frames;
+        return true;
+    }
+
+    const unsigned long long relative_100ns = std::max<unsigned long long>(1,
+        (static_cast<unsigned long long>(remaining_qpc) * 10000000ULL +
+            static_cast<unsigned long long>(g_proxy_pacing_qpc_frequency) - 1) /
+        static_cast<unsigned long long>(g_proxy_pacing_qpc_frequency));
+    LARGE_INTEGER due = {};
+    due.QuadPart = -static_cast<LONGLONG>(relative_100ns);
+    if (!SetWaitableTimer(g_proxy_pacing_timer, &due, 0, nullptr, nullptr, FALSE))
+    {
+        Log("explicit proxy pacing timer could not be armed: error=%lu", GetLastError());
+        return true;
+    }
+
+    const HANDLE waits[2] = {g_proxy_present_stop_event, g_proxy_pacing_timer};
+    const DWORD wait = WaitForMultipleObjects(2, waits, FALSE, 50);
+    LARGE_INTEGER finished = {};
+    QueryPerformanceCounter(&finished);
+    SmoothMicroseconds(g_cpu_proxy_pacing_wait_us,
+        CounterDeltaMicroseconds(now, finished));
+    if (wait == WAIT_OBJECT_0)
+        return false;
+    if (wait != WAIT_OBJECT_0 + 1)
+    {
+        ++g_proxy_present_timeouts;
+        Log("explicit proxy pacing wait failed: result=%lu error=%lu", wait, GetLastError());
+    }
+    return true;
+}
+
 static void RecordAcceptedProxyPresent(bool generated)
 {
     LARGE_INTEGER now = {};
@@ -5869,6 +5926,8 @@ static void RecordAcceptedProxyPresent(bool generated)
     }
     g_proxy_last_accepted_present_qpc = now;
     g_proxy_last_accepted_was_generated = generated;
+    if (g_proxy_explicit_pacing_active && g_proxy_pacing_interval_qpc > 0)
+        g_proxy_next_present_qpc = now.QuadPart + g_proxy_pacing_interval_qpc;
 }
 
 static unsigned int CounterDeltaMicroseconds(const LARGE_INTEGER &begin, const LARGE_INTEGER &end)
@@ -5912,18 +5971,21 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
             g_guide_gpu_telemetry_available.load() ? 1u : 0u,
             g_cpu_vort_submit_us.load() / 1000.0f, g_cpu_feed_submit_us.load() / 1000.0f,
             g_cpu_guide_flush_us.load() / 1000.0f);
-        Log("performance proxy: GPU generated=%.3fms real=%.3fms pair=%.3fms samples=%llu available=%u; CPU mailbox=%.3fms fence_wait=%.3fms swap_wait=%.3fms Present=%.3fms worker=%.3fms peak=%.3fms; output interval current=%.3fms avg=%.3fms peak=%.3fms generated->real=%.3fms real->generated=%.3fms; requests=%llu completed=%llu coalesced=%llu timeouts=%llu display_backpressure=%llu; neural deferrals presenter=%llu GPU=%llu",
+        Log("performance proxy: GPU generated=%.3fms real=%.3fms pair=%.3fms samples=%llu available=%u; CPU mailbox=%.3fms fence_wait=%.3fms swap_wait=%.3fms pacing_wait=%.3fms Present=%.3fms worker=%.3fms peak=%.3fms; output interval current=%.3fms avg=%.3fms peak=%.3fms generated->real=%.3fms real->generated=%.3fms target=%uHz late=%llu; requests=%llu completed=%llu coalesced=%llu timeouts=%llu display_backpressure=%llu; neural deferrals presenter=%llu GPU=%llu",
             g_gpu_proxy_generated_us.load() / 1000.0f, g_gpu_proxy_real_us.load() / 1000.0f,
             g_gpu_proxy_total_us.load() / 1000.0f, g_proxy_telemetry_samples.load(),
             g_proxy_gpu_telemetry_available.load() ? 1u : 0u,
             g_cpu_proxy_mailbox_us.load() / 1000.0f, g_cpu_proxy_fence_wait_us.load() / 1000.0f,
-            g_cpu_proxy_swap_wait_us.load() / 1000.0f, g_cpu_proxy_present_us.load() / 1000.0f,
+            g_cpu_proxy_swap_wait_us.load() / 1000.0f,
+            g_cpu_proxy_pacing_wait_us.load() / 1000.0f,
+            g_cpu_proxy_present_us.load() / 1000.0f,
             g_cpu_proxy_worker_us.load() / 1000.0f, g_cpu_proxy_worker_peak_us.load() / 1000.0f,
             g_proxy_output_interval_us.load() / 1000.0f,
             g_proxy_output_interval_avg_us.load() / 1000.0f,
             g_proxy_output_interval_peak_us.load() / 1000.0f,
             g_proxy_generated_to_real_us.load() / 1000.0f,
             g_proxy_real_to_generated_us.load() / 1000.0f,
+            g_proxy_refresh_hz, g_proxy_pacing_late_frames.load(),
             g_proxy_present_requests.load(), g_proxy_present_completed.load(),
             g_proxy_present_coalesced.load(), g_proxy_present_timeouts.load(),
             g_proxy_display_backpressure_drops.load(),
@@ -6044,7 +6106,9 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
     if (!GetMonitorInfoW(monitor, &monitor_info)) { g_proxy_failed = true; return false; }
     DEVMODEW display_mode = {};
     display_mode.dmSize = sizeof(display_mode);
-    if (EnumDisplaySettingsW(monitor_info.szDevice, ENUM_CURRENT_SETTINGS, &display_mode))
+    const bool display_mode_available =
+        EnumDisplaySettingsW(monitor_info.szDevice, ENUM_CURRENT_SETTINGS, &display_mode) != FALSE;
+    if (display_mode_available)
         Log("proxy target monitor: device=%ls desktop=%ldx%ld refresh=%luHz position=(%ld,%ld)-(%ld,%ld) primary=%s",
             monitor_info.szDevice, display_mode.dmPelsWidth, display_mode.dmPelsHeight,
             display_mode.dmDisplayFrequency,
@@ -6054,6 +6118,8 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
     else
         Log("proxy target monitor refresh query failed: device=%ls error=%lu",
             monitor_info.szDevice, GetLastError());
+    g_proxy_refresh_hz = display_mode_available && display_mode.dmDisplayFrequency >= 24 &&
+        display_mode.dmDisplayFrequency <= 1000 ? display_mode.dmDisplayFrequency : 60u;
 
     // Prefer attaching the output to the game's HWND. Vulkan WSI requires its
     // swapchain extent to match the physical client area, though, so a reduced
@@ -6334,6 +6400,26 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
     if (SUCCEEDED(hr)) g_proxy_fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (SUCCEEDED(hr)) g_proxy_present_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (SUCCEEDED(hr)) g_proxy_present_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_proxy_explicit_pacing_active = pace_async_output;
+    g_proxy_next_present_qpc = 0;
+    LARGE_INTEGER pacing_frequency = {};
+    if (g_proxy_explicit_pacing_active && QueryPerformanceFrequency(&pacing_frequency) &&
+        pacing_frequency.QuadPart > 0)
+    {
+        g_proxy_pacing_qpc_frequency = pacing_frequency.QuadPart;
+        g_proxy_pacing_interval_qpc = std::max<LONGLONG>(1,
+            (pacing_frequency.QuadPart + g_proxy_refresh_hz / 2) / g_proxy_refresh_hz);
+        g_proxy_pacing_timer = CreateWaitableTimerExW(nullptr, nullptr,
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        if (g_proxy_pacing_timer == nullptr)
+            g_proxy_pacing_timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+    }
+    if (g_proxy_explicit_pacing_active && g_proxy_pacing_timer == nullptr)
+    {
+        g_proxy_explicit_pacing_active = false;
+        Log("explicit proxy pacing unavailable; using DXGI latency pacing only: error=%lu",
+            GetLastError());
+    }
     if (SUCCEEDED(hr) && g_proxy_fence_event && g_proxy_present_event && g_proxy_present_stop_event)
         g_proxy_present_thread = CreateThread(nullptr, 0, ProxyPresentationThread, nullptr, 0, nullptr);
     if (FAILED(hr) || g_proxy_fence_event == nullptr || g_proxy_present_event == nullptr ||
@@ -6363,14 +6449,17 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
     g_proxy_output_interval_peak_us = 0;
     g_proxy_generated_to_real_us = 0;
     g_proxy_real_to_generated_us = 0;
-    Log("%s compositor ready: %ux%u source_format=%u present_format=%u game_hwnd=%p target_hwnd=%p ownership=%s alpha=%s input_owner=%s DWM_paced=yes presenter=%s buffers=3 max_latency=%u pacing=%s",
+    Log("%s compositor ready: %ux%u source_format=%u present_format=%u game_hwnd=%p target_hwnd=%p ownership=%s alpha=%s input_owner=%s DWM_paced=yes presenter=%s buffers=3 max_latency=%u pacing=%s target=%uHz/%.3fms",
         DetachedPresentationEnabled() ? "detached" : "same-window", width, height,
         static_cast<unsigned int>(source_format), static_cast<unsigned int>(present_format), g_game_window,
         composition_window, g_same_window_compositor ? "attached/game-HWND" : "detached/proxy-HWND",
         desc.AlphaMode == DXGI_ALPHA_MODE_IGNORE ? "opaque/ignore" : "premultiplied",
         DetachedPresentationEnabled() ? "routed-to-game" : "game",
         g_synchronous_proxy_presentation ? "serialized/game-thread" : "asynchronous/worker",
-        proxy_max_frame_latency, pace_async_output ? "one-flip/display-gated" : "legacy");
+        proxy_max_frame_latency,
+        g_proxy_explicit_pacing_active ? "explicit-refresh-timer" :
+            (pace_async_output ? "one-flip/display-gated" : "legacy"),
+        g_proxy_refresh_hz, 1000.0 / std::max(1u, g_proxy_refresh_hz));
     return true;
 }
 
@@ -6575,6 +6664,9 @@ static bool PresentProxyFrameOnWorker(UINT slot_index)
     bool accepted_by_swapchain = false;
     for (UINT present_index = 0; present_index < present_count; ++present_index)
     {
+        const bool explicit_pacing = use_framegen && g_proxy_explicit_pacing_active;
+        if (explicit_pacing && !WaitForExplicitProxyPacing())
+            return false;
         const int command_slot_index = AcquireProxyCommandSlot();
         if (command_slot_index < 0)
         {
@@ -6592,9 +6684,9 @@ static bool PresentProxyFrameOnWorker(UINT slot_index)
         // is full, Present returns WAS_STILL_DRAWING and this slot can be
         // released as soon as its draw completes. The next completed neural
         // frame then becomes the latest candidate for the next refresh.
-        if (use_framegen && g_performance_telemetry_enabled)
+        if (use_framegen && !explicit_pacing && g_performance_telemetry_enabled)
             QueryPerformanceCounter(&wait_begin);
-        if (use_framegen && (g_proxy_frame_latency_waitable == nullptr ||
+        if (use_framegen && !explicit_pacing && (g_proxy_frame_latency_waitable == nullptr ||
             WaitForSingleObject(g_proxy_frame_latency_waitable, 50) != WAIT_OBJECT_0))
         {
             const unsigned long long timeouts = ++g_proxy_present_timeouts;
@@ -6602,7 +6694,7 @@ static bool PresentProxyFrameOnWorker(UINT slot_index)
                 Log("async proxy presenter timed out waiting for a swapchain slot (timeout=%llu)", timeouts);
             return false;
         }
-        if (use_framegen && g_performance_telemetry_enabled)
+        if (use_framegen && !explicit_pacing && g_performance_telemetry_enabled)
         {
             QueryPerformanceCounter(&wait_end);
             SmoothMicroseconds(g_cpu_proxy_swap_wait_us, CounterDeltaMicroseconds(wait_begin, wait_end));
@@ -8377,7 +8469,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         }
         if (g_proxy_present_event) CloseHandle(g_proxy_present_event);
         if (g_proxy_present_stop_event) CloseHandle(g_proxy_present_stop_event);
+        if (g_proxy_pacing_timer) CloseHandle(g_proxy_pacing_timer);
         if (g_proxy_fence_event) CloseHandle(g_proxy_fence_event);
+        g_proxy_pacing_timer = nullptr;
         g_proxy_pipeline.Reset(); g_proxy_root_signature.Reset(); g_proxy_srv_heap.Reset(); g_proxy_rtv_heap.Reset();
         for (UINT index = 0; index < kProxyCommandSlotCount; ++index)
         {
