@@ -32,7 +32,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 
-#define ADDON_VERSION "2.0.3"
+#define ADDON_VERSION "2.0.4-buffered-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -451,6 +451,33 @@ static std::atomic<unsigned long long> g_current_guide_frames{0};
 static Microsoft::WRL::ComPtr<ID3D12Device> g_neural_device;
 static Microsoft::WRL::ComPtr<ID3D12CommandAllocator> g_neural_allocator;
 static Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> g_neural_list;
+static constexpr UINT kPipelineFrameSlotCount = 2;
+enum PipelineFrameSlotState : unsigned int
+{
+    PipelineSlotFree = 0,
+    PipelineSlotRecording = 1,
+    PipelineSlotReady = 2,
+    PipelineSlotPresentRecording = 3,
+    PipelineSlotPresenting = 4,
+    PipelineSlotAbandoned = 5,
+};
+struct PipelineFrameSlot
+{
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+    Microsoft::WRL::ComPtr<ID3D12Resource> real_output;
+    Microsoft::WRL::ComPtr<ID3D12Resource> generated_output;
+    Microsoft::WRL::ComPtr<ID3D12Resource> original_input;
+    std::atomic<unsigned int> state{PipelineSlotFree};
+    UINT64 neural_fence_value = 0;
+    std::atomic<UINT64> proxy_fence_value{0};
+    unsigned long long sequence = 0;
+    bool has_generated_frame = false;
+};
+static PipelineFrameSlot g_pipeline_slots[kPipelineFrameSlotCount];
+static UINT g_next_pipeline_slot;
+static int g_pending_pipeline_slot = -1;
+static ID3D12GraphicsCommandList *g_active_neural_list;
 static Microsoft::WRL::ComPtr<ID3D12Fence> g_neural_fence;
 static HANDLE g_neural_fence_event;
 static UINT64 g_neural_fence_value;
@@ -1245,6 +1272,98 @@ static bool NeuralGpuIdle()
         g_neural_fence->GetCompletedValue() >= g_neural_fence_value;
 }
 
+static ID3D12GraphicsCommandList *NeuralCommandList()
+{
+    return g_active_neural_list != nullptr ? g_active_neural_list : g_neural_list.Get();
+}
+
+static void ReclaimPipelineFrameSlots()
+{
+    const UINT64 neural_completed = g_neural_fence ? g_neural_fence->GetCompletedValue() : 0;
+    const UINT64 proxy_completed = g_proxy_fence ? g_proxy_fence->GetCompletedValue() : 0;
+    for (PipelineFrameSlot &slot : g_pipeline_slots)
+    {
+        unsigned int state = slot.state.load(std::memory_order_acquire);
+        const bool completed = state == PipelineSlotAbandoned ?
+            neural_completed >= slot.neural_fence_value :
+            state == PipelineSlotPresenting &&
+                proxy_completed >= slot.proxy_fence_value.load(std::memory_order_acquire);
+        if (completed)
+            slot.state.compare_exchange_strong(state, PipelineSlotFree,
+                std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+}
+
+static int AcquirePipelineFrameSlot()
+{
+    ReclaimPipelineFrameSlots();
+    for (UINT offset = 0; offset < kPipelineFrameSlotCount; ++offset)
+    {
+        const UINT index = (g_next_pipeline_slot + offset) % kPipelineFrameSlotCount;
+        unsigned int expected = PipelineSlotFree;
+        if (g_pipeline_slots[index].state.compare_exchange_strong(expected, PipelineSlotRecording,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+            g_next_pipeline_slot = (index + 1) % kPipelineFrameSlotCount;
+            return static_cast<int>(index);
+        }
+    }
+    return -1;
+}
+
+static bool BeginNeuralFrameCommands(UINT slot_index)
+{
+    PipelineFrameSlot &slot = g_pipeline_slots[slot_index];
+    HRESULT hr = slot.allocator->Reset();
+    if (SUCCEEDED(hr)) hr = slot.list->Reset(slot.allocator.Get(), nullptr);
+    if (FAILED(hr))
+    {
+        slot.state.store(PipelineSlotFree, std::memory_order_release);
+        Fail("buffered neural command-list reset", static_cast<unsigned int>(hr));
+        return false;
+    }
+    g_active_neural_list = slot.list.Get();
+    ConsumeGpuTelemetry();
+    return true;
+}
+
+static bool SubmitNeuralFrameCommands(UINT slot_index)
+{
+    PipelineFrameSlot &slot = g_pipeline_slots[slot_index];
+    ID3D12GraphicsCommandList *list = NeuralCommandList();
+    HRESULT hr = list->Close();
+    if (FAILED(hr))
+    {
+        g_active_neural_list = nullptr;
+        slot.state.store(PipelineSlotFree, std::memory_order_release);
+        Fail("buffered neural command-list close", static_cast<unsigned int>(hr));
+        return false;
+    }
+    ID3D12CommandList *lists[] = {list};
+    g_command_queue->ExecuteCommandLists(1, lists);
+    const UINT64 value = ++g_neural_fence_value;
+    hr = g_command_queue->Signal(g_neural_fence.Get(), value);
+    g_active_neural_list = nullptr;
+    if (FAILED(hr))
+    {
+        slot.state.store(PipelineSlotAbandoned, std::memory_order_release);
+        Fail("buffered neural queue signal", static_cast<unsigned int>(hr));
+        return false;
+    }
+    slot.neural_fence_value = value;
+    return true;
+}
+
+static void AbortNeuralFrameCommands(UINT slot_index)
+{
+    if (g_active_neural_list != nullptr)
+    {
+        g_active_neural_list->Close();
+        g_active_neural_list = nullptr;
+    }
+    g_pipeline_slots[slot_index].state.store(PipelineSlotFree, std::memory_order_release);
+}
+
 static bool WaitForNeuralGpu(DWORD timeout, bool fatal_on_timeout, const char *stage)
 {
     if (NeuralGpuIdle()) return true;
@@ -1271,6 +1390,7 @@ static bool BeginNeuralCommands(DWORD timeout = 0, bool fatal_on_timeout = false
 {
     if (!WaitForNeuralGpu(timeout, fatal_on_timeout, "neural GPU fence")) return false;
     ConsumeGpuTelemetry();
+    g_active_neural_list = nullptr;
     HRESULT hr = g_neural_allocator->Reset();
     if (SUCCEEDED(hr)) hr = g_neural_list->Reset(g_neural_allocator.Get(), nullptr);
     if (FAILED(hr)) { Fail("neural command-list reset", static_cast<unsigned int>(hr)); return false; }
@@ -1279,9 +1399,10 @@ static bool BeginNeuralCommands(DWORD timeout = 0, bool fatal_on_timeout = false
 
 static bool SubmitNeuralCommands(bool wait)
 {
-    HRESULT hr = g_neural_list->Close();
+    ID3D12GraphicsCommandList *list = NeuralCommandList();
+    HRESULT hr = list->Close();
     if (FAILED(hr)) { Fail("neural command-list close", static_cast<unsigned int>(hr)); return false; }
-    ID3D12CommandList *lists[] = {g_neural_list.Get()};
+    ID3D12CommandList *lists[] = {list};
     g_command_queue->ExecuteCommandLists(1, lists);
     const UINT64 value = ++g_neural_fence_value;
     hr = g_command_queue->Signal(g_neural_fence.Get(), value);
@@ -1619,7 +1740,7 @@ static NVSDK_NGX_Result SafeCreate(bool nr, DWORD *exception)
     *exception = 0;
     __try
     {
-        return g_bridge_create(nr ? g_nr_create : g_sr_create, g_neural_list.Get(),
+        return g_bridge_create(nr ? g_nr_create : g_sr_create, NeuralCommandList(),
             nr ? kFeatureDlssNr : NVSDK_NGX_Feature_SuperSampling, g_ngx_params,
             nr ? &g_nr_feature : &g_sr_feature);
     }
@@ -1635,7 +1756,7 @@ static NVSDK_NGX_Result SafeEvaluate(bool nr, DWORD *exception)
     *exception = 0;
     __try
     {
-        return g_bridge_evaluate(nr ? g_nr_evaluate : g_sr_evaluate, g_neural_list.Get(),
+        return g_bridge_evaluate(nr ? g_nr_evaluate : g_sr_evaluate, NeuralCommandList(),
             nr ? g_nr_feature : g_sr_feature, g_ngx_params, nullptr);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -1671,7 +1792,7 @@ static bool CreateFeatures()
         SetNrCreationContract();
         if (!BeginNeuralCommands(kInitializationGpuWaitMs, true)) return false;
         result = SafeCreate(true, &exception);
-        if (exception) { g_neural_list->Close(); Fail("NR feature creation exception", exception); return false; }
+        if (exception) { NeuralCommandList()->Close(); Fail("NR feature creation exception", exception); return false; }
         if (!SubmitNeuralCommands(true)) return false;
         Log("CreateFeature(feature=18) = 0x%08X (%s), handle=%p", static_cast<unsigned int>(result), ResultName(result), g_nr_feature);
         if (NVSDK_NGX_FAILED(result) || !g_nr_feature) { Fail("NR feature creation", static_cast<unsigned int>(result)); return false; }
@@ -1700,7 +1821,7 @@ static bool CreateFeatures()
         result = SafeCreate(false, &exception);
         if (exception)
         {
-            g_neural_list->Close();
+            NeuralCommandList()->Close();
             Fail("DLSS SR feature creation exception", exception);
             return false;
         }
@@ -1748,7 +1869,7 @@ static bool CreateFeatures()
         result = SafeCreateFg(&exception);
         if (exception)
         {
-            g_neural_list->Close();
+            NeuralCommandList()->Close();
             Log("DLSS-G creation exception 0x%08X; continuing without frame generation", exception);
             g_framegen_failed = true;
         }
@@ -1890,7 +2011,7 @@ static NVSDK_NGX_Result SafeCreateFg(DWORD *exception)
     *exception = 0;
     __try
     {
-        return g_bridge_create(g_fg_create, g_neural_list.Get(),
+        return g_bridge_create(g_fg_create, NeuralCommandList(),
             NVSDK_NGX_Feature_FrameGeneration, g_ngx_params, &g_fg_feature);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -1905,7 +2026,7 @@ static NVSDK_NGX_Result SafeEvaluateFg(DWORD *exception)
     *exception = 0;
     __try
     {
-        return g_bridge_evaluate(g_fg_evaluate, g_neural_list.Get(),
+        return g_bridge_evaluate(g_fg_evaluate, NeuralCommandList(),
             g_fg_feature, g_ngx_params, nullptr);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -1928,9 +2049,23 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
         g_resource_input_width, g_resource_input_height, static_cast<unsigned int>(g_resource_input_format),
         next_width, next_height, static_cast<unsigned int>(next_format));
 
-    // The async presenter may still hold the current output resources while it
-    // records their sampling commands. Defer retirement until those commands
-    // have been submitted; the proxy fence check below then covers GPU use.
+    ReclaimPipelineFrameSlots();
+    for (PipelineFrameSlot &slot : g_pipeline_slots)
+    {
+        const unsigned int state = slot.state.load(std::memory_order_acquire);
+        if (state != PipelineSlotFree)
+        {
+            if (state == PipelineSlotReady && g_proxy_present_event)
+                SetEvent(g_proxy_present_event);
+            Log("resolution reconfiguration deferred: buffered pipeline slot still active (state=%u sequence=%llu)",
+                state, slot.sequence);
+            return false;
+        }
+    }
+
+    // The async presenter may still be between selecting a slot and submitting
+    // its sampling commands. Defer retirement until that short CPU section is
+    // complete; the per-slot proxy fence then covers GPU ownership.
     if (g_proxy_present_request_state.load(std::memory_order_acquire) != 0)
     {
         Log("resolution reconfiguration deferred: async proxy presenter still owns the current frame");
@@ -1999,6 +2134,16 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
     g_fallback_motion.Reset(); g_fallback_depth.Reset();
     ReleaseLegacyFrameResources();
     g_fg_stage.Reset(); g_sr_stage.Reset(); g_nr_stage.Reset();
+    for (PipelineFrameSlot &slot : g_pipeline_slots)
+    {
+        slot.generated_output.Reset();
+        slot.real_output.Reset();
+        slot.original_input.Reset();
+        slot.state.store(PipelineSlotFree, std::memory_order_release);
+        slot.neural_fence_value = 0;
+        slot.proxy_fence_value = 0;
+    }
+    g_pending_pipeline_slot = -1;
     g_post_reshade_color.Reset(); g_post_reshade_color_ready = false;
     g_packed_color.Reset();
 
@@ -2632,6 +2777,16 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
         if (SUCCEEDED(hr)) hr = g_neural_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
             g_neural_allocator.Get(), nullptr, IID_PPV_ARGS(&g_neural_list));
         if (SUCCEEDED(hr)) hr = g_neural_list->Close();
+        for (UINT index = 0; SUCCEEDED(hr) && index < kPipelineFrameSlotCount; ++index)
+        {
+            PipelineFrameSlot &slot = g_pipeline_slots[index];
+            hr = g_neural_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(&slot.allocator));
+            if (SUCCEEDED(hr))
+                hr = g_neural_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    slot.allocator.Get(), nullptr, IID_PPV_ARGS(&slot.list));
+            if (SUCCEEDED(hr)) hr = slot.list->Close();
+        }
         if (SUCCEEDED(hr)) hr = g_neural_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_neural_fence));
         D3D12_DESCRIPTOR_HEAP_DESC guide_heap_desc = {};
         guide_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
@@ -2662,9 +2817,28 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
     const bool post_input_ready = legacy || CreateTexture(iw, ih, input_format, false,
         D3D12_RESOURCE_STATE_COPY_DEST, g_post_reshade_color);
     if (!input_ready || !post_input_ready ||
-        !CreateTexture(iw, ih, result_format, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g_nr_stage) ||
-        !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, g_sr_stage) ||
-        !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, g_fg_stage)) return false;
+        !CreateTexture(iw, ih, result_format, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g_nr_stage)) return false;
+    for (PipelineFrameSlot &slot : g_pipeline_slots)
+    {
+        slot.real_output.Reset();
+        slot.generated_output.Reset();
+        slot.original_input.Reset();
+        slot.neural_fence_value = 0;
+        slot.proxy_fence_value = 0;
+        slot.sequence = 0;
+        slot.has_generated_frame = false;
+        slot.state.store(PipelineSlotFree, std::memory_order_release);
+        if (!CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, slot.real_output) ||
+            !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, slot.generated_output) ||
+            !CreateTexture(iw, ih, input_format, false, D3D12_RESOURCE_STATE_COMMON, slot.original_input))
+            return false;
+    }
+    // These aliases preserve the existing feature/readiness probes. Per-frame
+    // evaluation and presentation use the selected slot resources directly.
+    g_sr_stage = g_pipeline_slots[0].real_output;
+    g_fg_stage = g_pipeline_slots[0].generated_output;
+    g_next_pipeline_slot = 0;
+    g_pending_pipeline_slot = -1;
     const float motion_clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     const float depth_clear[4] = {g_depth_reversed ? 0.0f : 1.0f, 0.0f, 0.0f, 0.0f};
     if (!CreateGuideTexture(iw, ih, DXGI_FORMAT_R16G16_FLOAT, motion_clear, 0, g_fallback_motion) ||
@@ -2681,9 +2855,9 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
     }
     SetStatus("active on present: %s + %s (fallback guides)",
         g_nr_enabled ? "NR" : "NR disabled", SrModeName());
-    Log("resources ready on present: compact packed/NR=%ux%u, %s=%ux%u, input fmt=%u result fmt=%u; fallback guides=%ux%u",
+    Log("resources ready on present: compact packed/NR=%ux%u, %s=%ux%u, input fmt=%u result fmt=%u; fallback guides=%ux%u; buffered pipeline slots=%u",
         iw, ih, SrModeName(), ow, oh, static_cast<unsigned int>(input_format),
-        static_cast<unsigned int>(result_format), iw, ih);
+        static_cast<unsigned int>(result_format), iw, ih, kPipelineFrameSlotCount);
     Log("resolution configuration active without restart: input=%ux%u output=%ux%u mode=%s",
         iw, ih, ow, oh, SrModeName());
     ResetContractCandidate();
@@ -2750,10 +2924,10 @@ static void SetNrEvaluationContract(ID3D12Resource *depth, ID3D12Resource *motio
     g_ngx_params->Set("DLSSNR.UICorrection", 0u);
 }
 
-static void SetSrEvaluationContract(ID3D12Resource *color, ID3D12Resource *depth, ID3D12Resource *motion,
-    ID3D12Resource *history_mask, bool reset)
+static void SetSrEvaluationContract(ID3D12Resource *color, ID3D12Resource *output,
+    ID3D12Resource *depth, ID3D12Resource *motion, ID3D12Resource *history_mask, bool reset)
 {
-    g_ngx_params->Set("Color", color); g_ngx_params->Set("Output", g_sr_stage.Get());
+    g_ngx_params->Set("Color", color); g_ngx_params->Set("Output", output);
     g_ngx_params->Set("Depth", depth); g_ngx_params->Set("MotionVectors", motion);
     g_ngx_params->Set("Reset", reset ? 1 : 0);
     g_ngx_params->Set("Jitter.Offset.X", 0.0f); g_ngx_params->Set("Jitter.Offset.Y", 0.0f);
@@ -2777,18 +2951,19 @@ static void SetSrEvaluationContract(ID3D12Resource *color, ID3D12Resource *depth
     g_ngx_params->Set("DLSS.Indicator.Invert.X.Axis", 0); g_ngx_params->Set("DLSS.Indicator.Invert.Y.Axis", 0);
 }
 
-static void SetFgEvaluationContract(ID3D12Resource *depth, ID3D12Resource *motion, bool reset)
+static void SetFgEvaluationContract(ID3D12Resource *real_output, ID3D12Resource *generated_output,
+    ID3D12Resource *depth, ID3D12Resource *motion, bool reset)
 {
     static float identity[4][4] = {
         {1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}
     };
     const UINT iw = g_resource_input_width, ih = g_resource_input_height;
     const UINT ow = g_resource_output_width, oh = g_resource_output_height;
-    g_ngx_params->Set("DLSSG.Backbuffer", g_sr_stage.Get());
+    g_ngx_params->Set("DLSSG.Backbuffer", real_output);
     g_ngx_params->Set("DLSSG.MVecs", motion);
     g_ngx_params->Set("DLSSG.Depth", depth);
-    g_ngx_params->Set("DLSSG.HUDLess", g_sr_stage.Get());
-    g_ngx_params->Set("DLSSG.OutputInterpolated", g_fg_stage.Get());
+    g_ngx_params->Set("DLSSG.HUDLess", real_output);
+    g_ngx_params->Set("DLSSG.OutputInterpolated", generated_output);
     g_ngx_params->Set("DLSSG.MultiFrameCount", 1u); g_ngx_params->Set("DLSSG.MultiFrameIndex", 1u);
     for (const char *name : {"DLSSG.CameraViewToClip", "DLSSG.ClipToCameraView",
         "DLSSG.ClipToLensClip", "DLSSG.ClipToPrevClip", "DLSSG.PrevClipToClip"})
@@ -3234,33 +3409,27 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
 {
     const bool legacy_input = backbuffer == nullptr;
     if ((!legacy_input && !EnsureStandaloneResources(backbuffer)) || (legacy_input && !g_neural_ready)) return false;
-    // The presenter samples the persistent NR/SR/FG textures on a worker. Do
-    // not queue the next NGX evaluation until that worker has submitted its
-    // reads to the same D3D12 queue. This is a non-blocking ownership handoff:
-    // the game continues presenting and reuses the last completed output.
-    if (g_proxy_present_request_state.load(std::memory_order_acquire) != 0)
-    {
-        ++g_neural_presenter_deferrals;
-        const unsigned long long skipped = ++g_neural_busy_frame_skips;
-        if (skipped <= 8 || skipped % 600 == 0)
-            Log("neural frame deferred for async proxy presenter (skip=%llu)", skipped);
-        return false;
-    }
     if (g_feature_recreate_requested.load())
     {
         if (!NeuralGpuIdle()) return false;
         if (!RecreateFeatures()) return false;
         g_feature_recreate_requested = false;
     }
-    if (!NeuralGpuIdle())
+    const int pipeline_slot_index = AcquirePipelineFrameSlot();
+    if (pipeline_slot_index < 0)
     {
         ++g_neural_gpu_deferrals;
         const unsigned long long skipped = ++g_neural_busy_frame_skips;
         if (skipped <= 8 || skipped % 600 == 0)
-            Log("neural frame skipped without blocking Present: GPU work still active (skip=%llu completed=%llu submitted=%llu)",
-                skipped, g_neural_fence ? g_neural_fence->GetCompletedValue() : 0, g_neural_fence_value);
+            Log("neural frame skipped: both buffered pipeline slots are genuinely occupied (skip=%llu neural=%llu/%llu proxy=%llu/%llu)",
+                skipped, g_neural_fence ? g_neural_fence->GetCompletedValue() : 0, g_neural_fence_value,
+                g_proxy_fence ? g_proxy_fence->GetCompletedValue() : 0, g_proxy_fence_value);
         return false;
     }
+    const UINT slot_index = static_cast<UINT>(pipeline_slot_index);
+    PipelineFrameSlot &pipeline_slot = g_pipeline_slots[slot_index];
+    ID3D12Resource *real_output = pipeline_slot.real_output.Get();
+    ID3D12Resource *generated_output = pipeline_slot.generated_output.Get();
     const unsigned long long source_sequence = g_source_frame_sequence.load(std::memory_order_acquire);
     if (g_last_neural_source_sequence != 0 && source_sequence > g_last_neural_source_sequence + 1)
     {
@@ -3289,12 +3458,13 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     ID3D12Resource *motion = use_external_guides ? g_captured_motion.Get() : g_fallback_motion.Get();
     ID3D12Resource *depth = use_external_guides ? g_captured_depth.Get() : g_fallback_depth.Get();
 
-    if (!BeginNeuralCommands()) return false;
+    if (!BeginNeuralFrameCommands(slot_index)) return false;
+    ID3D12GraphicsCommandList *commands = NeuralCommandList();
     const bool record_gpu_telemetry = g_performance_telemetry_enabled && InitializeGpuTelemetry();
     auto timestamp = [record_gpu_telemetry](UINT index)
     {
         if (record_gpu_telemetry)
-            g_neural_list->EndQuery(g_telemetry_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, index);
+            NeuralCommandList()->EndQuery(g_telemetry_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, index);
     };
     timestamp(0);
     if (!legacy_input)
@@ -3303,7 +3473,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
             Transition(backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
             Transition(g_packed_color.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)
         };
-        g_neural_list->ResourceBarrier(2, copy_begin);
+        commands->ResourceBarrier(2, copy_begin);
         D3D12_TEXTURE_COPY_LOCATION source = {};
         source.pResource = backbuffer;
         source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -3313,18 +3483,18 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         destination.SubresourceIndex = 0;
         const D3D12_BOX source_box = {0, 0, 0, g_resource_input_width, g_resource_input_height, 1};
-        g_neural_list->CopyTextureRegion(&destination, 0, 0, 0, &source, &source_box);
+        commands->CopyTextureRegion(&destination, 0, 0, 0, &source, &source_box);
         D3D12_RESOURCE_BARRIER copy_end[2] = {
             Transition(backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT),
             Transition(g_packed_color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
         };
-        g_neural_list->ResourceBarrier(2, copy_end);
+        commands->ResourceBarrier(2, copy_end);
     }
     else
     {
         D3D12_RESOURCE_BARRIER input_to_srv = Transition(g_packed_color.Get(),
             D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        g_neural_list->ResourceBarrier(1, &input_to_srv);
+        commands->ResourceBarrier(1, &input_to_srv);
     }
 
     if (legacy_input && use_external_guides)
@@ -3341,7 +3511,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         if (g_nr_mask_available)
             guide_barriers[guide_count++] = Transition(g_captured_nr_mask.Get(),
                 D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        g_neural_list->ResourceBarrier(guide_count, guide_barriers);
+        commands->ResourceBarrier(guide_count, guide_barriers);
     }
 
     if (!use_external_guides)
@@ -3350,19 +3520,19 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
             Transition(motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
             Transition(depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET)
         };
-        g_neural_list->ResourceBarrier(2, guides_to_rtv);
+        commands->ResourceBarrier(2, guides_to_rtv);
         D3D12_CPU_DESCRIPTOR_HANDLE motion_rtv = g_guide_rtv_heap->GetCPUDescriptorHandleForHeapStart();
         D3D12_CPU_DESCRIPTOR_HANDLE depth_rtv = motion_rtv;
         depth_rtv.ptr += g_guide_rtv_stride;
         const float motion_clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         const float depth_clear[4] = {g_depth_reversed ? 0.0f : 1.0f, 0.0f, 0.0f, 0.0f};
-        g_neural_list->ClearRenderTargetView(motion_rtv, motion_clear, 0, nullptr);
-        g_neural_list->ClearRenderTargetView(depth_rtv, depth_clear, 0, nullptr);
+        commands->ClearRenderTargetView(motion_rtv, motion_clear, 0, nullptr);
+        commands->ClearRenderTargetView(depth_rtv, depth_clear, 0, nullptr);
         D3D12_RESOURCE_BARRIER guides_to_srv[2] = {
             Transition(motion, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             Transition(depth, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
         };
-        g_neural_list->ResourceBarrier(2, guides_to_srv);
+        commands->ResourceBarrier(2, guides_to_srv);
     }
     else if (g_stable_sr_history)
     {
@@ -3371,13 +3541,13 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         // resolution recreation rather than relying on allocation contents.
         D3D12_RESOURCE_BARRIER to_rtv = Transition(g_fallback_motion.Get(),
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        g_neural_list->ResourceBarrier(1, &to_rtv);
+        commands->ResourceBarrier(1, &to_rtv);
         const float zero_motion[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        g_neural_list->ClearRenderTargetView(g_guide_rtv_heap->GetCPUDescriptorHandleForHeapStart(),
+        commands->ClearRenderTargetView(g_guide_rtv_heap->GetCPUDescriptorHandleForHeapStart(),
             zero_motion, 0, nullptr);
         D3D12_RESOURCE_BARRIER to_srv = Transition(g_fallback_motion.Get(),
             D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        g_neural_list->ResourceBarrier(1, &to_srv);
+        commands->ResourceBarrier(1, &to_srv);
     }
 
     timestamp(1);
@@ -3385,8 +3555,8 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     const bool reset = g_need_history_reset || g_reset_every_frame;
     g_need_history_reset = false;
     D3D12_RESOURCE_BARRIER sr_to_uav = Transition(
-        g_sr_stage.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    g_neural_list->ResourceBarrier(1, &sr_to_uav);
+        real_output, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    commands->ResourceBarrier(1, &sr_to_uav);
     DWORD exception = 0;
     NVSDK_NGX_Result nr_result = NVSDK_NGX_Result_Success;
     // Strength zero is an exact bypass for this experiment: do not merely bind
@@ -3401,7 +3571,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         nr_result = SafeEvaluate(true, &exception);
         if (exception)
         {
-            g_neural_list->Close();
+            AbortNeuralFrameCommands(slot_index);
             Fail("on-present NR evaluation exception", exception);
             return false;
         }
@@ -3412,7 +3582,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     if (evaluate_nr)
     {
         nr_to_srv = Transition(g_nr_stage.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        g_neural_list->ResourceBarrier(1, &nr_to_srv);
+        commands->ResourceBarrier(1, &nr_to_srv);
         sr_color = g_nr_stage.Get();
     }
     // Keep motion-guided NR, but do not let generic optical-flow errors persist
@@ -3420,12 +3590,12 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     ID3D12Resource *sr_motion = g_stable_sr_history ? g_fallback_motion.Get() : motion;
     ID3D12Resource *history_mask = !g_stable_sr_history && use_external_guides && g_mask_available ? g_captured_mask.Get() : nullptr;
     const bool sr_reset = g_stable_sr_history || reset;
-    SetSrEvaluationContract(sr_color, depth, sr_motion, history_mask, sr_reset);
+    SetSrEvaluationContract(sr_color, real_output, depth, sr_motion, history_mask, sr_reset);
     NVSDK_NGX_Result sr_result = static_cast<NVSDK_NGX_Result>(0xBAD00004);
     if (NVSDK_NGX_SUCCEED(nr_result)) sr_result = SafeEvaluate(false, &exception);
     if (exception)
     {
-        g_neural_list->Close();
+        AbortNeuralFrameCommands(slot_index);
         Fail("on-present DLSS SR evaluation exception", exception);
         return false;
     }
@@ -3436,18 +3606,19 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     if (evaluate_fg)
     {
         D3D12_RESOURCE_BARRIER fg_begin[2] = {
-            Transition(g_sr_stage.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            Transition(real_output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-            Transition(g_fg_stage.Get(), D3D12_RESOURCE_STATE_COMMON,
+            Transition(generated_output, D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
         };
-        g_neural_list->ResourceBarrier(2, fg_begin);
-        SetFgEvaluationContract(depth, motion, reset || g_fg_frames.load() == 0);
+        commands->ResourceBarrier(2, fg_begin);
+        SetFgEvaluationContract(real_output, generated_output, depth, motion,
+            reset || g_fg_frames.load() == 0);
         exception = 0;
         fg_result = SafeEvaluateFg(&exception);
         if (exception)
         {
-            g_neural_list->Close();
+            AbortNeuralFrameCommands(slot_index);
             Log("DLSS-G evaluation exception 0x%08X; frame generation disabled", exception);
             g_framegen_failed = true;
             return false;
@@ -3462,13 +3633,13 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (evaluate_fg)
     {
-        restore[restore_count++] = Transition(g_sr_stage.Get(),
+        restore[restore_count++] = Transition(real_output,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-        restore[restore_count++] = Transition(g_fg_stage.Get(),
+        restore[restore_count++] = Transition(generated_output,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
     }
     else
-        restore[restore_count++] = Transition(g_sr_stage.Get(),
+        restore[restore_count++] = Transition(real_output,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
     if (legacy_input)
         restore[restore_count++] = Transition(g_packed_color.Get(),
@@ -3486,12 +3657,29 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
             restore[restore_count++] = Transition(g_captured_nr_mask.Get(),
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     }
-    g_neural_list->ResourceBarrier(restore_count, restore);
+    commands->ResourceBarrier(restore_count, restore);
+
+    // Preserve the exact source frame used by this NGX submission. F10 and
+    // overlay composition can now sample it asynchronously without racing the
+    // next game-frame capture into g_packed_color.
+    const D3D12_RESOURCE_STATES packed_base_state = legacy_input ?
+        D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    D3D12_RESOURCE_BARRIER snapshot_begin[2] = {
+        Transition(g_packed_color.Get(), packed_base_state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        Transition(pipeline_slot.original_input.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)
+    };
+    commands->ResourceBarrier(2, snapshot_begin);
+    commands->CopyResource(pipeline_slot.original_input.Get(), g_packed_color.Get());
+    D3D12_RESOURCE_BARRIER snapshot_end[2] = {
+        Transition(g_packed_color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, packed_base_state),
+        Transition(pipeline_slot.original_input.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)
+    };
+    commands->ResourceBarrier(2, snapshot_end);
     timestamp(5);
     if (record_gpu_telemetry)
-        g_neural_list->ResolveQueryData(g_telemetry_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+        commands->ResolveQueryData(g_telemetry_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
             0, kTelemetryQueryCount, g_telemetry_readback.Get(), 0);
-    if (!SubmitNeuralCommands(false)) return false;
+    if (!SubmitNeuralFrameCommands(slot_index)) return false;
     g_last_neural_source_sequence = source_sequence;
     if (record_gpu_telemetry)
     {
@@ -3501,11 +3689,16 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     if (legacy_input)
     {
         const UINT64 done = ++g_legacy_fence_value;
-        if (FAILED(g_command_queue->Signal(g_legacy_fence12.Get(), done))) return false;
+        if (FAILED(g_command_queue->Signal(g_legacy_fence12.Get(), done)))
+        {
+            pipeline_slot.state.store(PipelineSlotAbandoned, std::memory_order_release);
+            return false;
+        }
         g_legacy_d3d12_done_value = done;
     }
     if (NVSDK_NGX_FAILED(nr_result) || NVSDK_NGX_FAILED(sr_result))
     {
+        pipeline_slot.state.store(PipelineSlotAbandoned, std::memory_order_release);
         Log("on-present evaluation failure: NR=0x%08X (%s), SR=0x%08X (%s)",
             static_cast<unsigned int>(nr_result), ResultName(nr_result),
             static_cast<unsigned int>(sr_result), ResultName(sr_result));
@@ -3524,6 +3717,11 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
             g_framegen_failed = true;
         }
     }
+
+    pipeline_slot.sequence = source_sequence;
+    pipeline_slot.has_generated_frame = evaluate_fg && NVSDK_NGX_SUCCEED(fg_result) && !g_framegen_failed;
+    pipeline_slot.state.store(PipelineSlotReady, std::memory_order_release);
+    g_pending_pipeline_slot = static_cast<int>(slot_index);
 
     const unsigned long long frame = ++g_sr_frames;
     if (evaluate_nr) ++g_nr_frames;
@@ -5613,26 +5811,42 @@ static bool AdoptPresentQueue(reshade::api::command_queue *queue)
     return true;
 }
 
-static bool PresentProxyFrameOnWorker()
+static int ClaimOldestReadyPipelineSlot()
 {
-    ID3D12Resource *real_source = g_nr_output;
-    ID3D12Resource *original_source = g_packed_color.Get();
+    int selected = -1;
+    unsigned long long oldest = ~0ull;
+    for (UINT index = 0; index < kPipelineFrameSlotCount; ++index)
+    {
+        PipelineFrameSlot &slot = g_pipeline_slots[index];
+        if (slot.state.load(std::memory_order_acquire) == PipelineSlotReady && slot.sequence < oldest)
+        {
+            selected = static_cast<int>(index);
+            oldest = slot.sequence;
+        }
+    }
+    if (selected < 0) return -1;
+    unsigned int expected = PipelineSlotReady;
+    return g_pipeline_slots[selected].state.compare_exchange_strong(expected, PipelineSlotPresentRecording,
+        std::memory_order_acq_rel, std::memory_order_acquire) ? selected : -1;
+}
+
+static bool PresentProxyFrameOnWorker(UINT slot_index)
+{
+    PipelineFrameSlot &pipeline_slot = g_pipeline_slots[slot_index];
+    ID3D12Resource *real_source = pipeline_slot.real_output.Get();
+    ID3D12Resource *original_source = pipeline_slot.original_input.Get();
     if (g_proxy_hidden || g_proxy_transition_hold || g_sr_frames.load() == 0 || real_source == nullptr ||
         original_source == nullptr || g_proxy_swapchain == nullptr) return false;
 
     const bool use_framegen = EffectiveFramegenEnabled() && !g_framegen_failed &&
-        g_show_neural_output && g_fg_stage && g_fg_frames.load() >= 2;
-    const bool legacy = g_present_api == reshade::api::device_api::d3d11 ||
-        g_present_api == reshade::api::device_api::d3d9 ||
-        g_present_api == reshade::api::device_api::vulkan;
-    const D3D12_RESOURCE_STATES original_base_state = legacy ?
-        D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        g_show_neural_output && pipeline_slot.has_generated_frame && g_fg_frames.load() >= 2;
+    const D3D12_RESOURCE_STATES original_base_state = D3D12_RESOURCE_STATE_COMMON;
     const bool composite_post = !g_proxy_overlay_preview.load() &&
         g_reshade_overlay_open.load() &&
         g_post_reshade_color_ready.load(std::memory_order_acquire) && g_post_reshade_color;
     ID3D12Resource *post_source = composite_post ? g_post_reshade_color.Get() : original_source;
     ID3D12Resource *present_sources[2] = {
-        use_framegen ? g_fg_stage.Get() : real_source,
+        use_framegen ? pipeline_slot.generated_output.Get() : real_source,
         real_source
     };
     const UINT present_count = use_framegen ? 2u : 1u;
@@ -5810,12 +6024,6 @@ static bool PresentProxyFrameOnWorker()
         g_proxy_telemetry_present_count = present_count;
         g_proxy_telemetry_pending = true;
     }
-    if (legacy)
-    {
-        const UINT64 done = ++g_legacy_fence_value;
-        if (FAILED(g_command_queue->Signal(g_legacy_fence12.Get(), done))) return false;
-        g_legacy_d3d12_done_value = done;
-    }
     const unsigned long long post_frame = ++g_post_reshade_frames;
     if (post_frame == 1)
         Log("post-ReShade native presentation active; effects and overlay are available to the proxy compositor");
@@ -5846,38 +6054,44 @@ static DWORD WINAPI ProxyPresentationThread(void *)
         if (wait == WAIT_OBJECT_0) break;
         if (wait != WAIT_OBJECT_0 + 1) continue;
 
-        unsigned int expected = 1;
-        if (!g_proxy_present_request_state.compare_exchange_strong(expected, 2,
-                std::memory_order_acq_rel, std::memory_order_acquire))
-            continue;
+        while (true)
+        {
+            const int slot_index = ClaimOldestReadyPipelineSlot();
+            if (slot_index < 0) break;
+            g_proxy_present_request_state.store(2, std::memory_order_release);
 
-        LARGE_INTEGER worker_begin = {}, worker_end = {};
-        if (g_performance_telemetry_enabled)
-        {
-            QueryPerformanceCounter(&worker_begin);
-            LARGE_INTEGER queued = {};
-            queued.QuadPart = g_proxy_request_qpc.exchange(0, std::memory_order_acq_rel);
-            if (queued.QuadPart != 0)
-                SmoothMicroseconds(g_cpu_proxy_mailbox_us,
-                    CounterDeltaMicroseconds(queued, worker_begin));
-        }
-        const bool presented = PresentProxyFrameOnWorker();
-        if (!presented)
-        {
-            const unsigned long long skipped = ++g_proxy_busy_frame_skips;
-            if (skipped <= 8 || skipped % 120 == 0)
-                Log("async proxy presentation request dropped safely (skip=%llu)", skipped);
-        }
-        else
-        {
-            ++g_proxy_present_completed;
-        }
-        if (g_performance_telemetry_enabled)
-        {
-            QueryPerformanceCounter(&worker_end);
-            const unsigned int duration = CounterDeltaMicroseconds(worker_begin, worker_end);
-            SmoothMicroseconds(g_cpu_proxy_worker_us, duration);
-            RecordPeakMicroseconds(g_cpu_proxy_worker_peak_us, duration);
+            LARGE_INTEGER worker_begin = {}, worker_end = {};
+            if (g_performance_telemetry_enabled)
+            {
+                QueryPerformanceCounter(&worker_begin);
+                LARGE_INTEGER queued = {};
+                queued.QuadPart = g_proxy_request_qpc.exchange(0, std::memory_order_acq_rel);
+                if (queued.QuadPart != 0)
+                    SmoothMicroseconds(g_cpu_proxy_mailbox_us,
+                        CounterDeltaMicroseconds(queued, worker_begin));
+            }
+            const bool presented = PresentProxyFrameOnWorker(static_cast<UINT>(slot_index));
+            PipelineFrameSlot &slot = g_pipeline_slots[slot_index];
+            slot.proxy_fence_value.store(g_proxy_fence_value, std::memory_order_release);
+            slot.state.store(PipelineSlotPresenting, std::memory_order_release);
+            if (!presented)
+            {
+                const unsigned long long skipped = ++g_proxy_busy_frame_skips;
+                if (skipped <= 8 || skipped % 120 == 0)
+                    Log("async proxy presentation request dropped safely (skip=%llu slot=%d)", skipped, slot_index);
+            }
+            else
+            {
+                ++g_proxy_present_completed;
+            }
+            if (g_performance_telemetry_enabled)
+            {
+                QueryPerformanceCounter(&worker_end);
+                const unsigned int duration = CounterDeltaMicroseconds(worker_begin, worker_end);
+                SmoothMicroseconds(g_cpu_proxy_worker_us, duration);
+                RecordPeakMicroseconds(g_cpu_proxy_worker_peak_us, duration);
+            }
+            ReclaimPipelineFrameSlots();
         }
         g_proxy_present_request_state.store(0, std::memory_order_release);
     }
@@ -5886,23 +6100,18 @@ static DWORD WINAPI ProxyPresentationThread(void *)
     return 0;
 }
 
-static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
+static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer, int slot_index)
 {
-    ID3D12Resource *real_source = g_nr_output;
-    ID3D12Resource *original_source = g_packed_color.Get();
+    if (slot_index < 0 || slot_index >= static_cast<int>(kPipelineFrameSlotCount)) return false;
+    PipelineFrameSlot &slot = g_pipeline_slots[slot_index];
+    ID3D12Resource *real_source = slot.real_output.Get();
+    ID3D12Resource *original_source = slot.original_input.Get();
     if (g_proxy_hidden || g_proxy_transition_hold || g_sr_frames.load() == 0 || real_source == nullptr ||
         original_source == nullptr || backbuffer == nullptr || !EnsureProxy(real_source) ||
         g_proxy_present_event == nullptr || g_proxy_present_thread == nullptr)
-        return false;
-
-    unsigned int expected = 0;
-    if (!g_proxy_present_request_state.compare_exchange_strong(expected, 1,
-            std::memory_order_acq_rel, std::memory_order_acquire))
     {
-        // The request already in flight uses the latest completed persistent
-        // pipeline output. Coalesce repeats instead of blocking the game.
-        ++g_proxy_present_coalesced;
-        return true;
+        slot.state.store(PipelineSlotAbandoned, std::memory_order_release);
+        return false;
     }
     ++g_proxy_present_requests;
 
@@ -5912,10 +6121,16 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
         // not safe when another swapchain calls Present concurrently. ReShade
         // has already flushed the game command list at this boundary, so record,
         // submit and present the composition image on this same game thread.
+        unsigned int expected = PipelineSlotReady;
+        if (!slot.state.compare_exchange_strong(expected, PipelineSlotPresentRecording,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+            return false;
         g_proxy_present_request_state.store(2, std::memory_order_release);
         LARGE_INTEGER worker_begin = {}, worker_end = {};
         if (g_performance_telemetry_enabled) QueryPerformanceCounter(&worker_begin);
-        const bool presented = PresentProxyFrameOnWorker();
+        const bool presented = PresentProxyFrameOnWorker(static_cast<UINT>(slot_index));
+        slot.proxy_fence_value.store(g_proxy_fence_value, std::memory_order_release);
+        slot.state.store(PipelineSlotPresenting, std::memory_order_release);
         if (presented) ++g_proxy_present_completed;
         else ++g_proxy_busy_frame_skips;
         if (g_performance_telemetry_enabled)
@@ -5926,6 +6141,7 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
             RecordPeakMicroseconds(g_cpu_proxy_worker_peak_us, duration);
         }
         g_proxy_present_request_state.store(0, std::memory_order_release);
+        ReclaimPipelineFrameSlots();
         return presented;
     }
 
@@ -5935,9 +6151,10 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer)
         QueryPerformanceCounter(&queued);
         g_proxy_request_qpc.store(queued.QuadPart, std::memory_order_release);
     }
+    g_proxy_present_request_state.store(1, std::memory_order_release);
     if (!SetEvent(g_proxy_present_event))
     {
-        g_proxy_present_request_state.store(0, std::memory_order_release);
+        slot.state.store(PipelineSlotAbandoned, std::memory_order_release);
         return false;
     }
     return true;
@@ -5995,9 +6212,16 @@ static void OnReshadePresent(reshade::api::effect_runtime *runtime)
     }
     if (runtime != g_runtime || !g_pending_proxy_frame) return;
     g_pending_proxy_frame = false;
-    if (!g_enabled || g_neural_failed || g_proxy_hidden) return;
+    const int slot_index = g_pending_pipeline_slot;
+    g_pending_pipeline_slot = -1;
+    auto abandon_slot = [slot_index]()
+    {
+        if (slot_index >= 0 && slot_index < static_cast<int>(kPipelineFrameSlotCount))
+            g_pipeline_slots[slot_index].state.store(PipelineSlotAbandoned, std::memory_order_release);
+    };
+    if (!g_enabled || g_neural_failed || g_proxy_hidden) { abandon_slot(); return; }
     const reshade::api::resource resource = runtime->get_current_back_buffer();
-    if (!resource.handle) return;
+    if (!resource.handle) { abandon_slot(); return; }
 
     reshade::api::command_queue *queue = runtime->get_command_queue();
     const reshade::api::device_api api = runtime->get_device()->get_api();
@@ -6013,21 +6237,21 @@ static void OnReshadePresent(reshade::api::effect_runtime *runtime)
             if (g_proxy_present_request_state.load(std::memory_order_acquire) != 0)
             {
                 ++g_proxy_present_coalesced;
-                return;
             }
-            if (!CapturePostReshadeFrame(backbuffer))
+            else if (!CapturePostReshadeFrame(backbuffer))
             {
                 Log("native compositor could not capture the post-ReShade menu frame");
-                return;
             }
         }
-        PresentProxyAfterReshade(backbuffer);
+        PresentProxyAfterReshade(backbuffer, slot_index);
     }
     else if ((api == reshade::api::device_api::d3d11 || api == reshade::api::device_api::d3d9) &&
         CopyLegacyFrameToD3D12(reinterpret_cast<void *>(resource.handle), true))
-        PresentProxyAfterReshade(g_legacy_post12.Get());
+        PresentProxyAfterReshade(g_legacy_post12.Get(), slot_index);
     else if (api == reshade::api::device_api::vulkan)
-        PresentProxyAfterReshade(g_packed_color.Get());
+        PresentProxyAfterReshade(g_packed_color.Get(), slot_index);
+    else
+        abandon_slot();
 }
 
 static void OnReshadeFinishEffects(reshade::api::effect_runtime *runtime,
@@ -6360,6 +6584,16 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         g_last_logged_mouse_event = routed_mouse_events;
         Log("proxy forwarded gameplay mouse event=%llu", routed_mouse_events);
     }
+    // A normal ReShade Present consumes this immediately. If a title skipped
+    // that callback, retire the orphaned slot rather than leaking one half of
+    // the frame ring forever.
+    if (g_pending_pipeline_slot >= 0 &&
+        g_pending_pipeline_slot < static_cast<int>(kPipelineFrameSlotCount))
+    {
+        g_pipeline_slots[g_pending_pipeline_slot].state.store(
+            PipelineSlotAbandoned, std::memory_order_release);
+        g_pending_pipeline_slot = -1;
+    }
     g_pending_proxy_frame = false;
     g_vulkan_release_wait_queued = false;
     g_vulkan_input_copy_recorded = false;
@@ -6420,12 +6654,8 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         g_input_height = backbuffer_desc.Height;
         if (!ExecuteOnPresentPipeline(backbuffer))
         {
-            // A busy neural queue is a dropped enhancement frame, not a reason
-            // to stall the game's Present thread. Re-present the last completed
-            // output when it is safe and otherwise leave the game surface alone.
-            if (!g_neural_failed && !g_proxy_hidden && !g_proxy_transition_hold && g_neural_ready &&
-                g_nr_output != nullptr && EnsureProxy(g_nr_output))
-                g_pending_proxy_frame = true;
+            // A genuinely full pipeline ring is fail-open: the existing proxy
+            // backbuffer remains visible until a fresh slot becomes available.
             return;
         }
     }
@@ -7405,6 +7635,16 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         g_guide_telemetry_fence.Reset(); g_guide_telemetry_readback.Reset();
         g_guide_telemetry_query_heap.Reset();
         g_telemetry_readback.Reset(); g_telemetry_query_heap.Reset();
+        for (PipelineFrameSlot &slot : g_pipeline_slots)
+        {
+            slot.generated_output.Reset();
+            slot.real_output.Reset();
+            slot.original_input.Reset();
+            slot.list.Reset();
+            slot.allocator.Reset();
+            slot.state.store(PipelineSlotFree, std::memory_order_release);
+        }
+        g_active_neural_list = nullptr;
         g_neural_list.Reset(); g_neural_allocator.Reset(); g_neural_fence.Reset(); g_neural_device.Reset();
         if (g_neural_fence_event) CloseHandle(g_neural_fence_event);
         if (g_command_queue) g_command_queue->Release();
