@@ -35,6 +35,9 @@ Bring Neural Rendering, DLAA/DLSS Super Resolution, and Frame Generation to supp
 
 Reduced-resolution DLSS SR can provide major performance improvements. Native-resolution DLAA instead prioritizes image quality.
 
+> [!IMPORTANT]
+> **If performance is unexpectedly low or stuttery, set an in-game or external frame cap below the uncapped source frame rate.** NR and Frame Generation can overwhelm the pipeline when the game submits frames faster than NGX can process them. Counterintuitively, a lower cap may increase the final displayed FPS and eliminate stuttering: in testing, a game struggling around 45 FPS with NR + FG became a consistent 60 FPS after its source frame rate was capped at 30. Start with a 30 FPS source cap for a 60 FPS FG target, then raise it gradually while watching frame pacing.
+
 - Press **F10** to compare the processed image with the original game output.
 - Press **Ctrl+Alt+P** to cycle through the modern DLSS render presets **J → K → L → M**. NVIDIA Default remains selectable in ReShade. A three-second corner notice shows the selected preset and the mode it was designed to target; the ReShade status separately reports the pipeline's actual active DLAA/DLSS mode.
 - Press **Ctrl+Alt+N** to cycle through Neural Rendering models **1 → 2 → 3**. A three-second corner notice confirms the selected model.
@@ -64,6 +67,7 @@ Open **ReShade > Add-ons > Standalone DLSS-NR + SR**, then expand **Compatibilit
 
 | What you see | Setting or action to use |
 | --- | --- |
+| **Performance is much lower than expected, FPS fluctuates, or motion stutters despite NR/FG being active** | Apply a frame cap **below the current uncapped source FPS**. With Frame Generation, try a 30 FPS source cap for a stable 60 FPS output, then increase it gradually. A lower cap can produce a higher and smoother final frame rate by preventing the game from flooding the NGX pipeline. |
 | **The image is small, stuck in a corner, or only occupies part of the screen** | Enable **Force reduced-window virtualization**. This is the first option to try for a wrongly sized image. Restart if the image does not settle immediately. |
 | **The picture is correct, but mouse clicks land in the wrong place or only part of the screen is clickable** | Enable **Scale window input coordinates to render resolution**. It automatically enables **Force reduced-window virtualization**, which it requires. |
 | **The game does not capture the mouse, the pointer escapes, or camera rotation stops at a screen edge** | Enable **Hide detached Windows cursor**. Turn it back off if the game needs the normal Windows cursor for its menus; automatic cursor handling works in most games. |
@@ -110,6 +114,12 @@ The new **Compatibility / troubleshooting** panel provides opt-in fixes for game
 Resolution transitions are serialized outside the game's DXGI callback, failed sessions can recover into serialized mode by holding **F8** during launch, and startup contract changes hold the last completed native frame instead of repeatedly exposing the low-resolution game surface.
 
 Because presentation behavior varies substantially between engines, 2.0 may work better or worse than 1.x in a particular game. Keep [v1.7.24](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/tag/v1.7.24) available as the stable 1.x fallback and report regressions with the game name, graphics API, display mode, and persistent addon log.
+
+### Version 2.0.4
+
+The asynchronous NGX compute pipeline is enabled by default when no explicit per-game setting exists. It uses the common post-capture NR/DLSS/FG scheduler tested across D3D9, D3D11, D3D12, and Vulkan games; users may still disable it per game for compatibility. A detected crash is now diagnostic only and never silently enables serialized presentation on the next launch. Holding **F8** during startup remains the deliberate manual safe-mode option.
+
+If NR and Frame Generation exhibit poor throughput or uneven pacing, cap the game's source frame rate below its uncapped rate. This can reduce NGX queue pressure enough to increase the final generated output rate rather than merely limiting it.
 
 ### Version 2.0.2
 
