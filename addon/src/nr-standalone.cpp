@@ -33,7 +33,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.6-queued-presentation-prototype"
+#define ADDON_VERSION "2.0.5-decoupled-presentation-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -80,12 +80,6 @@ static Microsoft::WRL::ComPtr<ID3D12CommandAllocator> g_proxy_allocators[kProxyC
 static Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> g_proxy_lists[kProxyCommandSlotCount];
 static UINT64 g_proxy_command_fence_values[kProxyCommandSlotCount] = {};
 static UINT g_next_proxy_command_slot;
-static constexpr UINT kStageCommandSlotCount = 3;
-static Microsoft::WRL::ComPtr<ID3D12CommandAllocator> g_stage_allocators[kStageCommandSlotCount];
-static Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> g_stage_lists[kStageCommandSlotCount];
-static UINT64 g_stage_command_fence_values[kStageCommandSlotCount] = {};
-static UINT g_next_stage_command_slot;
-static SRWLOCK g_proxy_submission_lock = SRWLOCK_INIT;
 static Microsoft::WRL::ComPtr<ID3D12Fence> g_proxy_fence;
 static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> g_proxy_rtv_heap;
 static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> g_proxy_srv_heap;
@@ -95,14 +89,12 @@ static UINT g_proxy_rtv_stride;
 static UINT g_proxy_srv_stride;
 static DXGI_FORMAT g_proxy_present_format;
 static HANDLE g_proxy_fence_event;
-static std::atomic<UINT64> g_proxy_fence_value{0};
+static UINT64 g_proxy_fence_value;
 static bool g_proxy_allow_tearing;
 static HANDLE g_proxy_frame_latency_waitable;
 static HANDLE g_proxy_present_event;
-static HANDLE g_proxy_display_event;
 static HANDLE g_proxy_present_stop_event;
 static HANDLE g_proxy_present_thread;
-static HANDLE g_proxy_display_thread;
 static HANDLE g_proxy_pacing_timer;
 static LONGLONG g_proxy_pacing_qpc_frequency;
 static LONGLONG g_proxy_pacing_interval_qpc;
@@ -114,8 +106,6 @@ static bool g_requested_synchronous_proxy_presentation;
 // 0 = idle, 1 = a completed pipeline frame is waiting, 2 = the presenter is
 // recording/submitting that frame. The game thread never waits on this state.
 static std::atomic<unsigned int> g_proxy_present_request_state{0};
-static std::atomic<bool> g_proxy_stage_active{false};
-static std::atomic<bool> g_proxy_display_active{false};
 static std::atomic<unsigned long long> g_proxy_present_coalesced{0};
 static std::atomic<unsigned long long> g_proxy_present_timeouts{0};
 static std::atomic<unsigned long long> g_proxy_display_backpressure_drops{0};
@@ -224,9 +214,6 @@ static bool g_proxy_last_accepted_was_generated;
 static std::atomic<unsigned int> g_cpu_shared_telemetry_us{0};
 static std::atomic<unsigned long long> g_proxy_present_requests{0};
 static std::atomic<unsigned long long> g_proxy_present_completed{0};
-static std::atomic<unsigned long long> g_presentation_staged_pairs{0};
-static std::atomic<unsigned long long> g_presentation_stale_pairs{0};
-static std::atomic<unsigned int> g_presentation_queue_high_water{0};
 static std::atomic<unsigned long long> g_neural_presenter_deferrals{0};
 static std::atomic<unsigned long long> g_neural_gpu_deferrals{0};
 static std::atomic<unsigned long long> g_source_frame_sequence{0};
@@ -2498,8 +2485,6 @@ static NVSDK_NGX_Result SafeEvaluateFg(DWORD *exception)
     }
 }
 
-static bool ProxyWorkersActive();
-
 static void ClearPublishedOutput()
 {
     ID3D12Resource *old = static_cast<ID3D12Resource *>(
@@ -2542,7 +2527,7 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
     // The async presenter may still be between selecting a slot and submitting
     // its sampling commands. Defer retirement until that short CPU section is
     // complete; the per-slot proxy fence then covers GPU ownership.
-    if (ProxyWorkersActive())
+    if (g_proxy_present_request_state.load(std::memory_order_acquire) != 0)
     {
         Log("resolution reconfiguration deferred: async proxy presenter still owns the current frame");
         return false;
@@ -2551,11 +2536,10 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
     // The proxy submits after the neural fence, on the same queue, but owns a
     // later fence value. Do not withdraw its SRV resource until that sampling
     // work has completed.
-    const UINT64 proxy_submitted = g_proxy_fence_value.load(std::memory_order_acquire);
-    if (g_proxy_fence && proxy_submitted != 0 && g_proxy_fence->GetCompletedValue() < proxy_submitted)
+    if (g_proxy_fence && g_proxy_fence_value != 0 && g_proxy_fence->GetCompletedValue() < g_proxy_fence_value)
     {
         Log("resolution reconfiguration deferred: proxy GPU work is still active (completed=%llu submitted=%llu)",
-            g_proxy_fence->GetCompletedValue(), proxy_submitted);
+            g_proxy_fence->GetCompletedValue(), g_proxy_fence_value);
         return false;
     }
     if (!WaitForNeuralGpu(0, false, "resolution transition GPU fence"))
@@ -3621,7 +3605,6 @@ static void ResolveHandles(reshade::api::effect_runtime *runtime)
 
 static bool InitializeProxyPresentation(ID3D12Resource *source, bool early);
 static DWORD WINAPI ProxyPresentationThread(void *);
-static DWORD WINAPI ProxyDisplayThread(void *);
 
 static void OnInitEffectRuntime(reshade::api::effect_runtime *runtime)
 {
@@ -3994,13 +3977,6 @@ static D3D12_RESOURCE_BARRIER Transition(ID3D12Resource *resource,
     return barrier;
 }
 
-static bool ProxyWorkersActive()
-{
-    return g_proxy_present_request_state.load(std::memory_order_acquire) != 0 ||
-        g_proxy_stage_active.load(std::memory_order_acquire) ||
-        g_proxy_display_active.load(std::memory_order_acquire);
-}
-
 static bool CaptureAsyncD3D12Backbuffer(PipelineFrameSlot &slot,
     ID3D12Resource *backbuffer, ID3D12Resource *destination)
 {
@@ -4064,8 +4040,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
         if (skipped <= 8 || skipped % 600 == 0)
             Log("neural frame skipped: all buffered pipeline slots are genuinely occupied (skip=%llu neural=%llu/%llu proxy=%llu/%llu)",
                 skipped, g_neural_fence ? g_neural_fence->GetCompletedValue() : 0, g_neural_fence_value,
-                g_proxy_fence ? g_proxy_fence->GetCompletedValue() : 0,
-                g_proxy_fence_value.load(std::memory_order_acquire));
+                g_proxy_fence ? g_proxy_fence->GetCompletedValue() : 0, g_proxy_fence_value);
         return false;
     }
     const UINT slot_index = static_cast<UINT>(pipeline_slot_index);
@@ -6084,7 +6059,7 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
             g_guide_gpu_telemetry_available.load() ? 1u : 0u,
             g_cpu_vort_submit_us.load() / 1000.0f, g_cpu_feed_submit_us.load() / 1000.0f,
             g_cpu_guide_flush_us.load() / 1000.0f);
-        Log("performance proxy: GPU generated=%.3fms real=%.3fms pair=%.3fms samples=%llu available=%u; CPU mailbox=%.3fms fence_wait=%.3fms swap_wait=%.3fms pacing_wait=%.3fms Present=%.3fms worker=%.3fms peak=%.3fms; output interval current=%.3fms avg=%.3fms peak=%.3fms generated->real=%.3fms real->generated=%.3fms target=%uHz late=%llu; requests=%llu completed=%llu coalesced=%llu timeouts=%llu display_backpressure=%llu; neural deferrals presenter=%llu GPU=%llu; output_queue staged=%llu stale=%llu high_water=%u",
+        Log("performance proxy: GPU generated=%.3fms real=%.3fms pair=%.3fms samples=%llu available=%u; CPU mailbox=%.3fms fence_wait=%.3fms swap_wait=%.3fms pacing_wait=%.3fms Present=%.3fms worker=%.3fms peak=%.3fms; output interval current=%.3fms avg=%.3fms peak=%.3fms generated->real=%.3fms real->generated=%.3fms target=%uHz late=%llu; requests=%llu completed=%llu coalesced=%llu timeouts=%llu display_backpressure=%llu; neural deferrals presenter=%llu GPU=%llu",
             g_gpu_proxy_generated_us.load() / 1000.0f, g_gpu_proxy_real_us.load() / 1000.0f,
             g_gpu_proxy_total_us.load() / 1000.0f, g_proxy_telemetry_samples.load(),
             g_proxy_gpu_telemetry_available.load() ? 1u : 0u,
@@ -6102,9 +6077,7 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
             g_proxy_present_requests.load(), g_proxy_present_completed.load(),
             g_proxy_present_coalesced.load(), g_proxy_present_timeouts.load(),
             g_proxy_display_backpressure_drops.load(),
-            g_neural_presenter_deferrals.load(), g_neural_gpu_deferrals.load(),
-            g_presentation_staged_pairs.load(), g_presentation_stale_pairs.load(),
-            g_presentation_queue_high_water.load());
+            g_neural_presenter_deferrals.load(), g_neural_gpu_deferrals.load());
         if (g_windowed_virtualization_active.load() || DetachedPresentationEnabled())
             Log("presentation compatibility: host=%s window_virtualization=%s logical_client=%s input_coordinates=%s render=%ux%u output=%ux%u resolution_intents=%llu WM_SIZE=%llu client_queries=%llu coordinate_APIs=%llu mouse_messages=%llu cursor_queries=%llu cursor_warps=%llu cursor_clips=%llu resize_pins=%llu",
                 DetachedPresentationEnabled() ? "detached" : "attached",
@@ -6408,27 +6381,12 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
         }
         if (SUCCEEDED(hr)) { failed_stage = "CloseCommandList"; hr = g_proxy_lists[index]->Close(); }
     }
-    for (UINT index = 0; index < kStageCommandSlotCount && SUCCEEDED(hr); ++index)
-    {
-        failed_stage = "Create staging command allocator";
-        hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_stage_allocators[index]));
-        if (SUCCEEDED(hr))
-        {
-            failed_stage = "Create staging command list";
-            hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                g_stage_allocators[index].Get(), nullptr, IID_PPV_ARGS(&g_stage_lists[index]));
-        }
-        if (SUCCEEDED(hr)) { failed_stage = "Close staging command list"; hr = g_stage_lists[index]->Close(); }
-    }
     if (SUCCEEDED(hr)) { failed_stage = "CreateFence"; hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_proxy_fence)); }
     if (SUCCEEDED(hr))
     {
         for (UINT index = 0; index < kProxyCommandSlotCount; ++index)
             g_proxy_command_fence_values[index] = 0;
         g_next_proxy_command_slot = 0;
-        for (UINT index = 0; index < kStageCommandSlotCount; ++index)
-            g_stage_command_fence_values[index] = 0;
-        g_next_stage_command_slot = 0;
     }
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
     heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; heap_desc.NumDescriptors = 3;
@@ -6529,7 +6487,6 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
     }
     if (SUCCEEDED(hr)) g_proxy_fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (SUCCEEDED(hr)) g_proxy_present_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (SUCCEEDED(hr)) g_proxy_display_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (SUCCEEDED(hr)) g_proxy_present_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_proxy_explicit_pacing_active = pace_async_output;
     g_proxy_next_present_qpc = 0;
@@ -6551,14 +6508,10 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
         Log("explicit proxy pacing unavailable; using DXGI latency pacing only: error=%lu",
             GetLastError());
     }
-    if (SUCCEEDED(hr) && g_proxy_fence_event && g_proxy_present_event &&
-        g_proxy_display_event && g_proxy_present_stop_event)
+    if (SUCCEEDED(hr) && g_proxy_fence_event && g_proxy_present_event && g_proxy_present_stop_event)
         g_proxy_present_thread = CreateThread(nullptr, 0, ProxyPresentationThread, nullptr, 0, nullptr);
-    if (SUCCEEDED(hr) && g_proxy_present_thread)
-        g_proxy_display_thread = CreateThread(nullptr, 0, ProxyDisplayThread, nullptr, 0, nullptr);
     if (FAILED(hr) || g_proxy_fence_event == nullptr || g_proxy_present_event == nullptr ||
-        g_proxy_display_event == nullptr || g_proxy_present_stop_event == nullptr ||
-        g_proxy_present_thread == nullptr || g_proxy_display_thread == nullptr)
+        g_proxy_present_stop_event == nullptr || g_proxy_present_thread == nullptr)
     {
         Log("native presentation initialization failed at %s: hr=0x%08X win32=%lu", failed_stage, static_cast<unsigned int>(hr), GetLastError());
         g_proxy_failed = true;
@@ -6712,23 +6665,6 @@ static int AcquireProxyCommandSlot()
     return -1;
 }
 
-static int AcquireStageCommandSlot()
-{
-    if (!g_proxy_fence) return -1;
-    const UINT64 completed = g_proxy_fence->GetCompletedValue();
-    for (UINT offset = 0; offset < kStageCommandSlotCount; ++offset)
-    {
-        const UINT index = (g_next_stage_command_slot + offset) % kStageCommandSlotCount;
-        if (g_stage_command_fence_values[index] == 0 ||
-            completed >= g_stage_command_fence_values[index])
-        {
-            g_next_stage_command_slot = (index + 1) % kStageCommandSlotCount;
-            return static_cast<int>(index);
-        }
-    }
-    return -1;
-}
-
 static int StagePipelineFrameForPresentation(UINT pipeline_slot_index)
 {
     if (pipeline_slot_index >= kPipelineFrameSlotCount || !g_proxy_fence || !g_command_queue)
@@ -6742,7 +6678,7 @@ static int StagePipelineFrameForPresentation(UINT pipeline_slot_index)
     if (presentation_slot_index < 0)
         return -1;
     PresentationFrameSlot &presentation = g_presentation_slots[presentation_slot_index];
-    const int command_slot_index = AcquireStageCommandSlot();
+    const int command_slot_index = AcquireProxyCommandSlot();
     if (command_slot_index < 0)
     {
         presentation.state.store(PresentationSlotFree, std::memory_order_release);
@@ -6750,8 +6686,8 @@ static int StagePipelineFrameForPresentation(UINT pipeline_slot_index)
     }
 
     const UINT command_slot = static_cast<UINT>(command_slot_index);
-    ID3D12CommandAllocator *allocator = g_stage_allocators[command_slot].Get();
-    ID3D12GraphicsCommandList *list = g_stage_lists[command_slot].Get();
+    ID3D12CommandAllocator *allocator = g_proxy_allocators[command_slot].Get();
+    ID3D12GraphicsCommandList *list = g_proxy_lists[command_slot].Get();
     if (!allocator || !list || FAILED(allocator->Reset()) || FAILED(list->Reset(allocator, nullptr)))
     {
         presentation.state.store(PresentationSlotFree, std::memory_order_release);
@@ -6796,30 +6732,18 @@ static int StagePipelineFrameForPresentation(UINT pipeline_slot_index)
     }
 
     ID3D12CommandList *lists[] = {list};
-    AcquireSRWLockExclusive(&g_proxy_submission_lock);
     g_command_queue->ExecuteCommandLists(1, lists);
     const UINT64 copy_fence = ++g_proxy_fence_value;
-    const HRESULT signal_result = g_command_queue->Signal(g_proxy_fence.Get(), copy_fence);
-    ReleaseSRWLockExclusive(&g_proxy_submission_lock);
-    if (FAILED(signal_result))
+    if (FAILED(g_command_queue->Signal(g_proxy_fence.Get(), copy_fence)))
     {
         presentation.state.store(PresentationSlotFree, std::memory_order_release);
         return -1;
     }
-    g_stage_command_fence_values[command_slot] = copy_fence;
+    g_proxy_command_fence_values[command_slot] = copy_fence;
     presentation.fence_value = copy_fence;
     presentation.sequence = pipeline.sequence;
     presentation.has_generated_frame = pipeline.has_generated_frame;
     presentation.state.store(PresentationSlotReady, std::memory_order_release);
-    ++g_presentation_staged_pairs;
-    unsigned int ready_count = 0;
-    for (const PresentationFrameSlot &slot : g_presentation_slots)
-        if (slot.state.load(std::memory_order_acquire) == PresentationSlotReady)
-            ++ready_count;
-    unsigned int high_water = g_presentation_queue_high_water.load(std::memory_order_relaxed);
-    while (ready_count > high_water &&
-        !g_presentation_queue_high_water.compare_exchange_weak(high_water, ready_count,
-            std::memory_order_relaxed, std::memory_order_relaxed)) {}
 
     // The neural resources are no longer needed after this copy reaches the
     // graphics queue. Presentation timing now owns only the dedicated copies.
@@ -6827,7 +6751,7 @@ static int StagePipelineFrameForPresentation(UINT pipeline_slot_index)
     pipeline.state.store(PipelineSlotPresenting, std::memory_order_release);
     static std::atomic<bool> logged_decoupled_presentation{false};
     if (!logged_decoupled_presentation.exchange(true, std::memory_order_acq_rel))
-        Log("queued presentation active: staging producer retires NGX slots into dedicated textures while an independent consumer paces display output");
+        Log("decoupled presentation active: NGX slots retire after output copy; refresh pacing owns dedicated textures");
     return presentation_slot_index;
 }
 
@@ -6919,8 +6843,7 @@ static bool PresentProxySourcesOnWorker(ID3D12Resource *real_source,
             const unsigned long long timeouts = ++g_proxy_present_timeouts;
             if (timeouts <= 8 || timeouts % 120 == 0)
                 Log("async proxy command ring exhausted without blocking (timeout=%llu completed=%llu submitted=%llu)",
-                    timeouts, g_proxy_fence->GetCompletedValue(),
-                    g_proxy_fence_value.load(std::memory_order_acquire));
+                    timeouts, g_proxy_fence->GetCompletedValue(), g_proxy_fence_value);
             return false;
         }
         const UINT command_slot = static_cast<UINT>(command_slot_index);
@@ -7008,13 +6931,10 @@ static bool PresentProxySourcesOnWorker(ID3D12Resource *real_source,
         }
         if (FAILED(list->Close())) return false;
         ID3D12CommandList *lists[] = {list};
-        AcquireSRWLockExclusive(&g_proxy_submission_lock);
         g_command_queue->ExecuteCommandLists(1, lists);
-        const UINT64 draw_fence = ++g_proxy_fence_value;
-        const HRESULT signal_result = g_command_queue->Signal(g_proxy_fence.Get(), draw_fence);
-        ReleaseSRWLockExclusive(&g_proxy_submission_lock);
-        if (FAILED(signal_result)) return false;
-        g_proxy_command_fence_values[command_slot] = draw_fence;
+        ++g_proxy_fence_value;
+        if (FAILED(g_command_queue->Signal(g_proxy_fence.Get(), g_proxy_fence_value))) return false;
+        g_proxy_command_fence_values[command_slot] = g_proxy_fence_value;
         const UINT present_flags = use_framegen ?
             (g_proxy_allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0u) :
             DXGI_PRESENT_DO_NOT_WAIT;
@@ -7049,7 +6969,7 @@ static bool PresentProxySourcesOnWorker(ID3D12Resource *real_source,
     }
     if (record_proxy_gpu)
     {
-        g_proxy_telemetry_fence_value = g_proxy_fence_value.load(std::memory_order_acquire);
+        g_proxy_telemetry_fence_value = g_proxy_fence_value;
         g_proxy_telemetry_present_count = present_count;
         g_proxy_telemetry_pending = true;
     }
@@ -7092,46 +7012,6 @@ static bool PresentPipelineFrameOnWorker(UINT slot_index)
         slot.original_input.Get(), slot.has_generated_frame);
 }
 
-static bool DecoupledPresentationEnabled()
-{
-    return g_async_compute_active && g_proxy_explicit_pacing_active &&
-        !g_synchronous_proxy_presentation;
-}
-
-static int SelectNewestReadyPresentationSlot()
-{
-    int selected = -1;
-    unsigned long long newest = 0;
-    for (UINT index = 0; index < kPresentationFrameSlotCount; ++index)
-    {
-        const PresentationFrameSlot &slot = g_presentation_slots[index];
-        if (slot.state.load(std::memory_order_acquire) == PresentationSlotReady &&
-            (selected < 0 || slot.sequence > newest))
-        {
-            selected = static_cast<int>(index);
-            newest = slot.sequence;
-        }
-    }
-    if (selected < 0) return -1;
-
-    // Keep latency bounded when the producer outruns the physical display.
-    // Older copied frames are safe to retire at their existing copy fences;
-    // only the freshest complete pair is presented.
-    for (UINT index = 0; index < kPresentationFrameSlotCount; ++index)
-    {
-        if (static_cast<int>(index) == selected) continue;
-        PresentationFrameSlot &slot = g_presentation_slots[index];
-        unsigned int expected = PresentationSlotReady;
-        if (slot.sequence < newest && slot.state.compare_exchange_strong(expected,
-                PresentationSlotPresenting, std::memory_order_acq_rel, std::memory_order_acquire))
-        {
-            ++g_proxy_present_coalesced;
-            ++g_presentation_stale_pairs;
-        }
-    }
-    return selected;
-}
-
 static bool PresentStagedFrameOnWorker(UINT slot_index)
 {
     if (slot_index >= kPresentationFrameSlotCount) return false;
@@ -7142,7 +7022,7 @@ static bool PresentStagedFrameOnWorker(UINT slot_index)
         return false;
     const bool presented = PresentProxySourcesOnWorker(slot.real_output.Get(),
         slot.generated_output.Get(), slot.original_input.Get(), slot.has_generated_frame);
-    slot.fence_value = g_proxy_fence_value.load(std::memory_order_acquire);
+    slot.fence_value = g_proxy_fence_value;
     slot.state.store(PresentationSlotPresenting, std::memory_order_release);
     return presented;
 }
@@ -7150,42 +7030,12 @@ static bool PresentStagedFrameOnWorker(UINT slot_index)
 static DWORD WINAPI ProxyPresentationThread(void *)
 {
     const HANDLE waits[2] = {g_proxy_present_stop_event, g_proxy_present_event};
-    Log("async proxy staging worker started");
+    Log("async proxy presentation worker started");
     while (true)
     {
         const DWORD wait = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
         if (wait == WAIT_OBJECT_0) break;
         if (wait != WAIT_OBJECT_0 + 1) continue;
-
-        if (DecoupledPresentationEnabled())
-        {
-            g_proxy_stage_active.store(true, std::memory_order_release);
-            g_proxy_present_request_state.store(2, std::memory_order_release);
-            while (true)
-            {
-                const int slot_index = ClaimOldestReadyPipelineSlot();
-                if (slot_index < 0)
-                {
-                    ArmAsyncProxyWakeForNeuralCompletion();
-                    break;
-                }
-                PipelineFrameSlot &slot = g_pipeline_slots[slot_index];
-                const int presentation_slot_index = StagePipelineFrameForPresentation(
-                    static_cast<UINT>(slot_index));
-                if (presentation_slot_index < 0)
-                {
-                    // Queue pressure is temporary. Preserve this completed NGX
-                    // result and retry when the display consumer releases a slot.
-                    slot.state.store(PipelineSlotReady, std::memory_order_release);
-                    break;
-                }
-                ReclaimPipelineFrameSlots();
-                SetEvent(g_proxy_display_event);
-            }
-            g_proxy_stage_active.store(false, std::memory_order_release);
-            g_proxy_present_request_state.store(0, std::memory_order_release);
-            continue;
-        }
 
         while (true)
         {
@@ -7212,16 +7062,39 @@ static DWORD WINAPI ProxyPresentationThread(void *)
                         CounterDeltaMicroseconds(queued, worker_begin));
             }
             PipelineFrameSlot &slot = g_pipeline_slots[slot_index];
-            const bool presented = PresentPipelineFrameOnWorker(static_cast<UINT>(slot_index));
-            slot.proxy_fence_value.store(
-                g_proxy_fence_value.load(std::memory_order_acquire), std::memory_order_release);
-            slot.state.store(PipelineSlotPresenting, std::memory_order_release);
+            const bool decoupled_presentation = g_async_compute_active &&
+                g_proxy_explicit_pacing_active && !g_synchronous_proxy_presentation;
+            bool presented = false;
+            int presentation_slot_index = -1;
+            if (decoupled_presentation)
+            {
+                presentation_slot_index = StagePipelineFrameForPresentation(
+                    static_cast<UINT>(slot_index));
+                if (presentation_slot_index >= 0)
+                {
+                    // The graphics copy fence, rather than the display fence,
+                    // now controls retirement of the expensive NGX slot.
+                    ReclaimPipelineFrameSlots();
+                    presented = PresentStagedFrameOnWorker(
+                        static_cast<UINT>(presentation_slot_index));
+                }
+                else
+                {
+                    slot.state.store(PipelineSlotAbandoned, std::memory_order_release);
+                }
+            }
+            else
+            {
+                presented = PresentPipelineFrameOnWorker(static_cast<UINT>(slot_index));
+                slot.proxy_fence_value.store(g_proxy_fence_value, std::memory_order_release);
+                slot.state.store(PipelineSlotPresenting, std::memory_order_release);
+            }
             if (!presented)
             {
                 const unsigned long long skipped = ++g_proxy_busy_frame_skips;
                 if (skipped <= 8 || skipped % 120 == 0)
-                    Log("async proxy presentation request dropped safely (skip=%llu neural_slot=%d)",
-                        skipped, slot_index);
+                    Log("async proxy presentation request dropped safely (skip=%llu neural_slot=%d output_slot=%d)",
+                        skipped, slot_index, presentation_slot_index);
             }
             else
             {
@@ -7240,63 +7113,7 @@ static DWORD WINAPI ProxyPresentationThread(void *)
         g_proxy_present_request_state.store(0, std::memory_order_release);
     }
     g_proxy_present_request_state.store(0, std::memory_order_release);
-    g_proxy_stage_active.store(false, std::memory_order_release);
-    Log("async proxy staging worker stopped");
-    return 0;
-}
-
-static DWORD WINAPI ProxyDisplayThread(void *)
-{
-    const HANDLE waits[2] = {g_proxy_present_stop_event, g_proxy_display_event};
-    Log("paced proxy display consumer started");
-    while (true)
-    {
-        const DWORD wait = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
-        if (wait == WAIT_OBJECT_0) break;
-        if (wait != WAIT_OBJECT_0 + 1) continue;
-
-        while (DecoupledPresentationEnabled())
-        {
-            ReclaimPresentationFrameSlots();
-            const int slot_index = SelectNewestReadyPresentationSlot();
-            if (slot_index < 0) break;
-            g_proxy_display_active.store(true, std::memory_order_release);
-            LARGE_INTEGER worker_begin = {}, worker_end = {};
-            if (g_performance_telemetry_enabled) QueryPerformanceCounter(&worker_begin);
-            const bool presented = PresentStagedFrameOnWorker(static_cast<UINT>(slot_index));
-            if (presented)
-            {
-                ++g_proxy_present_completed;
-            }
-            else
-            {
-                const unsigned long long skipped = ++g_proxy_busy_frame_skips;
-                if (skipped <= 8 || skipped % 120 == 0)
-                    Log("paced proxy display pair dropped safely (skip=%llu output_slot=%d)",
-                        skipped, slot_index);
-            }
-            if (g_performance_telemetry_enabled)
-            {
-                QueryPerformanceCounter(&worker_end);
-                const unsigned int duration = CounterDeltaMicroseconds(worker_begin, worker_end);
-                SmoothMicroseconds(g_cpu_proxy_worker_us, duration);
-                RecordPeakMicroseconds(g_cpu_proxy_worker_peak_us, duration);
-            }
-            g_proxy_display_active.store(false, std::memory_order_release);
-            ReclaimPresentationFrameSlots();
-
-            // Wake the producer immediately and once more when the GPU has
-            // actually released this output slot. This avoids a full-ring
-            // deadlock when no new game Present can be accepted meanwhile.
-            SetEvent(g_proxy_present_event);
-            PresentationFrameSlot &slot = g_presentation_slots[slot_index];
-            const UINT64 release_fence = slot.fence_value;
-            if (g_proxy_fence && release_fence > g_proxy_fence->GetCompletedValue())
-                g_proxy_fence->SetEventOnCompletion(release_fence, g_proxy_present_event);
-        }
-    }
-    g_proxy_display_active.store(false, std::memory_order_release);
-    Log("paced proxy display consumer stopped");
+    Log("async proxy presentation worker stopped");
     return 0;
 }
 
@@ -7308,8 +7125,7 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer, int slot_index)
     ID3D12Resource *original_source = slot.original_input.Get();
     if (g_proxy_hidden || g_proxy_transition_hold || g_sr_frames.load() == 0 || real_source == nullptr ||
         original_source == nullptr || backbuffer == nullptr || !EnsureProxy(real_source) ||
-        g_proxy_present_event == nullptr || g_proxy_present_thread == nullptr ||
-        g_proxy_display_event == nullptr || g_proxy_display_thread == nullptr)
+        g_proxy_present_event == nullptr || g_proxy_present_thread == nullptr)
     {
         slot.state.store(PipelineSlotAbandoned, std::memory_order_release);
         return false;
@@ -7330,8 +7146,7 @@ static bool PresentProxyAfterReshade(ID3D12Resource *backbuffer, int slot_index)
         LARGE_INTEGER worker_begin = {}, worker_end = {};
         if (g_performance_telemetry_enabled) QueryPerformanceCounter(&worker_begin);
         const bool presented = PresentPipelineFrameOnWorker(static_cast<UINT>(slot_index));
-        slot.proxy_fence_value.store(
-            g_proxy_fence_value.load(std::memory_order_acquire), std::memory_order_release);
+        slot.proxy_fence_value.store(g_proxy_fence_value, std::memory_order_release);
         slot.state.store(PipelineSlotPresenting, std::memory_order_release);
         if (presented) ++g_proxy_present_completed;
         else ++g_proxy_busy_frame_skips;
@@ -7437,7 +7252,7 @@ static void OnReshadePresent(reshade::api::effect_runtime *runtime)
         {
             // Do not overwrite the persistent menu snapshot while the worker
             // owns it. A later ReShade Present will refresh it.
-            if (ProxyWorkersActive())
+            if (g_proxy_present_request_state.load(std::memory_order_acquire) != 0)
             {
                 ++g_proxy_present_coalesced;
             }
@@ -8873,19 +8688,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::unregister_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
         if (g_proxy_present_stop_event) SetEvent(g_proxy_present_stop_event);
         if (g_proxy_present_event) SetEvent(g_proxy_present_event);
-        if (g_proxy_display_event) SetEvent(g_proxy_display_event);
         if (g_proxy_present_thread)
         {
             WaitForSingleObject(g_proxy_present_thread, 2000);
             CloseHandle(g_proxy_present_thread);
         }
-        if (g_proxy_display_thread)
-        {
-            WaitForSingleObject(g_proxy_display_thread, 2000);
-            CloseHandle(g_proxy_display_thread);
-        }
         if (g_proxy_present_event) CloseHandle(g_proxy_present_event);
-        if (g_proxy_display_event) CloseHandle(g_proxy_display_event);
         if (g_proxy_present_stop_event) CloseHandle(g_proxy_present_stop_event);
         if (g_proxy_pacing_timer) CloseHandle(g_proxy_pacing_timer);
         if (g_proxy_fence_event) CloseHandle(g_proxy_fence_event);
@@ -8896,12 +8704,6 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             g_proxy_lists[index].Reset();
             g_proxy_allocators[index].Reset();
             g_proxy_command_fence_values[index] = 0;
-        }
-        for (UINT index = 0; index < kStageCommandSlotCount; ++index)
-        {
-            g_stage_lists[index].Reset();
-            g_stage_allocators[index].Reset();
-            g_stage_command_fence_values[index] = 0;
         }
         g_proxy_telemetry_readback.Reset(); g_proxy_telemetry_query_heap.Reset();
         g_proxy_fence.Reset();
