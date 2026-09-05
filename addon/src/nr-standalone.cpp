@@ -31,8 +31,9 @@
 
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
+#include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.4-experimental.1"
+#define ADDON_VERSION "2.0.5-performance-lab-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -52,6 +53,7 @@ static std::atomic<unsigned int> g_input_width{0};
 static std::atomic<unsigned int> g_input_height{0};
 static bool g_enabled = true;
 static std::atomic<unsigned long long> g_frames_presented{0};
+static std::atomic<unsigned long long> g_primary_swapchain_address{0};
 static ID3D12Resource *g_nr_output;
 static ID3D12CommandQueue *g_command_queue;
 static reshade::api::command_queue *g_rs_queue;
@@ -194,6 +196,7 @@ static std::atomic<unsigned int> g_cpu_proxy_swap_wait_us{0};
 static std::atomic<unsigned int> g_cpu_proxy_present_us{0};
 static std::atomic<unsigned int> g_cpu_proxy_worker_us{0};
 static std::atomic<unsigned int> g_cpu_proxy_worker_peak_us{0};
+static std::atomic<unsigned int> g_cpu_shared_telemetry_us{0};
 static std::atomic<unsigned long long> g_proxy_present_requests{0};
 static std::atomic<unsigned long long> g_proxy_present_completed{0};
 static std::atomic<unsigned long long> g_neural_presenter_deferrals{0};
@@ -408,6 +411,14 @@ static DlssRenderPreset g_dlss_render_preset = DlssRenderPreset::L;
 static DlssRenderPreset g_active_dlss_render_preset = DlssRenderPreset::L;
 static bool g_dlss_render_preset_hotkey_down;
 static bool g_nr_model_hotkey_down;
+static bool g_benchmark_hotkey_down;
+static dlss5_aio_telemetry::BenchmarkMode g_benchmark_mode =
+    dlss5_aio_telemetry::BenchmarkMode::UserSettings;
+static std::atomic<unsigned int> g_benchmark_epoch{0};
+static bool g_benchmark_saved_settings;
+static bool g_benchmark_saved_enabled;
+static bool g_benchmark_saved_nr;
+static bool g_benchmark_saved_fg;
 static int g_active_dlss_quality = -1;
 static int g_nr_model = 1;
 static int g_active_nr_model;
@@ -548,6 +559,9 @@ static UINT g_resource_input_height;
 static UINT g_resource_output_width;
 static UINT g_resource_output_height;
 static DXGI_FORMAT g_resource_input_format = DXGI_FORMAT_UNKNOWN;
+static HANDLE g_performance_mapping;
+static dlss5_aio_telemetry::SnapshotV1 *g_performance_shared;
+static SRWLOCK g_performance_mapping_lock = SRWLOCK_INIT;
 
 static bool IsDlaaMode()
 {
@@ -618,6 +632,149 @@ static unsigned int CounterDeltaMicroseconds(const LARGE_INTEGER &begin, const L
 static bool EffectiveFramegenEnabled()
 {
     return g_framegen_enabled;
+}
+
+static bool EnsureSharedPerformanceTelemetry()
+{
+    if (g_performance_shared) return true;
+    wchar_t mapping_name[96] = {};
+    swprintf_s(mapping_name, L"%s%lu", dlss5_aio_telemetry::MappingPrefix,
+        GetCurrentProcessId());
+    HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr,
+        PAGE_READWRITE, 0, sizeof(dlss5_aio_telemetry::SnapshotV1), mapping_name);
+    if (!mapping) return false;
+    auto *snapshot = static_cast<dlss5_aio_telemetry::SnapshotV1 *>(
+        MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0,
+            sizeof(dlss5_aio_telemetry::SnapshotV1)));
+    if (!snapshot)
+    {
+        CloseHandle(mapping);
+        return false;
+    }
+    ZeroMemory(snapshot, sizeof(*snapshot));
+    snapshot->MagicValue = dlss5_aio_telemetry::Magic;
+    snapshot->VersionValue = dlss5_aio_telemetry::Version;
+    snapshot->StructSize = sizeof(*snapshot);
+    snapshot->ProcessId = GetCurrentProcessId();
+    LARGE_INTEGER frequency = {};
+    QueryPerformanceFrequency(&frequency);
+    snapshot->QpcFrequency = frequency.QuadPart;
+    g_performance_mapping = mapping;
+    g_performance_shared = snapshot;
+    return true;
+}
+
+static void UpdateSharedPerformanceTelemetry()
+{
+    LARGE_INTEGER telemetry_begin = {};
+    QueryPerformanceCounter(&telemetry_begin);
+    if (!TryAcquireSRWLockExclusive(&g_performance_mapping_lock)) return;
+    if (!EnsureSharedPerformanceTelemetry())
+    {
+        ReleaseSRWLockExclusive(&g_performance_mapping_lock);
+        return;
+    }
+    auto *snapshot = g_performance_shared;
+    InterlockedIncrement64(&snapshot->Sequence);
+    MemoryBarrier();
+    LARGE_INTEGER timestamp = {};
+    QueryPerformanceCounter(&timestamp);
+    snapshot->QpcTimestamp = timestamp.QuadPart;
+    snapshot->BenchmarkEpoch = g_benchmark_epoch.load(std::memory_order_relaxed);
+    snapshot->BenchmarkModeValue = static_cast<std::uint32_t>(g_benchmark_mode);
+    std::uint32_t flags = 0;
+    if (g_enabled) flags |= dlss5_aio_telemetry::AddonEnabled;
+    if (g_nr_enabled) flags |= dlss5_aio_telemetry::NeuralRenderingEnabled;
+    if (g_framegen_enabled) flags |= dlss5_aio_telemetry::FrameGenerationEnabled;
+    if (g_neural_ready) flags |= dlss5_aio_telemetry::NeuralPipelineReady;
+    if (g_framegen_failed) flags |= dlss5_aio_telemetry::FrameGenerationFailed;
+    if (g_show_neural_output) flags |= dlss5_aio_telemetry::ProcessedOutputVisible;
+    if (g_vort_guides_enabled) flags |= dlss5_aio_telemetry::VortGuidesEnabled;
+    if (IsDlaaMode()) flags |= dlss5_aio_telemetry::DlaaMode;
+    if (g_proxy_hidden.load()) flags |= dlss5_aio_telemetry::ProxyHidden;
+    if (g_proxy_failed) flags |= dlss5_aio_telemetry::ProxyFailed;
+    if (g_synchronous_proxy_presentation) flags |= dlss5_aio_telemetry::SynchronousPresenter;
+    if (g_reshade_overlay_open.load()) flags |= dlss5_aio_telemetry::ReshadeOverlayOpen;
+    if (g_gpu_telemetry_available.load()) flags |= dlss5_aio_telemetry::GpuTelemetryAvailable;
+    if (g_proxy_gpu_telemetry_available.load()) flags |= dlss5_aio_telemetry::ProxyGpuTelemetryAvailable;
+    if (g_guide_gpu_telemetry_available.load()) flags |= dlss5_aio_telemetry::GuideGpuTelemetryAvailable;
+    snapshot->FlagsValue = flags;
+    snapshot->GraphicsApi = static_cast<std::uint32_t>(g_present_api);
+    snapshot->InputWidth = g_input_width.load();
+    snapshot->InputHeight = g_input_height.load();
+    snapshot->OutputWidth = g_output_width.load();
+    snapshot->OutputHeight = g_output_height.load();
+    snapshot->SourceFps = g_source_fps.load();
+    snapshot->ProxyFps = g_proxy_fps.load();
+    snapshot->ActiveNrModel = static_cast<std::uint32_t>(std::max(0, g_active_nr_model));
+    snapshot->DlssPreset = static_cast<std::uint32_t>(g_active_dlss_render_preset);
+    std::uint32_t slot_states = 0;
+    for (UINT index = 0; index < kPipelineFrameSlotCount; ++index)
+        slot_states |= (g_pipeline_slots[index].state.load(std::memory_order_relaxed) & 0xFu) << (index * 4);
+    snapshot->PipelineSlotStates = slot_states;
+    snapshot->GpuPrepUs = g_gpu_prep_us.load();
+    snapshot->GpuNrUs = g_gpu_nr_us.load();
+    snapshot->GpuSrUs = g_gpu_sr_us.load();
+    snapshot->GpuFgUs = g_gpu_fg_us.load();
+    snapshot->GpuCleanupUs = g_gpu_cleanup_us.load();
+    snapshot->GpuTotalUs = g_gpu_total_us.load();
+    snapshot->GpuVortUs = g_gpu_vort_us.load();
+    snapshot->GpuFeedUs = g_gpu_feed_us.load();
+    snapshot->GpuGuidesTotalUs = g_gpu_guides_total_us.load();
+    snapshot->GpuProxyGeneratedUs = g_gpu_proxy_generated_us.load();
+    snapshot->GpuProxyRealUs = g_gpu_proxy_real_us.load();
+    snapshot->GpuProxyTotalUs = g_gpu_proxy_total_us.load();
+    snapshot->AddonCpuCurrentUs = g_addon_cpu_current_us.load();
+    snapshot->AddonCpuAverageUs = g_addon_cpu_avg_us.load();
+    snapshot->SourceFrameAverageUs = g_source_frame_avg_us.load();
+    snapshot->SourceFrameP99Us = g_source_frame_p99_us.load();
+    snapshot->CpuProxyMailboxUs = g_cpu_proxy_mailbox_us.load();
+    snapshot->CpuProxyFenceWaitUs = g_cpu_proxy_fence_wait_us.load();
+    snapshot->CpuProxySwapWaitUs = g_cpu_proxy_swap_wait_us.load();
+    snapshot->CpuProxyPresentUs = g_cpu_proxy_present_us.load();
+    snapshot->CpuProxyWorkerUs = g_cpu_proxy_worker_us.load();
+    snapshot->CpuSharedTelemetryUs = g_cpu_shared_telemetry_us.load();
+    snapshot->SourceFrameSequence = g_source_frame_sequence.load();
+    snapshot->LastNeuralSourceSequence = g_last_neural_source_sequence;
+    snapshot->NrFrames = g_nr_frames.load();
+    snapshot->SrFrames = g_sr_frames.load();
+    snapshot->FgFrames = g_fg_frames.load();
+    snapshot->FramesPresented = g_frames_presented.load();
+    snapshot->NeuralSkips = g_neural_busy_frame_skips.load();
+    snapshot->ProxySkips = g_proxy_busy_frame_skips.load();
+    snapshot->ProxyCoalesced = g_proxy_present_coalesced.load();
+    snapshot->ProxyTimeouts = g_proxy_present_timeouts.load();
+    snapshot->DisplayBackpressureDrops = g_proxy_display_backpressure_drops.load();
+    snapshot->TemporalDiscontinuities = g_temporal_discontinuities.load();
+    snapshot->ProxyRequests = g_proxy_present_requests.load();
+    snapshot->ProxyCompleted = g_proxy_present_completed.load();
+    snapshot->TelemetrySamples = g_telemetry_samples.load();
+    snapshot->PrimarySwapchainAddress = g_primary_swapchain_address.load();
+    snapshot->ProxySwapchainAddress = reinterpret_cast<std::uintptr_t>(g_proxy_swapchain.Get());
+    const std::int64_t qpc_frequency = snapshot->QpcFrequency;
+    MemoryBarrier();
+    InterlockedIncrement64(&snapshot->Sequence);
+    ReleaseSRWLockExclusive(&g_performance_mapping_lock);
+    LARGE_INTEGER telemetry_end = {};
+    QueryPerformanceCounter(&telemetry_end);
+    if (qpc_frequency > 0 && telemetry_end.QuadPart > telemetry_begin.QuadPart)
+    {
+        const auto microseconds = static_cast<unsigned long long>(
+            telemetry_end.QuadPart - telemetry_begin.QuadPart) * 1000000ULL /
+            static_cast<unsigned long long>(qpc_frequency);
+        g_cpu_shared_telemetry_us = static_cast<unsigned int>(
+            std::min<unsigned long long>(microseconds, UINT_MAX));
+    }
+}
+
+static void CloseSharedPerformanceTelemetry()
+{
+    AcquireSRWLockExclusive(&g_performance_mapping_lock);
+    if (g_performance_shared) UnmapViewOfFile(g_performance_shared);
+    if (g_performance_mapping) CloseHandle(g_performance_mapping);
+    g_performance_shared = nullptr;
+    g_performance_mapping = nullptr;
+    ReleaseSRWLockExclusive(&g_performance_mapping_lock);
 }
 
 static void DetectNativeStreamlinePresentHook()
@@ -800,6 +957,100 @@ static void CycleNrModel()
 {
     SelectNrModel(g_nr_model >= 3 ? 1 : g_nr_model + 1,
         "Ctrl+Alt+N hotkey");
+}
+
+static const char *BenchmarkModeName(dlss5_aio_telemetry::BenchmarkMode mode)
+{
+    using Mode = dlss5_aio_telemetry::BenchmarkMode;
+    switch (mode)
+    {
+    case Mode::AddonDisabled: return "addon disabled";
+    case Mode::DlssOnly: return "DLSS/DLAA only";
+    case Mode::NrDlss: return "NR + DLSS/DLAA";
+    case Mode::DlssFrameGeneration: return "DLSS/DLAA + FG";
+    case Mode::NrDlssFrameGeneration: return "NR + DLSS/DLAA + FG";
+    default: return "user settings";
+    }
+}
+
+static void ApplyBenchmarkMode(dlss5_aio_telemetry::BenchmarkMode mode)
+{
+    using Mode = dlss5_aio_telemetry::BenchmarkMode;
+    if (mode == g_benchmark_mode) return;
+    if (g_benchmark_mode == Mode::UserSettings && mode != Mode::UserSettings)
+    {
+        g_benchmark_saved_enabled = g_enabled;
+        g_benchmark_saved_nr = g_nr_enabled;
+        g_benchmark_saved_fg = g_framegen_enabled;
+        g_benchmark_saved_settings = true;
+    }
+
+    bool next_enabled = true;
+    bool next_nr = false;
+    bool next_fg = false;
+    switch (mode)
+    {
+    case Mode::UserSettings:
+        if (g_benchmark_saved_settings)
+        {
+            next_enabled = g_benchmark_saved_enabled;
+            next_nr = g_benchmark_saved_nr;
+            next_fg = g_benchmark_saved_fg;
+        }
+        else
+        {
+            next_enabled = g_enabled;
+            next_nr = g_nr_enabled;
+            next_fg = g_framegen_enabled;
+        }
+        break;
+    case Mode::AddonDisabled:
+        next_enabled = false;
+        next_nr = g_nr_enabled;
+        next_fg = g_framegen_enabled;
+        break;
+    case Mode::DlssOnly: break;
+    case Mode::NrDlss: next_nr = true; break;
+    case Mode::DlssFrameGeneration: next_fg = true; break;
+    case Mode::NrDlssFrameGeneration: next_nr = true; next_fg = true; break;
+    }
+
+    const bool feature_change = next_nr != g_nr_enabled || next_fg != g_framegen_enabled;
+    const bool was_enabled = g_enabled;
+    g_enabled = next_enabled;
+    g_nr_enabled = next_nr;
+    g_framegen_enabled = next_fg;
+    g_fg_frames = 0;
+    g_need_history_reset = true;
+    if (feature_change && g_neural_ready) g_feature_recreate_requested = true;
+    if (!g_enabled && g_proxy_swapchain && !g_proxy_hidden)
+    {
+        g_proxy_hidden = true;
+        UpdateProxyCursorClip(false);
+        RequestProxyVisibility(false);
+    }
+    else if (g_enabled && !was_enabled && g_proxy_swapchain && !g_proxy_failed)
+    {
+        g_proxy_hidden = false;
+        if (!g_proxy_overlay_bypass && !g_proxy_early_pending_activation)
+            RequestProxyVisibility(true);
+    }
+
+    g_benchmark_mode = mode;
+    const unsigned int epoch = g_benchmark_epoch.fetch_add(1) + 1;
+    Log("benchmark segment %u selected: %s (addon=%s NR=%s FG=%s; settings are not persisted)",
+        epoch, BenchmarkModeName(mode), g_enabled ? "on" : "off",
+        g_nr_enabled ? "on" : "off", g_framegen_enabled ? "on" : "off");
+    ShowPipelineNotice("BENCH %u: %s", epoch, BenchmarkModeName(mode));
+    if (mode == Mode::UserSettings) g_benchmark_saved_settings = false;
+}
+
+static void CycleBenchmarkMode()
+{
+    using Mode = dlss5_aio_telemetry::BenchmarkMode;
+    const auto current = static_cast<unsigned int>(g_benchmark_mode);
+    const auto next = static_cast<Mode>((current + 1) % 6);
+    ApplyBenchmarkMode(next);
 }
 
 static const char *DlssQualityName(int quality)
@@ -5459,6 +5710,11 @@ struct PresentCpuTelemetryScope
     ~PresentCpuTelemetryScope() { if (enabled) RecordAddonCpuTime(begin); }
 };
 
+struct SharedPerformanceTelemetryScope
+{
+    ~SharedPerformanceTelemetryScope() { UpdateSharedPerformanceTelemetry(); }
+};
+
 static DWORD WINAPI ProxyWindowThread(void *)
 {
     WNDCLASSEXW wc = {sizeof(wc)};
@@ -6565,6 +6821,10 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     }
     if (g_game_window && present_window && present_window != g_game_window) return;
     if (!g_game_window && present_window) g_game_window = present_window;
+    g_primary_swapchain_address = swapchain->get_native();
+    // Declare this before the CPU timer so reverse destruction order publishes
+    // the just-completed CPU measurement rather than the previous frame's.
+    SharedPerformanceTelemetryScope shared_telemetry;
     PresentCpuTelemetryScope cpu_telemetry;
     const ULONGLONG present_tick = GetTickCount64();
     g_last_primary_present_tick = present_tick;
@@ -6584,6 +6844,13 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     if (nr_model_hotkey_down && !g_nr_model_hotkey_down)
         CycleNrModel();
     g_nr_model_hotkey_down = nr_model_hotkey_down;
+    const bool benchmark_hotkey_down = primary_foreground &&
+        (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 &&
+        (GetAsyncKeyState(VK_MENU) & 0x8000) != 0 &&
+        (GetAsyncKeyState('B') & 0x8000) != 0;
+    if (benchmark_hotkey_down && !g_benchmark_hotkey_down)
+        CycleBenchmarkMode();
+    g_benchmark_hotkey_down = benchmark_hotkey_down;
     UpdateProxyCursorClip(primary_foreground && g_proxy_window != nullptr &&
         !g_proxy_hidden && !g_proxy_overlay_bypass && !g_proxy_failed &&
         !g_proxy_early_pending_activation && !g_proxy_overlay_preview.load() &&
@@ -7454,6 +7721,20 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::TextDisabled("Uses asynchronous GPU timestamps; results are read only after the existing frame fence completes.");
     ImGui::TextDisabled("Off shows a point-stretched raw pre-ReShade game frame for a clean temporal diagnostic.");
 
+    ImGui::SeparatorText("Performance lab");
+    ImGui::Text("Benchmark segment %u: %s", g_benchmark_epoch.load(),
+        BenchmarkModeName(g_benchmark_mode));
+    if (ImGui::Button("Next benchmark mode (Ctrl+Alt+B)")) CycleBenchmarkMode();
+    if (g_benchmark_mode != dlss5_aio_telemetry::BenchmarkMode::UserSettings)
+    {
+        ImGui::SameLine();
+        if (ImGui::Button("Restore user settings"))
+            ApplyBenchmarkMode(dlss5_aio_telemetry::BenchmarkMode::UserSettings);
+    }
+    ImGui::TextDisabled("Cycles: user settings -> addon disabled -> DLSS only -> NR+DLSS -> DLSS+FG -> all features.");
+    ImGui::TextDisabled("Benchmark overrides are temporary and are never written to ReShade.ini.");
+    ImGui::Text("Analyzer mapping: Local\\DLSS5_AIO_Telemetry_%lu", GetCurrentProcessId());
+
     ImGui::Separator();
     ImGui::Text("Status: %s", g_neural_status);
     ImGui::TextUnformatted("Activation boundary: game OnPresent (standalone private NGX runtime)");
@@ -7822,6 +8103,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         g_neural_list.Reset(); g_neural_allocator.Reset(); g_neural_fence.Reset(); g_neural_device.Reset();
         if (g_neural_fence_event) CloseHandle(g_neural_fence_event);
         if (g_command_queue) g_command_queue->Release();
+        CloseSharedPerformanceTelemetry();
         reshade::unregister_addon(module);
         DeleteCriticalSection(&g_log_lock);
     }

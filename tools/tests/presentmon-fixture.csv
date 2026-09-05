@@ -1,0 +1,7 @@
+Application,ProcessID,SwapChainAddress,PresentRuntime,PresentMode,CPUStartQPC,FrameTime,GPUBusy,GPUTime,DisplayLatency,DisplayedTime,Dropped
+Game.exe,123,0x1111,DXGI,Composed: Flip,10000000,10.0,7.0,8.0,15.0,10.0,0
+Game.exe,123,0x1111,DXGI,Composed: Flip,11000000,11.0,7.5,8.5,16.0,11.0,0
+Game.exe,123,0x1111,DXGI,Composed: Flip,12000000,9.0,6.5,7.5,14.0,9.0,0
+Game.exe,123,0x2222,DXGI,Composed: Flip,20000000,5.0,0.2,0.3,8.0,5.0,0
+Game.exe,123,0x2222,DXGI,Composed: Flip,21000000,5.5,0.2,0.3,8.5,5.5,0
+Game.exe,123,0x2222,DXGI,Composed: Flip,22000000,4.5,0.2,0.3,7.5,4.5,0

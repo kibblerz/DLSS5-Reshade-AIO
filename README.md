@@ -137,6 +137,15 @@ This project contains two independently useful pieces:
 
 - `lab/`: a deterministic D3D12 test program that reverse-engineers and validates the private DLSS-NR feature-18 contract without launching a game.
 - `addon/`: a standalone ReShade addon for D3D9, D3D11, D3D12, and 64-bit Windows Vulkan games. It does not hook or depend on the ShortFuse addon.
+- `tools/`: the dependency-free performance recorder and analyzer for PresentMon CSVs, existing addon logs, and synchronized shared-memory telemetry.
+
+## Performance analyzer
+
+Development builds expose a read-only shared-memory snapshot named `Local\DLSS5_AIO_Telemetry_<game PID>`. It records separate source, accepted neural, generated, and proxy-presentation counters together with the existing NR, DLSS/DLAA, FG, VORT, compositor, CPU, wait, skip, and backpressure measurements. The snapshot uses a seqlock and never makes the game wait for the analyzer.
+
+Run `tools\DLSS5-PerformanceAnalyzer.cmd Record -ProcessName <game> -Duration 180 -Output telemetry.csv`, then press `Ctrl+Alt+B` in game to cycle temporary benchmark segments. Generate `report.md` and `report.json` with the tool's `Analyze` command. The tool can optionally launch the official PresentMon console capture and keeps the primary and proxy swapchains separate in its report. See [`tools/README.md`](tools/README.md) for the complete workflow.
+
+F10 is a visual diagnostic, not a performance bypass: it changes the presented source while NGX continues processing. Use the analyzer's **addon disabled** segment to measure the loaded addon's bypass behavior. Measuring a true no-addon baseline still requires a separate launch with the addon binary physically absent.
 
 ## Proven pipeline
 

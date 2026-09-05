@@ -34,6 +34,8 @@ for %%F in (nvngx_dlssnr.dll nvngx_dlss.dll nvngx_dlssg.dll) do (
 )
 copy /y "shaders\DLSS5_AIO_Feed.fx" "build\DLSS5_AIO_Feed.fx" >nul || exit /b 1
 copy /y "shaders\StandaloneBoundary.fx" "build\StandaloneBoundary.fx" >nul || exit /b 1
+copy /y "..\tools\DLSS5-PerformanceAnalyzer.ps1" "build\DLSS5-PerformanceAnalyzer.ps1" >nul || exit /b 1
+copy /y "..\tools\DLSS5-PerformanceAnalyzer.cmd" "build\DLSS5-PerformanceAnalyzer.cmd" >nul || exit /b 1
 echo Building Vulkan fallback layer from %CD%
 call "%FEEDER_ROOT%\layer\build-layer.bat" || exit /b 1
 cd /d "%~dp0"
