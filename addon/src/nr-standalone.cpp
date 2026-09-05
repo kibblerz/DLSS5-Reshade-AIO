@@ -33,7 +33,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.5-async-compute-prototype"
+#define ADDON_VERSION "2.0.5-async-pacing-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -196,6 +196,13 @@ static std::atomic<unsigned int> g_cpu_proxy_swap_wait_us{0};
 static std::atomic<unsigned int> g_cpu_proxy_present_us{0};
 static std::atomic<unsigned int> g_cpu_proxy_worker_us{0};
 static std::atomic<unsigned int> g_cpu_proxy_worker_peak_us{0};
+static std::atomic<unsigned int> g_proxy_output_interval_us{0};
+static std::atomic<unsigned int> g_proxy_output_interval_avg_us{0};
+static std::atomic<unsigned int> g_proxy_output_interval_peak_us{0};
+static std::atomic<unsigned int> g_proxy_generated_to_real_us{0};
+static std::atomic<unsigned int> g_proxy_real_to_generated_us{0};
+static LARGE_INTEGER g_proxy_last_accepted_present_qpc;
+static bool g_proxy_last_accepted_was_generated;
 static std::atomic<unsigned int> g_cpu_shared_telemetry_us{0};
 static std::atomic<unsigned long long> g_proxy_present_requests{0};
 static std::atomic<unsigned long long> g_proxy_present_completed{0};
@@ -1326,6 +1333,9 @@ static void ResetPerformanceTelemetry()
     g_gpu_proxy_generated_us = 0; g_gpu_proxy_real_us = 0; g_gpu_proxy_total_us = 0;
     g_cpu_proxy_mailbox_us = 0; g_cpu_proxy_fence_wait_us = 0; g_cpu_proxy_swap_wait_us = 0;
     g_cpu_proxy_present_us = 0; g_cpu_proxy_worker_us = 0; g_cpu_proxy_worker_peak_us = 0;
+    g_proxy_output_interval_us = 0; g_proxy_output_interval_avg_us = 0;
+    g_proxy_output_interval_peak_us = 0; g_proxy_generated_to_real_us = 0;
+    g_proxy_real_to_generated_us = 0;
     g_telemetry_samples = 0;
     g_guide_telemetry_samples = 0; g_proxy_telemetry_samples = 0;
     g_gpu_telemetry_available = false; g_guide_gpu_telemetry_available = false;
@@ -5838,6 +5848,29 @@ static void UpdateOutputFps()
     g_output_fps_sample_start = now;
 }
 
+static void RecordAcceptedProxyPresent(bool generated)
+{
+    LARGE_INTEGER now = {};
+    QueryPerformanceCounter(&now);
+    if (g_proxy_last_accepted_present_qpc.QuadPart != 0)
+    {
+        const unsigned int interval = CounterDeltaMicroseconds(
+            g_proxy_last_accepted_present_qpc, now);
+        if (interval != 0)
+        {
+            g_proxy_output_interval_us = interval;
+            SmoothMicroseconds(g_proxy_output_interval_avg_us, interval);
+            RecordPeakMicroseconds(g_proxy_output_interval_peak_us, interval);
+            if (g_proxy_last_accepted_was_generated && !generated)
+                SmoothMicroseconds(g_proxy_generated_to_real_us, interval);
+            else if (!g_proxy_last_accepted_was_generated && generated)
+                SmoothMicroseconds(g_proxy_real_to_generated_us, interval);
+        }
+    }
+    g_proxy_last_accepted_present_qpc = now;
+    g_proxy_last_accepted_was_generated = generated;
+}
+
 static unsigned int CounterDeltaMicroseconds(const LARGE_INTEGER &begin, const LARGE_INTEGER &end)
 {
     LARGE_INTEGER frequency = {};
@@ -5879,13 +5912,18 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
             g_guide_gpu_telemetry_available.load() ? 1u : 0u,
             g_cpu_vort_submit_us.load() / 1000.0f, g_cpu_feed_submit_us.load() / 1000.0f,
             g_cpu_guide_flush_us.load() / 1000.0f);
-        Log("performance proxy: GPU generated=%.3fms real=%.3fms pair=%.3fms samples=%llu available=%u; CPU mailbox=%.3fms fence_wait=%.3fms swap_wait=%.3fms Present=%.3fms worker=%.3fms peak=%.3fms; requests=%llu completed=%llu coalesced=%llu timeouts=%llu display_backpressure=%llu; neural deferrals presenter=%llu GPU=%llu",
+        Log("performance proxy: GPU generated=%.3fms real=%.3fms pair=%.3fms samples=%llu available=%u; CPU mailbox=%.3fms fence_wait=%.3fms swap_wait=%.3fms Present=%.3fms worker=%.3fms peak=%.3fms; output interval current=%.3fms avg=%.3fms peak=%.3fms generated->real=%.3fms real->generated=%.3fms; requests=%llu completed=%llu coalesced=%llu timeouts=%llu display_backpressure=%llu; neural deferrals presenter=%llu GPU=%llu",
             g_gpu_proxy_generated_us.load() / 1000.0f, g_gpu_proxy_real_us.load() / 1000.0f,
             g_gpu_proxy_total_us.load() / 1000.0f, g_proxy_telemetry_samples.load(),
             g_proxy_gpu_telemetry_available.load() ? 1u : 0u,
             g_cpu_proxy_mailbox_us.load() / 1000.0f, g_cpu_proxy_fence_wait_us.load() / 1000.0f,
             g_cpu_proxy_swap_wait_us.load() / 1000.0f, g_cpu_proxy_present_us.load() / 1000.0f,
             g_cpu_proxy_worker_us.load() / 1000.0f, g_cpu_proxy_worker_peak_us.load() / 1000.0f,
+            g_proxy_output_interval_us.load() / 1000.0f,
+            g_proxy_output_interval_avg_us.load() / 1000.0f,
+            g_proxy_output_interval_peak_us.load() / 1000.0f,
+            g_proxy_generated_to_real_us.load() / 1000.0f,
+            g_proxy_real_to_generated_us.load() / 1000.0f,
             g_proxy_present_requests.load(), g_proxy_present_completed.load(),
             g_proxy_present_coalesced.load(), g_proxy_present_timeouts.load(),
             g_proxy_display_backpressure_drops.load(),
@@ -6131,12 +6169,20 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
         if (SUCCEEDED(hr)) hr = g_composition_device->Commit();
         if (SUCCEEDED(hr)) g_composition_target_window = composition_window;
     }
+    const bool pace_async_output = g_async_compute_active &&
+        !g_synchronous_proxy_presentation;
+    const UINT proxy_max_frame_latency = pace_async_output ? 1u : 2u;
     if (SUCCEEDED(hr))
     {
         Microsoft::WRL::ComPtr<IDXGISwapChain2> swapchain2;
         failed_stage = "IDXGISwapChain2 frame-latency setup";
         hr = g_proxy_swapchain.As(&swapchain2);
-        if (SUCCEEDED(hr)) hr = swapchain2->SetMaximumFrameLatency(2);
+        // The async FG path submits a generated/real pair for each accepted
+        // source frame. A two-frame queue lets both flips enter DWM together,
+        // which reports a high FPS while producing a short-short-long cadence.
+        // Keep only one outstanding flip so every member of the pair is gated
+        // by an actual composition opportunity.
+        if (SUCCEEDED(hr)) hr = swapchain2->SetMaximumFrameLatency(proxy_max_frame_latency);
         if (SUCCEEDED(hr))
         {
             g_proxy_frame_latency_waitable = swapchain2->GetFrameLatencyWaitableObject();
@@ -6310,13 +6356,21 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
     g_proxy_present_format = present_format;
     g_proxy_activation_frames = 0;
     g_proxy_early_pending_activation = true;
-    Log("%s compositor ready: %ux%u source_format=%u present_format=%u game_hwnd=%p target_hwnd=%p ownership=%s alpha=%s input_owner=%s DWM_paced=yes presenter=%s buffers=3 max_latency=2",
+    g_proxy_last_accepted_present_qpc = {};
+    g_proxy_last_accepted_was_generated = false;
+    g_proxy_output_interval_us = 0;
+    g_proxy_output_interval_avg_us = 0;
+    g_proxy_output_interval_peak_us = 0;
+    g_proxy_generated_to_real_us = 0;
+    g_proxy_real_to_generated_us = 0;
+    Log("%s compositor ready: %ux%u source_format=%u present_format=%u game_hwnd=%p target_hwnd=%p ownership=%s alpha=%s input_owner=%s DWM_paced=yes presenter=%s buffers=3 max_latency=%u pacing=%s",
         DetachedPresentationEnabled() ? "detached" : "same-window", width, height,
         static_cast<unsigned int>(source_format), static_cast<unsigned int>(present_format), g_game_window,
         composition_window, g_same_window_compositor ? "attached/game-HWND" : "detached/proxy-HWND",
         desc.AlphaMode == DXGI_ALPHA_MODE_IGNORE ? "opaque/ignore" : "premultiplied",
         DetachedPresentationEnabled() ? "routed-to-game" : "game",
-        g_synchronous_proxy_presentation ? "serialized/game-thread" : "asynchronous/worker");
+        g_synchronous_proxy_presentation ? "serialized/game-thread" : "asynchronous/worker",
+        proxy_max_frame_latency, pace_async_output ? "one-flip/display-gated" : "legacy");
     return true;
 }
 
@@ -6647,6 +6701,7 @@ static bool PresentProxyFrameOnWorker(UINT slot_index)
             return false;
         }
         accepted_by_swapchain = true;
+        RecordAcceptedProxyPresent(use_framegen && present_index == 0);
         ++g_frames_presented;
         UpdateOutputFps();
     }
