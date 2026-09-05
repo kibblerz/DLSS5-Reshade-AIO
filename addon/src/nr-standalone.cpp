@@ -34,7 +34,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.15-phase-scheduled-fg-prototype"
+#define ADDON_VERSION "2.0.25-common-phase-scheduled-fg-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -520,6 +520,8 @@ static std::atomic<unsigned long long> g_async_fg_busy_bypasses{0};
 static std::atomic<unsigned long long> g_async_fg_deadline_drops{0};
 static std::atomic<unsigned long long> g_async_fg_completed_in_time{0};
 static std::atomic<unsigned long long> g_async_fg_phase_waits{0};
+static std::atomic<unsigned long long> g_async_fg_common_phase_deferrals{0};
+static std::atomic<bool> g_async_fg_common_phase_logged{false};
 static std::atomic<bool> g_async_fg_reset_required{true};
 static std::atomic<bool> g_async_fg_phase_released{true};
 static Microsoft::WRL::ComPtr<ID3D12Fence> g_async_input_fence;
@@ -1507,6 +1509,8 @@ static void ResetPerformanceTelemetry()
     g_async_fg_submissions = 0; g_async_fg_overlap_frames = 0;
     g_async_fg_busy_bypasses = 0; g_async_fg_deadline_drops = 0;
     g_async_fg_completed_in_time = 0; g_async_fg_phase_waits = 0;
+    g_async_fg_common_phase_deferrals = 0;
+    g_async_fg_common_phase_logged = false;
     g_telemetry_samples = 0;
     g_guide_telemetry_samples = 0; g_proxy_telemetry_samples = 0;
     g_gpu_telemetry_available = false; g_guide_gpu_telemetry_available = false;
@@ -1813,9 +1817,30 @@ static bool LegacyCaptureMailboxEnabled()
         g_capture_ready_fence11 && g_capture_ready_fence12;
 }
 
-static bool SplitFrameGenerationEnabled()
+static bool PhaseScheduledFrameGenerationEnabled()
 {
-    return LegacyCaptureMailboxEnabled() && g_async_fg_queue && g_async_fg_fence;
+    // The scheduling contract belongs to the post-capture NGX pipeline, not to
+    // any one capture transport. D3D11's mailbox was simply the first caller
+    // that could exercise it. Every API reaches this same D3D12 NGX queue after
+    // capture, so use the split FG phase whenever direct output handoff exists.
+    return DirectOutputHandoffEnabled() && EffectiveFramegenEnabled() &&
+        !g_framegen_failed && g_fg_feature != nullptr &&
+        g_async_fg_queue && g_async_fg_fence;
+}
+
+static bool CommonPhaseScheduleAdmitsReconstruction()
+{
+    if (!PhaseScheduledFrameGenerationEnabled()) return true;
+    if (AsyncFgGpuIdle())
+    {
+        g_async_fg_phase_released = true;
+        return true;
+    }
+    // A missed presentation deadline explicitly releases the phase. This lets
+    // the newest real frame proceed while the obsolete intermediate retires.
+    if (g_async_fg_phase_released.load(std::memory_order_acquire)) return true;
+    ++g_async_fg_common_phase_deferrals;
+    return false;
 }
 
 static void ReclaimLegacyCaptureSlots()
@@ -2111,6 +2136,14 @@ static UINT DirectNeuralFramesInFlight()
 
 static bool AdmitNewestFrameForFgPair()
 {
+    // NR/SR and FG compete for the same NGX/GPU working set. Preserve the
+    // phase order that produced stable Batman frame pacing, but do it here at
+    // the common admission boundary so D3D12, D3D9 and Vulkan use it too. This
+    // never waits or throttles the game thread: the current source frame is
+    // declined and the first Present after FG retires supplies the newest one.
+    if (!CommonPhaseScheduleAdmitsReconstruction())
+        return false;
+
     const bool paced_fg = DirectOutputHandoffEnabled() &&
         EffectiveFramegenEnabled() && !g_framegen_failed && g_fg_feature != nullptr &&
         g_fg_frames.load(std::memory_order_acquire) >= 2 && g_show_neural_output &&
@@ -2142,7 +2175,7 @@ static bool AdmitNewestFrameForFgPair()
     // More output textures previously just made the serial NGX queue deeper.
     // Keep only two unfinished evaluations while allowing completed frames to
     // occupy the rest of the ring until their generated/real pair is shown.
-    const UINT neural_limit = LegacyCaptureMailboxEnabled() ?
+    const UINT neural_limit = PhaseScheduledFrameGenerationEnabled() ?
         kLatestFrameNeuralFramesInFlight : kMaxDirectNeuralFramesInFlight;
     if (DirectNeuralFramesInFlight() >= neural_limit)
     {
@@ -4888,6 +4921,15 @@ static bool SubmitSplitFrameGeneration(PresentationFrameSlot &slot,
     slot.fg_telemetry_pending = telemetry;
     g_async_fg_phase_released = false;
     ++g_async_fg_submissions;
+    if (!g_async_fg_common_phase_logged.exchange(true, std::memory_order_acq_rel))
+    {
+        const char *api_name = g_present_api == reshade::api::device_api::d3d12 ? "D3D12" :
+            g_present_api == reshade::api::device_api::d3d11 ? "D3D11" :
+            g_present_api == reshade::api::device_api::d3d9 ? "D3D9" :
+            g_present_api == reshade::api::device_api::vulkan ? "Vulkan" : "unknown";
+        Log("common post-capture phase scheduler ACTIVE: api=%s order=NR+SR -> FG -> newest source frame",
+            api_name);
+    }
     if (g_neural_fence->GetCompletedValue() < reconstruction_fence_value)
         ++g_async_fg_overlap_frames;
     return true;
@@ -5151,8 +5193,8 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     NVSDK_NGX_Result fg_result = static_cast<NVSDK_NGX_Result>(0xBAD00004);
     bool evaluate_fg = EffectiveFramegenEnabled() && !g_framegen_failed && g_fg_feature &&
         NVSDK_NGX_SUCCEED(nr_result) && NVSDK_NGX_SUCCEED(sr_result);
-    const bool split_fg_path = evaluate_fg && completion_driven_dispatch &&
-        mailbox_d3d11_input && SplitFrameGenerationEnabled() &&
+    const bool split_fg_path = evaluate_fg &&
+        PhaseScheduledFrameGenerationEnabled() &&
         direct_reservation.index >= 0;
     bool split_fg = split_fg_path && AsyncFgGpuIdle();
     if (split_fg_path && !split_fg)
@@ -7048,7 +7090,7 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
         Log("performance direct handoff: active=%u slots=%u neural_limit=%u submit->ready=%.3fms peak=%.3fms ready->present=%.3fms submit->present=%.3fms samples=%llu output_deferrals=%llu admission_deferrals=%llu inflight_deferrals=%llu capacity_deferrals=%llu target_real=%.1fHz",
             DirectOutputHandoffEnabled() ? 1u : 0u,
             kPresentationFrameSlotCount,
-            LegacyCaptureMailboxEnabled() ? kLatestFrameNeuralFramesInFlight :
+            PhaseScheduledFrameGenerationEnabled() ? kLatestFrameNeuralFramesInFlight :
                 kMaxDirectNeuralFramesInFlight,
             g_direct_submit_to_ready_us.load() / 1000.0f,
             g_direct_submit_to_ready_peak_us.load() / 1000.0f,
@@ -7072,10 +7114,15 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
             g_neural_dispatch_submissions.load(),
             g_neural_dispatch_gap_us.load() / 1000.0f,
             g_neural_dispatch_gap_peak_us.load() / 1000.0f);
-        Log("performance phase-scheduled FG: active=%u submissions=%llu outstanding=%llu phase-waits=%llu completed-in-window=%llu queue-pressure-bypasses=%llu deadline-drops=%llu FG_GPU=%.3fms reconstruction_GPU=%.3fms",
-            SplitFrameGenerationEnabled() ? 1u : 0u,
+        const char *phase_api = g_present_api == reshade::api::device_api::d3d12 ? "D3D12" :
+            g_present_api == reshade::api::device_api::d3d11 ? "D3D11" :
+            g_present_api == reshade::api::device_api::d3d9 ? "D3D9" :
+            g_present_api == reshade::api::device_api::vulkan ? "Vulkan" : "waiting";
+        Log("performance phase-scheduled FG: active=%u api=%s common-post-capture=1 submissions=%llu outstanding=%llu dispatcher-waits=%llu common-deferrals=%llu completed-in-window=%llu queue-pressure-bypasses=%llu deadline-drops=%llu FG_GPU=%.3fms reconstruction_GPU=%.3fms",
+            PhaseScheduledFrameGenerationEnabled() ? 1u : 0u, phase_api,
             g_async_fg_submissions.load(), AsyncFgOutstandingJobs(),
             g_async_fg_phase_waits.load(),
+            g_async_fg_common_phase_deferrals.load(),
             g_async_fg_completed_in_time.load(), g_async_fg_busy_bypasses.load(),
             g_async_fg_deadline_drops.load(),
             g_gpu_fg_us.load() / 1000.0f, g_gpu_total_us.load() / 1000.0f);
