@@ -33,7 +33,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.6-direct-output-handoff-prototype"
+#define ADDON_VERSION "2.0.7-admission-ring-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -220,6 +220,10 @@ static std::atomic<unsigned int> g_direct_ready_to_present_us{0};
 static std::atomic<unsigned int> g_direct_submit_to_present_us{0};
 static std::atomic<unsigned long long> g_direct_handoff_samples{0};
 static std::atomic<unsigned long long> g_direct_output_deferrals{0};
+static std::atomic<unsigned long long> g_fg_admission_deferrals{0};
+static std::atomic<unsigned long long> g_fg_admission_capacity_deferrals{0};
+static LONGLONG g_fg_admission_next_qpc;
+static LONGLONG g_fg_admission_frequency;
 static std::atomic<unsigned long long> g_neural_presenter_deferrals{0};
 static std::atomic<unsigned long long> g_neural_gpu_deferrals{0};
 static std::atomic<unsigned long long> g_source_frame_sequence{0};
@@ -495,7 +499,10 @@ static Microsoft::WRL::ComPtr<ID3D12Fence> g_async_input_fence;
 static UINT64 g_async_input_fence_value;
 static HANDLE g_async_input_fence_event;
 static constexpr UINT kPipelineFrameSlotCount = 3;
-static constexpr UINT kPresentationFrameSlotCount = 3;
+// Direct NGX outputs remain owned from compute submission through the paced
+// generated/real pair. Five slots cover the three-deep neural queue plus two
+// display-owned frames without reintroducing a post-NGX copy.
+static constexpr UINT kPresentationFrameSlotCount = 5;
 enum PipelineFrameSlotState : unsigned int
 {
     PipelineSlotFree = 0,
@@ -1389,6 +1396,11 @@ static void ResetPerformanceTelemetry()
     g_proxy_output_interval_peak_us = 0; g_proxy_generated_to_real_us = 0;
     g_proxy_real_to_generated_us = 0; g_cpu_proxy_pacing_wait_us = 0;
     g_proxy_pacing_late_frames = 0;
+    g_direct_submit_to_ready_us = 0; g_direct_submit_to_ready_peak_us = 0;
+    g_direct_ready_to_present_us = 0; g_direct_submit_to_present_us = 0;
+    g_direct_handoff_samples = 0; g_direct_output_deferrals = 0;
+    g_fg_admission_deferrals = 0; g_fg_admission_capacity_deferrals = 0;
+    g_fg_admission_next_qpc = 0;
     g_telemetry_samples = 0;
     g_guide_telemetry_samples = 0; g_proxy_telemetry_samples = 0;
     g_gpu_telemetry_available = false; g_guide_gpu_telemetry_available = false;
@@ -1731,6 +1743,68 @@ static int AcquirePresentationFrameSlot()
         }
     }
     return -1;
+}
+
+static bool DirectOutputCapacityAvailable()
+{
+    ReclaimPresentationFrameSlots();
+    for (PresentationFrameSlot &slot : g_presentation_slots)
+    {
+        if (slot.state.load(std::memory_order_acquire) == PresentationSlotFree)
+            return true;
+    }
+    return false;
+}
+
+static bool AdmitNewestFrameForFgPair()
+{
+    const bool paced_fg = DirectOutputHandoffEnabled() &&
+        EffectiveFramegenEnabled() && !g_framegen_failed && g_fg_feature != nullptr &&
+        g_fg_frames.load(std::memory_order_acquire) >= 2 && g_show_neural_output &&
+        g_proxy_refresh_hz >= 24;
+    if (!paced_fg)
+    {
+        g_fg_admission_next_qpc = 0;
+        return true;
+    }
+
+    // Do not capture an input that cannot acquire an output target. Leaving the
+    // deadline untouched means the first Present after a slot retires uses the
+    // newest game frame immediately instead of replaying an older candidate.
+    if (!DirectOutputCapacityAvailable())
+    {
+        ++g_fg_admission_capacity_deferrals;
+        return false;
+    }
+
+    LARGE_INTEGER now = {};
+    if (!QueryPerformanceCounter(&now)) return true;
+    if (g_fg_admission_frequency <= 0)
+    {
+        LARGE_INTEGER frequency = {};
+        if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0)
+            return true;
+        g_fg_admission_frequency = frequency.QuadPart;
+    }
+    const LONGLONG interval = std::max<LONGLONG>(1,
+        (g_fg_admission_frequency * 2 + g_proxy_refresh_hz / 2) /
+            static_cast<LONGLONG>(g_proxy_refresh_hz));
+    if (g_fg_admission_next_qpc != 0 && now.QuadPart < g_fg_admission_next_qpc)
+    {
+        ++g_fg_admission_deferrals;
+        return false;
+    }
+
+    if (g_fg_admission_next_qpc == 0 ||
+        now.QuadPart - g_fg_admission_next_qpc > interval * 2)
+        g_fg_admission_next_qpc = now.QuadPart + interval;
+    else
+    {
+        do
+            g_fg_admission_next_qpc += interval;
+        while (g_fg_admission_next_qpc <= now.QuadPart);
+    }
+    return true;
 }
 
 static bool BeginNeuralFrameCommands(UINT slot_index)
@@ -6190,13 +6264,16 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
             g_proxy_present_coalesced.load(), g_proxy_present_timeouts.load(),
             g_proxy_display_backpressure_drops.load(),
             g_neural_presenter_deferrals.load(), g_neural_gpu_deferrals.load());
-        Log("performance direct handoff: active=%u submit->ready=%.3fms peak=%.3fms ready->present=%.3fms submit->present=%.3fms samples=%llu output_deferrals=%llu",
+        Log("performance direct handoff: active=%u slots=%u submit->ready=%.3fms peak=%.3fms ready->present=%.3fms submit->present=%.3fms samples=%llu output_deferrals=%llu admission_deferrals=%llu capacity_deferrals=%llu target_real=%.1fHz",
             DirectOutputHandoffEnabled() ? 1u : 0u,
+            kPresentationFrameSlotCount,
             g_direct_submit_to_ready_us.load() / 1000.0f,
             g_direct_submit_to_ready_peak_us.load() / 1000.0f,
             g_direct_ready_to_present_us.load() / 1000.0f,
             g_direct_submit_to_present_us.load() / 1000.0f,
-            g_direct_handoff_samples.load(), g_direct_output_deferrals.load());
+            g_direct_handoff_samples.load(), g_direct_output_deferrals.load(),
+            g_fg_admission_deferrals.load(), g_fg_admission_capacity_deferrals.load(),
+            EffectiveFramegenEnabled() && g_show_neural_output ? g_proxy_refresh_hz * 0.5f : 0.0f);
         if (g_windowed_virtualization_active.load() || DetachedPresentationEnabled())
             Log("presentation compatibility: host=%s window_virtualization=%s logical_client=%s input_coordinates=%s render=%ux%u output=%ux%u resolution_intents=%llu WM_SIZE=%llu client_queries=%llu coordinate_APIs=%llu mouse_messages=%llu cursor_queries=%llu cursor_warps=%llu cursor_clips=%llu resize_pins=%llu",
                 DetachedPresentationEnabled() ? "detached" : "attached",
@@ -7941,6 +8018,8 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     }
     g_home_down = home;
     g_alt_x_down = alt_x;
+    if (!AdmitNewestFrameForFgPair())
+        return;
     const reshade::api::resource backbuffer_resource = swapchain->get_current_back_buffer();
     if (!backbuffer_resource.handle) return;
     if (api == reshade::api::device_api::d3d12)
