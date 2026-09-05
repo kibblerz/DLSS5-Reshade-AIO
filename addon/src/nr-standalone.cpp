@@ -100,6 +100,7 @@ static bool g_requested_synchronous_proxy_presentation;
 static std::atomic<unsigned int> g_proxy_present_request_state{0};
 static std::atomic<unsigned long long> g_proxy_present_coalesced{0};
 static std::atomic<unsigned long long> g_proxy_present_timeouts{0};
+static std::atomic<unsigned long long> g_proxy_display_backpressure_drops{0};
 static bool g_proxy_failed;
 static std::atomic<bool> g_proxy_initializing{false};
 static std::atomic<unsigned int> g_proxy_initialization_deferrals{0};
@@ -5387,7 +5388,7 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
             g_guide_gpu_telemetry_available.load() ? 1u : 0u,
             g_cpu_vort_submit_us.load() / 1000.0f, g_cpu_feed_submit_us.load() / 1000.0f,
             g_cpu_guide_flush_us.load() / 1000.0f);
-        Log("performance proxy: GPU generated=%.3fms real=%.3fms pair=%.3fms samples=%llu available=%u; CPU mailbox=%.3fms fence_wait=%.3fms swap_wait=%.3fms Present=%.3fms worker=%.3fms peak=%.3fms; requests=%llu completed=%llu coalesced=%llu timeouts=%llu; neural deferrals presenter=%llu GPU=%llu",
+        Log("performance proxy: GPU generated=%.3fms real=%.3fms pair=%.3fms samples=%llu available=%u; CPU mailbox=%.3fms fence_wait=%.3fms swap_wait=%.3fms Present=%.3fms worker=%.3fms peak=%.3fms; requests=%llu completed=%llu coalesced=%llu timeouts=%llu display_backpressure=%llu; neural deferrals presenter=%llu GPU=%llu",
             g_gpu_proxy_generated_us.load() / 1000.0f, g_gpu_proxy_real_us.load() / 1000.0f,
             g_gpu_proxy_total_us.load() / 1000.0f, g_proxy_telemetry_samples.load(),
             g_proxy_gpu_telemetry_available.load() ? 1u : 0u,
@@ -5396,6 +5397,7 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
             g_cpu_proxy_worker_us.load() / 1000.0f, g_cpu_proxy_worker_peak_us.load() / 1000.0f,
             g_proxy_present_requests.load(), g_proxy_present_completed.load(),
             g_proxy_present_coalesced.load(), g_proxy_present_timeouts.load(),
+            g_proxy_display_backpressure_drops.load(),
             g_neural_presenter_deferrals.load(), g_neural_gpu_deferrals.load());
         if (g_windowed_virtualization_active.load() || DetachedPresentationEnabled())
             Log("presentation compatibility: host=%s window_virtualization=%s logical_client=%s input_coordinates=%s render=%ux%u output=%ux%u resolution_intents=%llu WM_SIZE=%llu client_queries=%llu coordinate_APIs=%llu mouse_messages=%llu cursor_queries=%llu cursor_warps=%llu cursor_clips=%llu resize_pins=%llu",
@@ -5507,8 +5509,21 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
     }
 
     HMONITOR monitor = MonitorFromWindow(g_game_window, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO monitor_info = {sizeof(monitor_info)};
+    MONITORINFOEXW monitor_info = {};
+    monitor_info.cbSize = sizeof(monitor_info);
     if (!GetMonitorInfoW(monitor, &monitor_info)) { g_proxy_failed = true; return false; }
+    DEVMODEW display_mode = {};
+    display_mode.dmSize = sizeof(display_mode);
+    if (EnumDisplaySettingsW(monitor_info.szDevice, ENUM_CURRENT_SETTINGS, &display_mode))
+        Log("proxy target monitor: device=%ls desktop=%ldx%ld refresh=%luHz position=(%ld,%ld)-(%ld,%ld) primary=%s",
+            monitor_info.szDevice, display_mode.dmPelsWidth, display_mode.dmPelsHeight,
+            display_mode.dmDisplayFrequency,
+            monitor_info.rcMonitor.left, monitor_info.rcMonitor.top,
+            monitor_info.rcMonitor.right, monitor_info.rcMonitor.bottom,
+            (monitor_info.dwFlags & MONITORINFOF_PRIMARY) != 0 ? "yes" : "no");
+    else
+        Log("proxy target monitor refresh query failed: device=%ls error=%lu",
+            monitor_info.szDevice, GetLastError());
 
     // Prefer attaching the output to the game's HWND. Vulkan WSI requires its
     // swapchain extent to match the physical client area, though, so a reduced
@@ -5981,6 +5996,7 @@ static bool PresentProxyFrameOnWorker(UINT slot_index)
     D3D12_VIEWPORT viewport = {0, 0, static_cast<float>(g_output_width.load()), static_cast<float>(g_output_height.load()), 0, 1};
     D3D12_RECT scissor = {0, 0, static_cast<LONG>(g_output_width.load()), static_cast<LONG>(g_output_height.load())};
 
+    bool accepted_by_swapchain = false;
     for (UINT present_index = 0; present_index < present_count; ++present_index)
     {
         const int command_slot_index = AcquireProxyCommandSlot();
@@ -5993,19 +6009,31 @@ static bool PresentProxyFrameOnWorker(UINT slot_index)
             return false;
         }
         const UINT command_slot = static_cast<UINT>(command_slot_index);
-        if (g_performance_telemetry_enabled) QueryPerformanceCounter(&wait_begin);
-        if (g_proxy_frame_latency_waitable == nullptr ||
-            WaitForSingleObject(g_proxy_frame_latency_waitable, 50) != WAIT_OBJECT_0)
+        // A DWM composition swapchain may expose only one token per physical
+        // refresh. Waiting for that token here used to retain the NGX output
+        // slot for 9-16 ms and eventually made the game discard every other
+        // source frame. Without FG, submit opportunistically instead: if DWM
+        // is full, Present returns WAS_STILL_DRAWING and this slot can be
+        // released as soon as its draw completes. The next completed neural
+        // frame then becomes the latest candidate for the next refresh.
+        if (use_framegen && g_performance_telemetry_enabled)
+            QueryPerformanceCounter(&wait_begin);
+        if (use_framegen && (g_proxy_frame_latency_waitable == nullptr ||
+            WaitForSingleObject(g_proxy_frame_latency_waitable, 50) != WAIT_OBJECT_0))
         {
             const unsigned long long timeouts = ++g_proxy_present_timeouts;
             if (timeouts <= 8 || timeouts % 120 == 0)
                 Log("async proxy presenter timed out waiting for a swapchain slot (timeout=%llu)", timeouts);
             return false;
         }
-        if (g_performance_telemetry_enabled)
+        if (use_framegen && g_performance_telemetry_enabled)
         {
             QueryPerformanceCounter(&wait_end);
             SmoothMicroseconds(g_cpu_proxy_swap_wait_us, CounterDeltaMicroseconds(wait_begin, wait_end));
+        }
+        else
+        {
+            g_cpu_proxy_swap_wait_us = 0;
         }
         ID3D12CommandAllocator *allocator = g_proxy_allocators[command_slot].Get();
         ID3D12GraphicsCommandList *list = g_proxy_lists[command_slot].Get();
@@ -6069,13 +6097,22 @@ static bool PresentProxyFrameOnWorker(UINT slot_index)
         ++g_proxy_fence_value;
         if (FAILED(g_command_queue->Signal(g_proxy_fence.Get(), g_proxy_fence_value))) return false;
         g_proxy_command_fence_values[command_slot] = g_proxy_fence_value;
-        const UINT present_flags = g_proxy_allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0u;
+        const UINT present_flags = use_framegen ?
+            (g_proxy_allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0u) :
+            DXGI_PRESENT_DO_NOT_WAIT;
         if (g_performance_telemetry_enabled) QueryPerformanceCounter(&wait_begin);
         const HRESULT present_result = g_proxy_swapchain->Present(0, present_flags);
         if (g_performance_telemetry_enabled)
         {
             QueryPerformanceCounter(&wait_end);
             SmoothMicroseconds(g_cpu_proxy_present_us, CounterDeltaMicroseconds(wait_begin, wait_end));
+        }
+        if (!use_framegen && present_result == DXGI_ERROR_WAS_STILL_DRAWING)
+        {
+            const unsigned long long drops = ++g_proxy_display_backpressure_drops;
+            if (drops <= 4 || drops % 600 == 0)
+                Log("proxy display queue busy; retained newest-frame cadence without blocking NGX (drop=%llu)", drops);
+            continue;
         }
         if (FAILED(present_result))
         {
@@ -6087,6 +6124,7 @@ static bool PresentProxyFrameOnWorker(UINT slot_index)
             RequestProxyVisibility(false);
             return false;
         }
+        accepted_by_swapchain = true;
         ++g_frames_presented;
         UpdateOutputFps();
     }
@@ -6096,7 +6134,11 @@ static bool PresentProxyFrameOnWorker(UINT slot_index)
         g_proxy_telemetry_present_count = present_count;
         g_proxy_telemetry_pending = true;
     }
-    const unsigned long long post_frame = ++g_post_reshade_frames;
+    // Command submission succeeded even if DWM could not accept this
+    // particular Present. Keeping that distinction lets the pipeline slot
+    // retire without treating normal display backpressure as a proxy fault.
+    const unsigned long long post_frame = accepted_by_swapchain ? ++g_post_reshade_frames :
+        g_post_reshade_frames.load(std::memory_order_relaxed);
     if (post_frame == 1)
         Log("post-ReShade native presentation active; effects and overlay are available to the proxy compositor");
     if (use_framegen && post_frame == 2)
