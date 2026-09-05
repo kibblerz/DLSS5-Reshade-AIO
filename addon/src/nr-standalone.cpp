@@ -34,7 +34,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.15-phase-scheduled-fg-prototype"
+#define ADDON_VERSION "2.0.4-experimental.2"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -519,7 +519,7 @@ static std::atomic<unsigned long long> g_async_fg_overlap_frames{0};
 static std::atomic<unsigned long long> g_async_fg_busy_bypasses{0};
 static std::atomic<unsigned long long> g_async_fg_deadline_drops{0};
 static std::atomic<unsigned long long> g_async_fg_completed_in_time{0};
-static std::atomic<unsigned long long> g_async_fg_phase_waits{0};
+static std::atomic<unsigned long long> g_async_fg_gpu_chains{0};
 static std::atomic<bool> g_async_fg_reset_required{true};
 static std::atomic<bool> g_async_fg_phase_released{true};
 static Microsoft::WRL::ComPtr<ID3D12Fence> g_async_input_fence;
@@ -558,6 +558,7 @@ struct PipelineFrameSlot
     UINT64 neural_fence_value = 0;
     std::atomic<UINT64> proxy_fence_value{0};
     UINT64 async_input_fence_value = 0;
+    UINT64 fg_phase_dependency_value = 0;
     unsigned long long sequence = 0;
     bool has_generated_frame = false;
     bool input_dependency_satisfied = false;
@@ -1506,7 +1507,7 @@ static void ResetPerformanceTelemetry()
     g_neural_dispatch_completion_qpc = 0;
     g_async_fg_submissions = 0; g_async_fg_overlap_frames = 0;
     g_async_fg_busy_bypasses = 0; g_async_fg_deadline_drops = 0;
-    g_async_fg_completed_in_time = 0; g_async_fg_phase_waits = 0;
+    g_async_fg_completed_in_time = 0; g_async_fg_gpu_chains = 0;
     g_telemetry_samples = 0;
     g_guide_telemetry_samples = 0; g_proxy_telemetry_samples = 0;
     g_gpu_telemetry_available = false; g_guide_gpu_telemetry_available = false;
@@ -2021,6 +2022,7 @@ static int AcquirePipelineFrameSlot()
             g_pipeline_slots[index].neural_fence_value = 0;
             g_pipeline_slots[index].proxy_fence_value.store(0, std::memory_order_release);
             g_pipeline_slots[index].input_dependency_satisfied = false;
+            g_pipeline_slots[index].fg_phase_dependency_value = 0;
             g_pipeline_slots[index].fg_split_submission = false;
             g_pipeline_slots[index].presentation_slot_index = -1;
             return static_cast<int>(index);
@@ -2265,6 +2267,19 @@ static bool SubmitNeuralFrameCommands(UINT slot_index)
         return false;
     }
     ID3D12CommandQueue *queue = NeuralSubmissionQueue();
+    if (slot.fg_phase_dependency_value != 0)
+    {
+        hr = g_async_fg_fence ? queue->Wait(
+            g_async_fg_fence.Get(), slot.fg_phase_dependency_value) : E_POINTER;
+        if (FAILED(hr))
+        {
+            g_active_neural_list = nullptr;
+            slot.state.store(PipelineSlotAbandoned, std::memory_order_release);
+            Fail("GPU-chained FG-to-neural dependency", static_cast<unsigned int>(hr));
+            return false;
+        }
+        ++g_async_fg_gpu_chains;
+    }
     queue->ExecuteCommandLists(1, lists);
     const UINT64 value = ++g_neural_fence_value;
     hr = queue->Signal(g_neural_fence.Get(), value);
@@ -3170,6 +3185,7 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
         slot.neural_fence_value = 0;
         slot.proxy_fence_value = 0;
         slot.async_input_fence_value = 0;
+        slot.fg_phase_dependency_value = 0;
         slot.input_dependency_satisfied = false;
         slot.fg_split_submission = false;
         slot.presentation_slot_index = -1;
@@ -4146,6 +4162,7 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
         slot.neural_fence_value = 0;
         slot.proxy_fence_value = 0;
         slot.async_input_fence_value = 0;
+        slot.fg_phase_dependency_value = 0;
         slot.input_dependency_satisfied = false;
         slot.fg_split_submission = false;
         slot.sequence = 0;
@@ -4929,6 +4946,10 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     PipelineFrameSlot &pipeline_slot = g_pipeline_slots[slot_index];
     if (pipeline_slot.state.load(std::memory_order_acquire) != PipelineSlotRecording) return false;
     pipeline_slot.input_dependency_satisfied = mailbox_d3d11_input;
+    pipeline_slot.fg_phase_dependency_value = completion_driven_dispatch &&
+        mailbox_d3d11_input && SplitFrameGenerationEnabled() &&
+        !g_async_fg_phase_released.load(std::memory_order_acquire) &&
+        !AsyncFgGpuIdle() ? g_async_fg_fence_value : 0;
     if (mailbox_d3d11_input)
         pipeline_slot.async_input_fence_value =
             g_legacy_capture_slots[prepared_capture_slot].capture_fence_value;
@@ -5154,7 +5175,9 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     const bool split_fg_path = evaluate_fg && completion_driven_dispatch &&
         mailbox_d3d11_input && SplitFrameGenerationEnabled() &&
         direct_reservation.index >= 0;
-    bool split_fg = split_fg_path && AsyncFgGpuIdle();
+    const bool fg_phase_chained = pipeline_slot.fg_phase_dependency_value != 0;
+    bool split_fg = split_fg_path && AsyncFgOutstandingJobs() < 2 &&
+        (AsyncFgGpuIdle() || fg_phase_chained);
     if (split_fg_path && !split_fg)
     {
         // A late generated frame has no value after its associated real frame.
@@ -7072,10 +7095,10 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
             g_neural_dispatch_submissions.load(),
             g_neural_dispatch_gap_us.load() / 1000.0f,
             g_neural_dispatch_gap_peak_us.load() / 1000.0f);
-        Log("performance phase-scheduled FG: active=%u submissions=%llu outstanding=%llu phase-waits=%llu completed-in-window=%llu queue-pressure-bypasses=%llu deadline-drops=%llu FG_GPU=%.3fms reconstruction_GPU=%.3fms",
+        Log("performance GPU-chained FG: active=%u submissions=%llu outstanding=%llu GPU-chains=%llu completed-in-window=%llu queue-pressure-bypasses=%llu deadline-drops=%llu FG_GPU=%.3fms reconstruction_GPU=%.3fms",
             SplitFrameGenerationEnabled() ? 1u : 0u,
             g_async_fg_submissions.load(), AsyncFgOutstandingJobs(),
-            g_async_fg_phase_waits.load(),
+            g_async_fg_gpu_chains.load(),
             g_async_fg_completed_in_time.load(), g_async_fg_busy_bypasses.load(),
             g_async_fg_deadline_drops.load(),
             g_gpu_fg_us.load() / 1000.0f, g_gpu_total_us.load() / 1000.0f);
@@ -8424,31 +8447,6 @@ static void ArmNeuralDispatcherForCompletion()
             g_neural_fence_value, static_cast<unsigned int>(hr));
 }
 
-static bool HoldNeuralDispatcherForFgPhase()
-{
-    if (AsyncFgGpuIdle())
-    {
-        g_async_fg_phase_released = true;
-        return false;
-    }
-    if (g_async_fg_phase_released.load(std::memory_order_acquire))
-        return false;
-    if (!g_async_fg_fence || !g_neural_dispatch_wake_event)
-        return false;
-
-    ++g_async_fg_phase_waits;
-    const HRESULT hr = g_async_fg_fence->SetEventOnCompletion(
-        g_async_fg_fence_value, g_neural_dispatch_wake_event);
-    if (FAILED(hr))
-    {
-        Log("phase-scheduled FG wake arm failed: fence=%llu hr=0x%08X; releasing neural work",
-            g_async_fg_fence_value, static_cast<unsigned int>(hr));
-        g_async_fg_phase_released = true;
-        return false;
-    }
-    return true;
-}
-
 static DWORD WINAPI NeuralDispatchThread(void *)
 {
     const HANDLE waits[4] = {g_neural_dispatch_stop_event, g_capture_ready_event,
@@ -8473,13 +8471,6 @@ static DWORD WINAPI NeuralDispatchThread(void *)
         ReclaimPresentationFrameSlots();
         if (!g_capture_mailbox_was_enabled.load(std::memory_order_acquire) ||
             !LegacyCaptureMailboxEnabled())
-            continue;
-
-        // NR/SR and FG use the same GPU execution resources. Let FG finish its
-        // short phase before admitting the next reconstruction, avoiding the
-        // severe cache/compute contention seen with simultaneous NGX queues.
-        // A presenter deadline miss explicitly releases this hold below.
-        if (HoldNeuralDispatcherForFgPhase())
             continue;
 
         // Submit exactly one temporal NGX job at a time. Unlike the old path,
@@ -9726,7 +9717,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     }
     ImGui::TextDisabled("Off skips NR evaluation; DLSS Super Resolution and optional Frame Generation remain active.");
     bool async_compute = g_async_compute_requested;
-    if (ImGui::Checkbox("Asynchronous NGX compute (experimental)", &async_compute))
+    if (ImGui::Checkbox("Asynchronous NGX compute (recommended)", &async_compute))
     {
         g_async_compute_requested = async_compute;
         g_async_compute_restart_required = g_neural_device != nullptr &&
@@ -10071,7 +10062,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("StableSrHistory", "0", value, sizeof(value)); g_stable_sr_history = strcmp(value, "0") != 0;
         read_setting("VortGuides", "0", value, sizeof(value)); g_vort_guides_enabled = strcmp(value, "0") != 0;
         read_setting("NeuralRendering", "1", value, sizeof(value)); g_nr_enabled = strcmp(value, "0") != 0;
-        read_setting("AsyncComputePipeline", "0", value, sizeof(value)); g_async_compute_requested = strcmp(value, "0") != 0;
+        read_setting("AsyncComputePipeline", "1", value, sizeof(value)); g_async_compute_requested = strcmp(value, "0") != 0;
         read_setting("FrameGeneration", "1", value, sizeof(value)); g_framegen_enabled = strcmp(value, "0") != 0;
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
