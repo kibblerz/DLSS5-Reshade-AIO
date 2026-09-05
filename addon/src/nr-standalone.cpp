@@ -468,6 +468,7 @@ struct PipelineFrameSlot
     Microsoft::WRL::ComPtr<ID3D12Resource> real_output;
     Microsoft::WRL::ComPtr<ID3D12Resource> generated_output;
     Microsoft::WRL::ComPtr<ID3D12Resource> original_input;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> legacy_input11;
     std::atomic<unsigned int> state{PipelineSlotFree};
     UINT64 neural_fence_value = 0;
     std::atomic<UINT64> proxy_fence_value{0};
@@ -2173,6 +2174,11 @@ static void ReleaseLegacyFrameResources()
     g_legacy_input9.Reset(); g_legacy_post9.Reset();
     g_legacy_input9_11.Reset(); g_legacy_post9_11.Reset();
     g_legacy_input11.Reset(); g_legacy_post11.Reset(); g_legacy_post12.Reset();
+    for (PipelineFrameSlot &slot : g_pipeline_slots)
+    {
+        slot.legacy_input11.Reset();
+        slot.original_input.Reset();
+    }
     g_legacy_motion11.Reset(); g_legacy_depth11.Reset();
     g_legacy_mask11.Reset(); g_legacy_nr_mask11.Reset();
     g_legacy_source_motion11.Reset(); g_legacy_source_depth11.Reset();
@@ -2586,8 +2592,22 @@ static bool BuildLegacyFrameResources(UINT width, UINT height, DXGI_FORMAT forma
 {
     ReleaseLegacyFrameResources();
     g_packed_color.Reset();
-    if (!CreateSharedPair11(width, height, format, g_packed_color, g_legacy_input11) ||
-        !CreateSharedPair11(width, height, format, g_legacy_post12, g_legacy_post11))
+    if (g_present_api == reshade::api::device_api::d3d11)
+    {
+        for (PipelineFrameSlot &slot : g_pipeline_slots)
+        {
+            if (!CreateSharedPair11(width, height, format,
+                    slot.original_input, slot.legacy_input11))
+                return false;
+        }
+        // Preserve legacy readiness probes; actual frame copies and NGX reads
+        // select the independently owned resource for the acquired slot.
+        g_packed_color = g_pipeline_slots[0].original_input;
+        g_legacy_input11 = g_pipeline_slots[0].legacy_input11;
+    }
+    else if (!CreateSharedPair11(width, height, format, g_packed_color, g_legacy_input11))
+        return false;
+    if (!CreateSharedPair11(width, height, format, g_legacy_post12, g_legacy_post11))
         return false;
     if (g_present_api == reshade::api::device_api::d3d11)
     {
@@ -2642,13 +2662,22 @@ static bool WaitForD3D9Copy()
     return hr == S_OK;
 }
 
-static bool CopyLegacyFrameToD3D12(void *native_resource, bool post_effects)
+static bool CopyLegacyFrameToD3D12(void *native_resource, bool post_effects, int pipeline_slot_index = -1)
 {
     if (!native_resource || !g_legacy_context11 || !g_legacy_context4 || !g_legacy_fence11 ||
         !g_legacy_fence12 || !g_command_queue) return false;
-    ID3D11Texture2D *destination11 = post_effects ? g_legacy_post11.Get() : g_legacy_input11.Get();
+    const bool ringed_d3d11_input = !post_effects &&
+        g_present_api == reshade::api::device_api::d3d11 && pipeline_slot_index >= 0 &&
+        pipeline_slot_index < static_cast<int>(kPipelineFrameSlotCount);
+    ID3D11Texture2D *destination11 = post_effects ? g_legacy_post11.Get() :
+        (ringed_d3d11_input ? g_pipeline_slots[pipeline_slot_index].legacy_input11.Get() :
+            g_legacy_input11.Get());
     if (!destination11) return false;
-    if (g_legacy_d3d12_done_value != 0 &&
+    // A free ring slot has already retired its own D3D12/Present consumers, so
+    // D3D11 can capture the next source immediately. The old single shared
+    // input had to queue this wait every frame, serializing the game's next
+    // render behind NGX and effectively adding both frame times together.
+    if (!ringed_d3d11_input && g_legacy_d3d12_done_value != 0 &&
         FAILED(g_legacy_context4->Wait(g_legacy_fence11.Get(), g_legacy_d3d12_done_value)))
         return false;
     if (g_present_api == reshade::api::device_api::d3d11)
@@ -2822,7 +2851,8 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
     {
         slot.real_output.Reset();
         slot.generated_output.Reset();
-        slot.original_input.Reset();
+        if (g_present_api != reshade::api::device_api::d3d11)
+            slot.original_input.Reset();
         slot.neural_fence_value = 0;
         slot.proxy_fence_value = 0;
         slot.sequence = 0;
@@ -2830,7 +2860,8 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
         slot.state.store(PipelineSlotFree, std::memory_order_release);
         if (!CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, slot.real_output) ||
             !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, slot.generated_output) ||
-            !CreateTexture(iw, ih, input_format, false, D3D12_RESOURCE_STATE_COMMON, slot.original_input))
+            (g_present_api != reshade::api::device_api::d3d11 &&
+                !CreateTexture(iw, ih, input_format, false, D3D12_RESOURCE_STATE_COMMON, slot.original_input)))
             return false;
     }
     // These aliases preserve the existing feature/readiness probes. Per-frame
@@ -2864,11 +2895,11 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
     return true;
 }
 
-static void SetNrEvaluationContract(ID3D12Resource *depth, ID3D12Resource *motion,
-    ID3D12Resource *control_mask, bool reset)
+static void SetNrEvaluationContract(ID3D12Resource *color, ID3D12Resource *depth,
+    ID3D12Resource *motion, ID3D12Resource *control_mask, bool reset)
 {
     const UINT iw = g_resource_input_width, ih = g_resource_input_height;
-    for (const char *name : {"Color", "DLSSNR.Color"}) g_ngx_params->Set(name, g_packed_color.Get());
+    for (const char *name : {"Color", "DLSSNR.Color"}) g_ngx_params->Set(name, color);
     for (const char *name : {"Output", "DLSSNR.Output"}) g_ngx_params->Set(name, g_nr_stage.Get());
     for (const char *name : {"Depth", "DLSSNR.Depth"}) g_ngx_params->Set(name, depth);
     g_ngx_params->Set("MotionVectors", motion); g_ngx_params->Set("DLSSNR.MVec", motion);
@@ -3405,7 +3436,7 @@ static D3D12_RESOURCE_BARRIER Transition(ID3D12Resource *resource,
     return barrier;
 }
 
-static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
+static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pipeline_slot = -1)
 {
     const bool legacy_input = backbuffer == nullptr;
     if ((!legacy_input && !EnsureStandaloneResources(backbuffer)) || (legacy_input && !g_neural_ready)) return false;
@@ -3415,7 +3446,8 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         if (!RecreateFeatures()) return false;
         g_feature_recreate_requested = false;
     }
-    const int pipeline_slot_index = AcquirePipelineFrameSlot();
+    const int pipeline_slot_index = prepared_pipeline_slot >= 0 ?
+        prepared_pipeline_slot : AcquirePipelineFrameSlot();
     if (pipeline_slot_index < 0)
     {
         ++g_neural_gpu_deferrals;
@@ -3427,9 +3459,21 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         return false;
     }
     const UINT slot_index = static_cast<UINT>(pipeline_slot_index);
+    if (slot_index >= kPipelineFrameSlotCount)
+        return false;
     PipelineFrameSlot &pipeline_slot = g_pipeline_slots[slot_index];
+    if (pipeline_slot.state.load(std::memory_order_acquire) != PipelineSlotRecording) return false;
     ID3D12Resource *real_output = pipeline_slot.real_output.Get();
     ID3D12Resource *generated_output = pipeline_slot.generated_output.Get();
+    const bool ringed_d3d11_input = legacy_input &&
+        g_present_api == reshade::api::device_api::d3d11;
+    ID3D12Resource *packed_color = ringed_d3d11_input ?
+        pipeline_slot.original_input.Get() : g_packed_color.Get();
+    if (!packed_color)
+    {
+        pipeline_slot.state.store(PipelineSlotFree, std::memory_order_release);
+        return false;
+    }
     const unsigned long long source_sequence = g_source_frame_sequence.load(std::memory_order_acquire);
     if (g_last_neural_source_sequence != 0 && source_sequence > g_last_neural_source_sequence + 1)
     {
@@ -3471,7 +3515,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     {
         D3D12_RESOURCE_BARRIER copy_begin[2] = {
             Transition(backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
-            Transition(g_packed_color.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)
+            Transition(packed_color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)
         };
         commands->ResourceBarrier(2, copy_begin);
         D3D12_TEXTURE_COPY_LOCATION source = {};
@@ -3479,20 +3523,20 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         source.SubresourceIndex = 0;
         D3D12_TEXTURE_COPY_LOCATION destination = {};
-        destination.pResource = g_packed_color.Get();
+        destination.pResource = packed_color;
         destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         destination.SubresourceIndex = 0;
         const D3D12_BOX source_box = {0, 0, 0, g_resource_input_width, g_resource_input_height, 1};
         commands->CopyTextureRegion(&destination, 0, 0, 0, &source, &source_box);
         D3D12_RESOURCE_BARRIER copy_end[2] = {
             Transition(backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT),
-            Transition(g_packed_color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+            Transition(packed_color, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
         };
         commands->ResourceBarrier(2, copy_end);
     }
     else
     {
-        D3D12_RESOURCE_BARRIER input_to_srv = Transition(g_packed_color.Get(),
+        D3D12_RESOURCE_BARRIER input_to_srv = Transition(packed_color,
             D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         commands->ResourceBarrier(1, &input_to_srv);
     }
@@ -3567,7 +3611,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         g_nr_mask_available ? g_captured_nr_mask.Get() : nullptr;
     if (evaluate_nr)
     {
-        SetNrEvaluationContract(depth, motion, nr_control_mask, reset);
+        SetNrEvaluationContract(packed_color, depth, motion, nr_control_mask, reset);
         nr_result = SafeEvaluate(true, &exception);
         if (exception)
         {
@@ -3578,7 +3622,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     }
     timestamp(2);
     D3D12_RESOURCE_BARRIER nr_to_srv = {};
-    ID3D12Resource *sr_color = g_packed_color.Get();
+    ID3D12Resource *sr_color = packed_color;
     if (evaluate_nr)
     {
         nr_to_srv = Transition(g_nr_stage.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -3642,7 +3686,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
         restore[restore_count++] = Transition(real_output,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
     if (legacy_input)
-        restore[restore_count++] = Transition(g_packed_color.Get(),
+        restore[restore_count++] = Transition(packed_color,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     if (legacy_input && use_external_guides)
     {
@@ -3659,22 +3703,24 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer)
     }
     commands->ResourceBarrier(restore_count, restore);
 
-    // Preserve the exact source frame used by this NGX submission. F10 and
-    // overlay composition can now sample it asynchronously without racing the
-    // next game-frame capture into g_packed_color.
-    const D3D12_RESOURCE_STATES packed_base_state = legacy_input ?
-        D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    D3D12_RESOURCE_BARRIER snapshot_begin[2] = {
-        Transition(g_packed_color.Get(), packed_base_state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-        Transition(pipeline_slot.original_input.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)
-    };
-    commands->ResourceBarrier(2, snapshot_begin);
-    commands->CopyResource(pipeline_slot.original_input.Get(), g_packed_color.Get());
-    D3D12_RESOURCE_BARRIER snapshot_end[2] = {
-        Transition(g_packed_color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, packed_base_state),
-        Transition(pipeline_slot.original_input.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)
-    };
-    commands->ResourceBarrier(2, snapshot_end);
+    if (!ringed_d3d11_input)
+    {
+        // Preserve the exact source frame used by this NGX submission. F10 and
+        // overlay composition can sample it without racing the next capture.
+        const D3D12_RESOURCE_STATES packed_base_state = legacy_input ?
+            D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        D3D12_RESOURCE_BARRIER snapshot_begin[2] = {
+            Transition(packed_color, packed_base_state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            Transition(pipeline_slot.original_input.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)
+        };
+        commands->ResourceBarrier(2, snapshot_begin);
+        commands->CopyResource(pipeline_slot.original_input.Get(), packed_color);
+        D3D12_RESOURCE_BARRIER snapshot_end[2] = {
+            Transition(packed_color, D3D12_RESOURCE_STATE_COPY_SOURCE, packed_base_state),
+            Transition(pipeline_slot.original_input.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)
+        };
+        commands->ResourceBarrier(2, snapshot_end);
+    }
     timestamp(5);
     if (record_gpu_telemetry)
         commands->ResolveQueryData(g_telemetry_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
@@ -6219,6 +6265,7 @@ static void OnReshadePresent(reshade::api::effect_runtime *runtime)
         if (slot_index >= 0 && slot_index < static_cast<int>(kPipelineFrameSlotCount))
             g_pipeline_slots[slot_index].state.store(PipelineSlotAbandoned, std::memory_order_release);
     };
+    if (slot_index < 0 || slot_index >= static_cast<int>(kPipelineFrameSlotCount)) return;
     if (!g_enabled || g_neural_failed || g_proxy_hidden) { abandon_slot(); return; }
     const reshade::api::resource resource = runtime->get_current_back_buffer();
     if (!resource.handle) { abandon_slot(); return; }
@@ -6245,9 +6292,22 @@ static void OnReshadePresent(reshade::api::effect_runtime *runtime)
         }
         PresentProxyAfterReshade(backbuffer, slot_index);
     }
-    else if ((api == reshade::api::device_api::d3d11 || api == reshade::api::device_api::d3d9) &&
-        CopyLegacyFrameToD3D12(reinterpret_cast<void *>(resource.handle), true))
-        PresentProxyAfterReshade(g_legacy_post12.Get(), slot_index);
+    else if (api == reshade::api::device_api::d3d11 || api == reshade::api::device_api::d3d9)
+    {
+        ID3D12Resource *presentation_boundary = g_pipeline_slots[slot_index].original_input.Get();
+        const bool needs_post_effects_copy = g_reshade_overlay_open.load() &&
+            !g_proxy_overlay_preview.load();
+        if (needs_post_effects_copy)
+        {
+            if (!CopyLegacyFrameToD3D12(reinterpret_cast<void *>(resource.handle), true))
+            {
+                abandon_slot();
+                return;
+            }
+            presentation_boundary = g_legacy_post12.Get();
+        }
+        PresentProxyAfterReshade(presentation_boundary, slot_index);
+    }
     else if (api == reshade::api::device_api::vulkan)
         PresentProxyAfterReshade(g_packed_color.Get(), slot_index);
     else
@@ -6667,11 +6727,28 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         const DXGI_FORMAT format = static_cast<DXGI_FORMAT>(desc.texture.format);
         g_input_width = width; g_input_height = height;
         if (!EnsureStandaloneResources(width, height, format)) return;
+        const int prepared_slot = api == reshade::api::device_api::d3d11 ?
+            AcquirePipelineFrameSlot() : -1;
+        if (api == reshade::api::device_api::d3d11 && prepared_slot < 0)
+        {
+            ++g_neural_gpu_deferrals;
+            const unsigned long long skipped = ++g_neural_busy_frame_skips;
+            if (skipped <= 8 || skipped % 600 == 0)
+                Log("D3D11 capture skipped: both shared input slots are occupied (skip=%llu)", skipped);
+            return;
+        }
         if (api == reshade::api::device_api::d3d11)
             RenderLegacyCurrentFrameGuides(backbuffer_resource);
-        if (!CopyLegacyFrameToD3D12(reinterpret_cast<void *>(backbuffer_resource.handle), false) ||
-            !ExecuteOnPresentPipeline(nullptr))
+        if (!CopyLegacyFrameToD3D12(reinterpret_cast<void *>(backbuffer_resource.handle), false,
+                prepared_slot) ||
+            !ExecuteOnPresentPipeline(nullptr, prepared_slot))
         {
+            if (prepared_slot >= 0)
+            {
+                unsigned int expected = PipelineSlotRecording;
+                g_pipeline_slots[prepared_slot].state.compare_exchange_strong(expected, PipelineSlotFree,
+                    std::memory_order_acq_rel, std::memory_order_acquire);
+            }
             if (!g_neural_failed) SetStatus("waiting for a valid %s shared frame",
                 api == reshade::api::device_api::d3d11 ? "D3D11" : "D3D9");
             return;
