@@ -34,7 +34,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.8-nr3x-pre-rest"
+#define ADDON_VERSION "2.0.9-source-override-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -303,6 +303,8 @@ static constexpr ULONGLONG kReducedOrResizeSettleMs = 750;
 static constexpr unsigned int kStableContractFrames = 30;
 static UINT g_candidate_input_width;
 static UINT g_candidate_input_height;
+static UINT g_candidate_capture_width;
+static UINT g_candidate_capture_height;
 static UINT g_candidate_output_width;
 static UINT g_candidate_output_height;
 static DXGI_FORMAT g_candidate_input_format = DXGI_FORMAT_UNKNOWN;
@@ -473,6 +475,40 @@ enum class DlssRenderPreset : int
     L = 12,
     M = 13
 };
+struct SourceResolutionChoice
+{
+    const char *label;
+    UINT width;
+    UINT height;
+};
+static constexpr SourceResolutionChoice kSourceResolutionChoices[] = {
+    {"Disabled (use game backbuffer)", 0, 0},
+    {"16:9 - 960 x 540", 960, 540},
+    {"16:9 - 1280 x 720", 1280, 720},
+    {"16:9 - 1600 x 900", 1600, 900},
+    {"16:9 - 1920 x 1080", 1920, 1080},
+    {"16:9 - 2560 x 1440", 2560, 1440},
+    {"16:9 - 3200 x 1800", 3200, 1800},
+    {"16:10 - 1280 x 800", 1280, 800},
+    {"16:10 - 1440 x 900", 1440, 900},
+    {"16:10 - 1680 x 1050", 1680, 1050},
+    {"16:10 - 1920 x 1200", 1920, 1200},
+    {"16:10 - 2560 x 1600", 2560, 1600},
+    {"21:9 - 1280 x 540", 1280, 540},
+    {"21:9 - 1720 x 720", 1720, 720},
+    {"21:9 - 1920 x 800", 1920, 800},
+    {"21:9 - 2560 x 1080", 2560, 1080},
+    {"21:9 - 3440 x 1440", 3440, 1440},
+    {"32:9 - 1920 x 540", 1920, 540},
+    {"32:9 - 2560 x 720", 2560, 720},
+    {"32:9 - 3840 x 1080", 3840, 1080},
+    {"32:9 - 5120 x 1440", 5120, 1440},
+    {"4:3 - 960 x 720", 960, 720},
+    {"4:3 - 1280 x 960", 1280, 960},
+    {"4:3 - 1440 x 1080", 1440, 1080},
+    {"4:3 - 1600 x 1200", 1600, 1200},
+    {"5:4 - 1280 x 1024", 1280, 1024},
+};
 // Keep the user's requested convention separate from the convention actually
 // fed to NGX and presented by the proxy. Auto is resolved from the primary
 // game swapchain, with a format fallback for older ReShade/DXGI paths.
@@ -528,6 +564,9 @@ static std::atomic<unsigned long long> g_nr_second_frames{0};
 static std::atomic<unsigned long long> g_nr_third_frames{0};
 static std::atomic<unsigned long long> g_sr_frames{0};
 static std::atomic<unsigned long long> g_fg_frames{0};
+static int g_source_resolution_choice;
+static bool g_source_resolution_override_active;
+static bool g_source_resolution_override_rejected;
 
 static reshade::api::effect_runtime *g_runtime;
 static reshade::api::effect_technique g_feed_technique;
@@ -597,7 +636,9 @@ struct PipelineFrameSlot
     Microsoft::WRL::ComPtr<ID3D12Resource> real_output;
     Microsoft::WRL::ComPtr<ID3D12Resource> generated_output;
     Microsoft::WRL::ComPtr<ID3D12Resource> original_input;
+    Microsoft::WRL::ComPtr<ID3D12Resource> capture_input;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> legacy_input11;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> legacy_input_rtv;
     std::atomic<unsigned int> state{PipelineSlotFree};
     UINT64 neural_fence_value = 0;
     std::atomic<UINT64> proxy_fence_value{0};
@@ -626,6 +667,7 @@ struct LegacyCaptureSlot
 {
     Microsoft::WRL::ComPtr<ID3D12Resource> input12;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> input11;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> input_rtv;
     std::atomic<unsigned int> state{LegacyCaptureSlotFree};
     UINT64 capture_fence_value = 0;
     UINT64 neural_fence_value = 0;
@@ -721,6 +763,12 @@ static Microsoft::WRL::ComPtr<ID3D12Resource> g_captured_motion;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_captured_depth;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_captured_mask;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_captured_nr_mask;
+static Microsoft::WRL::ComPtr<ID3D12RootSignature> g_downsample_root_signature;
+static Microsoft::WRL::ComPtr<ID3D12PipelineState> g_downsample_pipeline;
+static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> g_downsample_srv_heap;
+static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> g_downsample_rtv_heap;
+static UINT g_downsample_srv_stride;
+static UINT g_downsample_rtv_stride;
 static reshade::api::device_api g_present_api = static_cast<reshade::api::device_api>(0);
 static Microsoft::WRL::ComPtr<ID3D11Device> g_legacy_device11;
 static Microsoft::WRL::ComPtr<ID3D11DeviceContext> g_legacy_context11;
@@ -741,6 +789,12 @@ static Microsoft::WRL::ComPtr<ID3D11Texture2D> g_legacy_source_motion11;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> g_legacy_source_depth11;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> g_legacy_source_mask11;
 static Microsoft::WRL::ComPtr<ID3D11Texture2D> g_legacy_source_nr_mask11;
+static Microsoft::WRL::ComPtr<ID3D11Texture2D> g_legacy_downsample_source11;
+static Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> g_legacy_downsample_source_srv;
+static Microsoft::WRL::ComPtr<ID3D11VertexShader> g_legacy_downsample_vs;
+static Microsoft::WRL::ComPtr<ID3D11PixelShader> g_legacy_downsample_ps;
+static Microsoft::WRL::ComPtr<ID3D11SamplerState> g_legacy_downsample_sampler;
+static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> g_legacy_post_rtv;
 static bool g_legacy_guides_ready;
 static Microsoft::WRL::ComPtr<IDirect3DDevice9> g_legacy_device9;
 static Microsoft::WRL::ComPtr<IDirect3DTexture9> g_legacy_input9;
@@ -772,6 +826,8 @@ static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> g_guide_rtv_heap;
 static UINT g_guide_rtv_stride;
 static UINT g_resource_input_width;
 static UINT g_resource_input_height;
+static UINT g_resource_capture_width;
+static UINT g_resource_capture_height;
 static UINT g_resource_output_width;
 static UINT g_resource_output_height;
 static DXGI_FORMAT g_resource_input_format = DXGI_FORMAT_UNKNOWN;
@@ -813,6 +869,63 @@ static bool IsNearNativeWindowedSurface(UINT input_width, UINT input_height,
 static const char *SrModeName()
 {
     return IsDlaaMode() ? "DLAA" : "DLSS SR";
+}
+
+static const SourceResolutionChoice &RequestedSourceResolution()
+{
+    const int index = std::clamp(g_source_resolution_choice, 0,
+        static_cast<int>(std::size(kSourceResolutionChoices)) - 1);
+    return kSourceResolutionChoices[index];
+}
+
+static bool AspectRatiosMatch(UINT first_width, UINT first_height,
+    UINT second_width, UINT second_height)
+{
+    if (first_width == 0 || first_height == 0 || second_width == 0 || second_height == 0)
+        return false;
+    const UINT64 first = static_cast<UINT64>(first_width) * second_height;
+    const UINT64 second = static_cast<UINT64>(second_width) * first_height;
+    const UINT64 delta = first > second ? first - second : second - first;
+    return delta * 100 <= std::max(first, second) * 2;
+}
+
+static void ResolvePipelineSourceResolution(UINT capture_width, UINT capture_height,
+    UINT &work_width, UINT &work_height)
+{
+    work_width = capture_width;
+    work_height = capture_height;
+    g_source_resolution_override_active = false;
+    g_source_resolution_override_rejected = false;
+    const SourceResolutionChoice &choice = RequestedSourceResolution();
+    if (choice.width == 0 || choice.height == 0)
+        return;
+
+    const UINT display_width = g_output_width.load();
+    const UINT display_height = g_output_height.load();
+    const bool fits_capture = choice.width <= capture_width && choice.height <= capture_height;
+    const bool capture_aspect_matches = AspectRatiosMatch(
+        choice.width, choice.height, capture_width, capture_height);
+    const bool display_aspect_matches = display_width == 0 || display_height == 0 ||
+        AspectRatiosMatch(choice.width, choice.height, display_width, display_height);
+    if (!fits_capture || !capture_aspect_matches || !display_aspect_matches)
+    {
+        g_source_resolution_override_rejected = true;
+        return;
+    }
+
+    if (choice.width == capture_width && choice.height == capture_height)
+        return;
+    work_width = choice.width;
+    work_height = choice.height;
+    g_source_resolution_override_active = true;
+}
+
+static bool SourceResolutionOverrideActive()
+{
+    return g_source_resolution_override_active &&
+        g_resource_capture_width != 0 && g_resource_capture_height != 0 &&
+        (g_resource_capture_width != g_resource_input_width ||
+         g_resource_capture_height != g_resource_input_height);
 }
 
 static constexpr NVSDK_NGX_Feature kFeatureDlssNr = static_cast<NVSDK_NGX_Feature>(0x12);
@@ -3130,7 +3243,8 @@ static DXGI_FORMAT TypedInputFormat(DXGI_FORMAT format)
 }
 
 static bool CreateTexture(UINT width, UINT height, DXGI_FORMAT format, bool uav,
-    D3D12_RESOURCE_STATES initial_state, Microsoft::WRL::ComPtr<ID3D12Resource> &resource)
+    D3D12_RESOURCE_STATES initial_state, Microsoft::WRL::ComPtr<ID3D12Resource> &resource,
+    D3D12_RESOURCE_FLAGS additional_flags = D3D12_RESOURCE_FLAG_NONE)
 {
     D3D12_HEAP_PROPERTIES heap = {};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -3138,7 +3252,8 @@ static bool CreateTexture(UINT width, UINT height, DXGI_FORMAT format, bool uav,
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = width; desc.Height = height; desc.DepthOrArraySize = 1; desc.MipLevels = 1;
     desc.Format = format; desc.SampleDesc.Count = 1; desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    desc.Flags = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+    desc.Flags = additional_flags |
+        (uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE);
     const HRESULT hr = g_neural_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
         initial_state, nullptr, IID_PPV_ARGS(&resource));
     if (FAILED(hr)) { Fail("neural texture allocation", static_cast<unsigned int>(hr)); return false; }
@@ -3187,6 +3302,120 @@ static bool EnsureSecondNrStage()
     }
     Log("second NR pass texture ready: %ux%u format=%u",
         g_resource_input_width, g_resource_input_height, static_cast<unsigned int>(format));
+    return true;
+}
+
+static bool InitializeD3D12SourceDownsample(DXGI_FORMAT format)
+{
+    if (!SourceResolutionOverrideActive() ||
+        g_present_api != reshade::api::device_api::d3d12)
+        return true;
+    if (!g_neural_device) return false;
+
+    HRESULT hr = S_OK;
+    D3D12_DESCRIPTOR_HEAP_DESC heap = {};
+    heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heap.NumDescriptors = kPipelineFrameSlotCount;
+    heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    hr = g_neural_device->CreateDescriptorHeap(&heap,
+        IID_PPV_ARGS(&g_downsample_srv_heap));
+    heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    if (SUCCEEDED(hr))
+        hr = g_neural_device->CreateDescriptorHeap(&heap,
+            IID_PPV_ARGS(&g_downsample_rtv_heap));
+
+    D3D12_DESCRIPTOR_RANGE range = {};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    range.NumDescriptors = 1;
+    D3D12_ROOT_PARAMETER parameter = {};
+    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameter.DescriptorTable.NumDescriptorRanges = 1;
+    parameter.DescriptorTable.pDescriptorRanges = &range;
+    parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC sampler = {};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW =
+        D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.ShaderRegister = 0;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    D3D12_ROOT_SIGNATURE_DESC root = {};
+    root.NumParameters = 1;
+    root.pParameters = &parameter;
+    root.NumStaticSamplers = 1;
+    root.pStaticSamplers = &sampler;
+    root.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    Microsoft::WRL::ComPtr<ID3DBlob> signature, error, vs, ps;
+    if (SUCCEEDED(hr))
+        hr = D3D12SerializeRootSignature(&root, D3D_ROOT_SIGNATURE_VERSION_1,
+            &signature, &error);
+    if (SUCCEEDED(hr))
+        hr = g_neural_device->CreateRootSignature(0, signature->GetBufferPointer(),
+            signature->GetBufferSize(), IID_PPV_ARGS(&g_downsample_root_signature));
+    static const char shader[] =
+        "Texture2D<float4> Source:register(t0); SamplerState Linear:register(s0);"
+        "struct O{float4 p:SV_Position;float2 uv:TEXCOORD0;};"
+        "O VS(uint id:SV_VertexID){O o;float2 p=float2((id<<1)&2,id&2);"
+        "o.uv=p;o.p=float4(p*float2(2,-2)+float2(-1,1),0,1);return o;}"
+        "float4 PS(O i):SV_Target{return Source.SampleLevel(Linear,i.uv,0);}";
+    if (SUCCEEDED(hr))
+        hr = D3DCompile(shader, sizeof(shader) - 1, "source-downsample", nullptr,
+            nullptr, "VS", "vs_5_0", 0, 0, &vs, &error);
+    if (SUCCEEDED(hr))
+        hr = D3DCompile(shader, sizeof(shader) - 1, "source-downsample", nullptr,
+            nullptr, "PS", "ps_5_0", 0, 0, &ps, &error);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
+    pso.pRootSignature = g_downsample_root_signature.Get();
+    if (vs) pso.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+    if (ps) pso.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+    pso.BlendState.RenderTarget[0].RenderTargetWriteMask =
+        D3D12_COLOR_WRITE_ENABLE_ALL;
+    pso.SampleMask = UINT_MAX;
+    pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pso.DepthStencilState.DepthEnable = FALSE;
+    pso.DepthStencilState.StencilEnable = FALSE;
+    pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pso.NumRenderTargets = 1;
+    pso.RTVFormats[0] = format;
+    pso.SampleDesc.Count = 1;
+    if (SUCCEEDED(hr))
+        hr = g_neural_device->CreateGraphicsPipelineState(&pso,
+            IID_PPV_ARGS(&g_downsample_pipeline));
+    if (FAILED(hr))
+    {
+        Log("source-resolution D3D12 downsample initialization failed: 0x%08X",
+            static_cast<unsigned int>(hr));
+        return false;
+    }
+
+    g_downsample_srv_stride = g_neural_device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    g_downsample_rtv_stride = g_neural_device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    D3D12_CPU_DESCRIPTOR_HANDLE srv =
+        g_downsample_srv_heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv =
+        g_downsample_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+    srv_desc.Format = format;
+    srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv_desc.Texture2D.MipLevels = 1;
+    for (PipelineFrameSlot &slot : g_pipeline_slots)
+    {
+        if (!slot.capture_input || !slot.original_input) return false;
+        g_neural_device->CreateShaderResourceView(slot.capture_input.Get(),
+            &srv_desc, srv);
+        g_neural_device->CreateRenderTargetView(slot.original_input.Get(), nullptr, rtv);
+        srv.ptr += g_downsample_srv_stride;
+        rtv.ptr += g_downsample_rtv_stride;
+    }
+    Log("D3D12 source downsample ready: capture=%ux%u work=%ux%u format=%u slots=%u",
+        g_resource_capture_width, g_resource_capture_height,
+        g_resource_input_width, g_resource_input_height,
+        static_cast<unsigned int>(format), kPipelineFrameSlotCount);
     return true;
 }
 
@@ -3364,7 +3593,8 @@ static void ClearPublishedOutput()
 
 static bool RetireResolutionDependentResources(UINT next_width, UINT next_height, DXGI_FORMAT next_format)
 {
-    Log("resolution reconfiguration begin: %ux%u fmt=%u -> %ux%u fmt=%u",
+    Log("resolution reconfiguration begin: capture=%ux%u work=%ux%u fmt=%u -> capture=%ux%u fmt=%u",
+        g_resource_capture_width, g_resource_capture_height,
         g_resource_input_width, g_resource_input_height, static_cast<unsigned int>(g_resource_input_format),
         next_width, next_height, static_cast<unsigned int>(next_format));
 
@@ -3518,6 +3748,8 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
         slot.generated_output.Reset();
         slot.real_output.Reset();
         slot.original_input.Reset();
+        slot.capture_input.Reset();
+        slot.legacy_input_rtv.Reset();
         slot.state.store(PipelineSlotFree, std::memory_order_release);
         slot.neural_fence_value = 0;
         slot.proxy_fence_value = 0;
@@ -3548,6 +3780,10 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
     g_pending_pipeline_slot = -1;
     g_post_reshade_color.Reset(); g_post_reshade_color_ready = false;
     g_packed_color.Reset();
+    g_downsample_pipeline.Reset(); g_downsample_root_signature.Reset();
+    g_downsample_srv_heap.Reset(); g_downsample_rtv_heap.Reset();
+    g_downsample_srv_stride = g_downsample_rtv_stride = 0;
+    g_resource_capture_width = g_resource_capture_height = 0;
 
     if (g_runtime)
     {
@@ -3577,6 +3813,7 @@ static void ReleaseLegacyFrameResources()
     g_legacy_input11.Reset(); g_legacy_post11.Reset(); g_legacy_post12.Reset();
     for (LegacyCaptureSlot &slot : g_legacy_capture_slots)
     {
+        slot.input_rtv.Reset();
         slot.input11.Reset();
         slot.input12.Reset();
         slot.capture_fence_value = 0;
@@ -3591,9 +3828,16 @@ static void ReleaseLegacyFrameResources()
     g_capture_mailbox_min_sequence = 0;
     for (PipelineFrameSlot &slot : g_pipeline_slots)
     {
+        slot.legacy_input_rtv.Reset();
         slot.legacy_input11.Reset();
         slot.original_input.Reset();
     }
+    g_legacy_post_rtv.Reset();
+    g_legacy_downsample_source_srv.Reset();
+    g_legacy_downsample_source11.Reset();
+    g_legacy_downsample_sampler.Reset();
+    g_legacy_downsample_ps.Reset();
+    g_legacy_downsample_vs.Reset();
     g_legacy_motion11.Reset(); g_legacy_depth11.Reset();
     g_legacy_mask11.Reset(); g_legacy_nr_mask11.Reset();
     g_legacy_source_motion11.Reset(); g_legacy_source_depth11.Reset();
@@ -3778,9 +4022,23 @@ static bool RecordVulkanFrameCopy(reshade::api::command_queue *queue,
     const reshade::api::resource resources[1] = {source};
     const reshade::api::resource_usage copy_source[1] = {reshade::api::resource_usage::copy_source};
     list->barrier(1, resources, &source_usage, copy_source);
-    FeedVkCopyImage(&g_vulkan, command_buffer, source_image,
-        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination, VK_IMAGE_LAYOUT_GENERAL,
-        g_legacy_width, g_legacy_height);
+    if (SourceResolutionOverrideActive())
+    {
+        VkImageBlit blit = {};
+        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.srcOffsets[1] = {static_cast<int32_t>(g_resource_capture_width),
+            static_cast<int32_t>(g_resource_capture_height), 1};
+        blit.dstOffsets[1] = {static_cast<int32_t>(g_legacy_width),
+            static_cast<int32_t>(g_legacy_height), 1};
+        g_vulkan.CmdBlitImage(command_buffer, source_image,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination, VK_IMAGE_LAYOUT_GENERAL,
+            1, &blit, VK_FILTER_LINEAR);
+    }
+    else
+        FeedVkCopyImage(&g_vulkan, command_buffer, source_image,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destination, VK_IMAGE_LAYOUT_GENERAL,
+            g_legacy_width, g_legacy_height);
     list->barrier(1, resources, copy_source, &source_usage);
 
     if (post_effects) g_vulkan_post_copy_recorded = true;
@@ -3803,7 +4061,8 @@ static bool CompleteVulkanFrameCopies(reshade::api::command_queue *queue)
 
 static bool CreateSharedPair11(UINT width, UINT height, DXGI_FORMAT format,
     Microsoft::WRL::ComPtr<ID3D12Resource> &resource12,
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> &resource11)
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> &resource11,
+    bool render_target = false)
 {
     if (!g_neural_device || !g_legacy_device11) return false;
     D3D12_HEAP_PROPERTIES heap = {};
@@ -3812,7 +4071,8 @@ static bool CreateSharedPair11(UINT width, UINT height, DXGI_FORMAT format,
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = width; desc.Height = height; desc.DepthOrArraySize = 1; desc.MipLevels = 1;
     desc.Format = format; desc.SampleDesc.Count = 1; desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
+        (render_target ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : D3D12_RESOURCE_FLAG_NONE);
     HRESULT hr = g_neural_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc,
         D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&resource12));
     HANDLE shared = nullptr;
@@ -4039,6 +4299,165 @@ static bool CreateD3D9SharedStage(UINT width, UINT height, DXGI_FORMAT format,
     return true;
 }
 
+static bool InitializeLegacySourceDownsample(UINT capture_width, UINT capture_height,
+    DXGI_FORMAT format)
+{
+    if (!SourceResolutionOverrideActive() ||
+        g_present_api != reshade::api::device_api::d3d11)
+        return true;
+    if (!g_legacy_device11) return false;
+
+    D3D11_TEXTURE2D_DESC stage = {};
+    stage.Width = capture_width;
+    stage.Height = capture_height;
+    stage.MipLevels = 1;
+    stage.ArraySize = 1;
+    stage.Format = format;
+    stage.SampleDesc.Count = 1;
+    stage.Usage = D3D11_USAGE_DEFAULT;
+    stage.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    HRESULT hr = g_legacy_device11->CreateTexture2D(&stage, nullptr,
+        &g_legacy_downsample_source11);
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv = {};
+    srv.Format = format;
+    srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srv.Texture2D.MipLevels = 1;
+    if (SUCCEEDED(hr))
+        hr = g_legacy_device11->CreateShaderResourceView(
+            g_legacy_downsample_source11.Get(), &srv,
+            &g_legacy_downsample_source_srv);
+
+    static const char shader[] =
+        "Texture2D<float4> Source:register(t0); SamplerState Linear:register(s0);"
+        "struct O{float4 p:SV_Position;float2 uv:TEXCOORD0;};"
+        "O VS(uint id:SV_VertexID){O o;float2 p=float2((id<<1)&2,id&2);"
+        "o.uv=p;o.p=float4(p*float2(2,-2)+float2(-1,1),0,1);return o;}"
+        "float4 PS(O i):SV_Target{return Source.SampleLevel(Linear,i.uv,0);}";
+    Microsoft::WRL::ComPtr<ID3DBlob> vs, ps, error;
+    if (SUCCEEDED(hr))
+        hr = D3DCompile(shader, sizeof(shader) - 1, "legacy-source-downsample",
+            nullptr, nullptr, "VS", "vs_5_0", 0, 0, &vs, &error);
+    if (SUCCEEDED(hr))
+        hr = D3DCompile(shader, sizeof(shader) - 1, "legacy-source-downsample",
+            nullptr, nullptr, "PS", "ps_5_0", 0, 0, &ps, &error);
+    if (SUCCEEDED(hr))
+        hr = g_legacy_device11->CreateVertexShader(vs->GetBufferPointer(),
+            vs->GetBufferSize(), nullptr, &g_legacy_downsample_vs);
+    if (SUCCEEDED(hr))
+        hr = g_legacy_device11->CreatePixelShader(ps->GetBufferPointer(),
+            ps->GetBufferSize(), nullptr, &g_legacy_downsample_ps);
+    D3D11_SAMPLER_DESC sampler = {};
+    sampler.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW =
+        D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler.MaxLOD = D3D11_FLOAT32_MAX;
+    if (SUCCEEDED(hr))
+        hr = g_legacy_device11->CreateSamplerState(&sampler,
+            &g_legacy_downsample_sampler);
+    if (FAILED(hr))
+    {
+        Log("D3D11 source downsample initialization failed: 0x%08X",
+            static_cast<unsigned int>(hr));
+        return false;
+    }
+    Log("D3D11 source downsample ready: capture=%ux%u work=%ux%u format=%u",
+        capture_width, capture_height, g_resource_input_width,
+        g_resource_input_height, static_cast<unsigned int>(format));
+    return true;
+}
+
+static bool CreateLegacyDownsampleRtv(ID3D11Texture2D *texture,
+    DXGI_FORMAT format, Microsoft::WRL::ComPtr<ID3D11RenderTargetView> &rtv)
+{
+    if (!texture || !g_legacy_device11) return false;
+    D3D11_RENDER_TARGET_VIEW_DESC desc = {};
+    desc.Format = format;
+    desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    return SUCCEEDED(g_legacy_device11->CreateRenderTargetView(texture, &desc, &rtv));
+}
+
+static bool DownsampleLegacyFrame(ID3D11Texture2D *source,
+    ID3D11RenderTargetView *destination)
+{
+    if (!source || !destination || !g_legacy_context11 ||
+        !g_legacy_downsample_source11 || !g_legacy_downsample_source_srv ||
+        !g_legacy_downsample_vs || !g_legacy_downsample_ps ||
+        !g_legacy_downsample_sampler)
+        return false;
+    g_legacy_context11->CopyResource(g_legacy_downsample_source11.Get(), source);
+
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> old_rtv;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> old_dsv;
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> old_vs;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> old_ps;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> old_srv;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> old_sampler;
+    Microsoft::WRL::ComPtr<ID3D11InputLayout> old_layout;
+    Microsoft::WRL::ComPtr<ID3D11BlendState> old_blend;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> old_depth_state;
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> old_rasterizer;
+    FLOAT old_blend_factor[4] = {};
+    UINT old_sample_mask = 0;
+    UINT old_stencil_reference = 0;
+    D3D11_PRIMITIVE_TOPOLOGY old_topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    UINT viewport_count = 1;
+    D3D11_VIEWPORT old_viewport = {};
+    g_legacy_context11->OMGetRenderTargets(1, &old_rtv, &old_dsv);
+    g_legacy_context11->VSGetShader(&old_vs, nullptr, nullptr);
+    g_legacy_context11->PSGetShader(&old_ps, nullptr, nullptr);
+    g_legacy_context11->PSGetShaderResources(0, 1, &old_srv);
+    g_legacy_context11->PSGetSamplers(0, 1, &old_sampler);
+    g_legacy_context11->IAGetInputLayout(&old_layout);
+    g_legacy_context11->IAGetPrimitiveTopology(&old_topology);
+    g_legacy_context11->OMGetBlendState(&old_blend, old_blend_factor,
+        &old_sample_mask);
+    g_legacy_context11->OMGetDepthStencilState(&old_depth_state,
+        &old_stencil_reference);
+    g_legacy_context11->RSGetState(&old_rasterizer);
+    g_legacy_context11->RSGetViewports(&viewport_count, &old_viewport);
+
+    D3D11_VIEWPORT viewport = {};
+    viewport.Width = static_cast<float>(g_resource_input_width);
+    viewport.Height = static_cast<float>(g_resource_input_height);
+    viewport.MaxDepth = 1.0f;
+    ID3D11RenderTargetView *rtv = destination;
+    ID3D11ShaderResourceView *srv = g_legacy_downsample_source_srv.Get();
+    ID3D11SamplerState *sampler = g_legacy_downsample_sampler.Get();
+    g_legacy_context11->RSSetViewports(1, &viewport);
+    g_legacy_context11->OMSetRenderTargets(1, &rtv, nullptr);
+    g_legacy_context11->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    g_legacy_context11->OMSetDepthStencilState(nullptr, 0);
+    g_legacy_context11->RSSetState(nullptr);
+    g_legacy_context11->IASetInputLayout(nullptr);
+    g_legacy_context11->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_legacy_context11->VSSetShader(g_legacy_downsample_vs.Get(), nullptr, 0);
+    g_legacy_context11->PSSetShader(g_legacy_downsample_ps.Get(), nullptr, 0);
+    g_legacy_context11->PSSetShaderResources(0, 1, &srv);
+    g_legacy_context11->PSSetSamplers(0, 1, &sampler);
+    g_legacy_context11->Draw(3, 0);
+
+    ID3D11ShaderResourceView *null_srv = nullptr;
+    g_legacy_context11->PSSetShaderResources(0, 1, &null_srv);
+    ID3D11RenderTargetView *old_rtv_raw = old_rtv.Get();
+    g_legacy_context11->OMSetRenderTargets(1, &old_rtv_raw, old_dsv.Get());
+    g_legacy_context11->VSSetShader(old_vs.Get(), nullptr, 0);
+    g_legacy_context11->PSSetShader(old_ps.Get(), nullptr, 0);
+    ID3D11ShaderResourceView *old_srv_raw = old_srv.Get();
+    ID3D11SamplerState *old_sampler_raw = old_sampler.Get();
+    g_legacy_context11->PSSetShaderResources(0, 1, &old_srv_raw);
+    g_legacy_context11->PSSetSamplers(0, 1, &old_sampler_raw);
+    g_legacy_context11->IASetInputLayout(old_layout.Get());
+    g_legacy_context11->IASetPrimitiveTopology(old_topology);
+    g_legacy_context11->OMSetBlendState(old_blend.Get(), old_blend_factor,
+        old_sample_mask);
+    g_legacy_context11->OMSetDepthStencilState(old_depth_state.Get(),
+        old_stencil_reference);
+    g_legacy_context11->RSSetState(old_rasterizer.Get());
+    if (viewport_count != 0)
+        g_legacy_context11->RSSetViewports(1, &old_viewport);
+    return true;
+}
+
 static bool BuildLegacyFrameResources(UINT width, UINT height, DXGI_FORMAT format)
 {
     ReleaseLegacyFrameResources();
@@ -4048,12 +4467,22 @@ static bool BuildLegacyFrameResources(UINT width, UINT height, DXGI_FORMAT forma
         for (PipelineFrameSlot &slot : g_pipeline_slots)
         {
             if (!CreateSharedPair11(width, height, format,
-                    slot.original_input, slot.legacy_input11))
+                    slot.original_input, slot.legacy_input11,
+                    SourceResolutionOverrideActive()))
+                return false;
+            if (SourceResolutionOverrideActive() &&
+                !CreateLegacyDownsampleRtv(slot.legacy_input11.Get(), format,
+                    slot.legacy_input_rtv))
                 return false;
         }
         for (LegacyCaptureSlot &slot : g_legacy_capture_slots)
         {
-            if (!CreateSharedPair11(width, height, format, slot.input12, slot.input11))
+            if (!CreateSharedPair11(width, height, format, slot.input12, slot.input11,
+                    SourceResolutionOverrideActive()))
+                return false;
+            if (SourceResolutionOverrideActive() &&
+                !CreateLegacyDownsampleRtv(slot.input11.Get(), format,
+                    slot.input_rtv))
                 return false;
             slot.capture_fence_value = 0;
             slot.neural_fence_value = 0;
@@ -4070,7 +4499,15 @@ static bool BuildLegacyFrameResources(UINT width, UINT height, DXGI_FORMAT forma
     }
     else if (!CreateSharedPair11(width, height, format, g_packed_color, g_legacy_input11))
         return false;
-    if (!CreateSharedPair11(width, height, format, g_legacy_post12, g_legacy_post11))
+    if (!CreateSharedPair11(width, height, format, g_legacy_post12, g_legacy_post11,
+            SourceResolutionOverrideActive()))
+        return false;
+    if (g_present_api == reshade::api::device_api::d3d11 &&
+        SourceResolutionOverrideActive() &&
+        !CreateLegacyDownsampleRtv(g_legacy_post11.Get(), format, g_legacy_post_rtv))
+        return false;
+    if (!InitializeLegacySourceDownsample(g_resource_capture_width,
+            g_resource_capture_height, format))
         return false;
     if (g_present_api == reshade::api::device_api::d3d11)
     {
@@ -4147,7 +4584,15 @@ static bool CopyLegacyFrameToD3D12(void *native_resource, bool post_effects, int
     {
         Microsoft::WRL::ComPtr<ID3D11Texture2D> source11;
         if (FAILED(reinterpret_cast<IUnknown *>(native_resource)->QueryInterface(IID_PPV_ARGS(&source11)))) return false;
-        g_legacy_context11->CopyResource(destination11, source11.Get());
+        if (SourceResolutionOverrideActive())
+        {
+            ID3D11RenderTargetView *rtv = post_effects ? g_legacy_post_rtv.Get() :
+                (ringed_d3d11_input ?
+                    g_pipeline_slots[pipeline_slot_index].legacy_input_rtv.Get() : nullptr);
+            if (!DownsampleLegacyFrame(source11.Get(), rtv)) return false;
+        }
+        else
+            g_legacy_context11->CopyResource(destination11, source11.Get());
     }
     else if (g_present_api == reshade::api::device_api::d3d9)
     {
@@ -4216,7 +4661,15 @@ static bool CaptureLegacyFrameToMailbox(void *native_resource)
     HRESULT hr = reinterpret_cast<IUnknown *>(native_resource)->QueryInterface(
         IID_PPV_ARGS(&source11));
     if (SUCCEEDED(hr) && slot.input11)
-        g_legacy_context11->CopyResource(slot.input11.Get(), source11.Get());
+    {
+        if (SourceResolutionOverrideActive())
+        {
+            if (!DownsampleLegacyFrame(source11.Get(), slot.input_rtv.Get()))
+                hr = E_FAIL;
+        }
+        else
+            g_legacy_context11->CopyResource(slot.input11.Get(), source11.Get());
+    }
     else if (SUCCEEDED(hr))
         hr = E_POINTER;
     const UINT64 value = ++g_capture_ready_fence_value;
@@ -4255,15 +4708,19 @@ static bool CaptureLegacyFrameToMailbox(void *native_resource)
 static void ResetContractCandidate()
 {
     g_candidate_input_width = g_candidate_input_height = 0;
+    g_candidate_capture_width = g_candidate_capture_height = 0;
     g_candidate_output_width = g_candidate_output_height = 0;
     g_candidate_input_format = DXGI_FORMAT_UNKNOWN;
     g_candidate_contract_since = 0;
     g_candidate_contract_frames = 0;
 }
 
-static bool ResourceContractIsStable(UINT iw, UINT ih, UINT ow, UINT oh, DXGI_FORMAT format)
+static bool ResourceContractIsStable(UINT capture_width, UINT capture_height,
+    UINT iw, UINT ih, UINT ow, UINT oh, DXGI_FORMAT format)
 {
-    if (g_neural_ready && iw == g_resource_input_width && ih == g_resource_input_height &&
+    if (g_neural_ready && capture_width == g_resource_capture_width &&
+        capture_height == g_resource_capture_height &&
+        iw == g_resource_input_width && ih == g_resource_input_height &&
         ow == g_resource_output_width && oh == g_resource_output_height && format == g_resource_input_format)
     {
         ResetContractCandidate();
@@ -4277,10 +4734,12 @@ static bool ResourceContractIsStable(UINT iw, UINT ih, UINT ow, UINT oh, DXGI_FO
     }
 
     const ULONGLONG now = GetTickCount64();
-    if (iw != g_candidate_input_width || ih != g_candidate_input_height ||
+    if (capture_width != g_candidate_capture_width || capture_height != g_candidate_capture_height ||
+        iw != g_candidate_input_width || ih != g_candidate_input_height ||
         ow != g_candidate_output_width || oh != g_candidate_output_height ||
         format != g_candidate_input_format)
     {
+        g_candidate_capture_width = capture_width; g_candidate_capture_height = capture_height;
         g_candidate_input_width = iw; g_candidate_input_height = ih;
         g_candidate_output_width = ow; g_candidate_output_height = oh;
         g_candidate_input_format = format;
@@ -4304,8 +4763,8 @@ static bool ResourceContractIsStable(UINT iw, UINT ih, UINT ow, UINT oh, DXGI_FO
                 RequestProxyVisibility(false);
             }
         }
-        Log("presentation contract candidate: %ux%u -> %ux%u fmt=%u; waiting for stability",
-            iw, ih, ow, oh, static_cast<unsigned int>(format));
+        Log("presentation contract candidate: capture=%ux%u work=%ux%u output=%ux%u fmt=%u; waiting for stability",
+            capture_width, capture_height, iw, ih, ow, oh, static_cast<unsigned int>(format));
     }
     else if (g_candidate_contract_frames != ~0u)
     {
@@ -4324,21 +4783,26 @@ static bool ResourceContractIsStable(UINT iw, UINT ih, UINT ow, UINT oh, DXGI_FO
     return true;
 }
 
-static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format)
+static bool EnsureStandaloneResources(UINT capture_width, UINT capture_height, DXGI_FORMAT input_format)
 {
     if (g_neural_failed || !g_command_queue) return false;
     const UINT display_width = g_output_width.load(), display_height = g_output_height.load();
     const bool near_native_window = IsNearNativeWindowedSurface(
-        iw, ih, display_width, display_height);
-    const UINT ow = near_native_window ? iw : display_width;
-    const UINT oh = near_native_window ? ih : display_height;
+        capture_width, capture_height, display_width, display_height);
+    const UINT ow = near_native_window ? capture_width : display_width;
+    const UINT oh = near_native_window ? capture_height : display_height;
+    UINT iw = capture_width, ih = capture_height;
+    ResolvePipelineSourceResolution(capture_width, capture_height, iw, ih);
     input_format = TypedInputFormat(input_format);
     if (iw == 0 || ih == 0 || ow == 0 || oh == 0) return false;
-    if (!ResourceContractIsStable(iw, ih, ow, oh, input_format)) return false;
-    if (g_neural_ready && (iw != g_resource_input_width || ih != g_resource_input_height ||
+    if (!ResourceContractIsStable(capture_width, capture_height,
+            iw, ih, ow, oh, input_format)) return false;
+    if (g_neural_ready && (capture_width != g_resource_capture_width ||
+        capture_height != g_resource_capture_height ||
+        iw != g_resource_input_width || ih != g_resource_input_height ||
         ow != g_resource_output_width || oh != g_resource_output_height || input_format != g_resource_input_format))
     {
-        if (!RetireResolutionDependentResources(iw, ih, input_format)) return false;
+        if (!RetireResolutionDependentResources(capture_width, capture_height, input_format)) return false;
     }
     if (iw > ow || ih > oh)
     {
@@ -4348,9 +4812,9 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
     }
     if (g_neural_ready) return true;
 
-    if (near_native_window && (iw != display_width || ih != display_height))
+    if (near_native_window && (capture_width != display_width || capture_height != display_height))
         Log("near-native window surface normalized to DLAA: game=%ux%u monitor=%ux%u; compositor handles final border/DPI stretch",
-            iw, ih, display_width, display_height);
+            capture_width, capture_height, display_width, display_height);
 
     if (!g_neural_device)
     {
@@ -4472,6 +4936,7 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
         InitializeGpuTelemetry();
     }
 
+    g_resource_capture_width = capture_width; g_resource_capture_height = capture_height;
     g_resource_input_width = iw; g_resource_input_height = ih;
     g_resource_output_width = ow; g_resource_output_height = oh;
     g_resource_input_format = input_format;
@@ -4483,9 +4948,10 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
     const bool input_ready = g_present_api == reshade::api::device_api::vulkan ?
         BuildVulkanFrameResources(iw, ih, input_format) :
         (legacy ? BuildLegacyFrameResources(iw, ih, input_format) :
-            CreateTexture(iw, ih, input_format, false,
-                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g_packed_color));
-    const bool post_input_ready = legacy || CreateTexture(iw, ih, input_format, false,
+            (SourceResolutionOverrideActive() || CreateTexture(iw, ih, input_format, false,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, g_packed_color)));
+    const bool post_input_ready = legacy || CreateTexture(capture_width, capture_height,
+        input_format, false,
         D3D12_RESOURCE_STATE_COPY_DEST, g_post_reshade_color);
     if (!input_ready || !post_input_ready ||
         !CreateTexture(iw, ih, result_format, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, g_nr_stage)) return false;
@@ -4493,6 +4959,7 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
     {
         slot.real_output.Reset();
         slot.generated_output.Reset();
+        slot.capture_input.Reset();
         if (g_present_api != reshade::api::device_api::d3d11)
             slot.original_input.Reset();
         slot.neural_fence_value = 0;
@@ -4507,7 +4974,16 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
         if (!CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, slot.real_output) ||
             !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, slot.generated_output) ||
             (g_present_api != reshade::api::device_api::d3d11 &&
-                !CreateTexture(iw, ih, input_format, false, D3D12_RESOURCE_STATE_COMMON, slot.original_input)))
+                !CreateTexture(iw, ih, input_format, false,
+                    D3D12_RESOURCE_STATE_COMMON, slot.original_input,
+                    g_present_api == reshade::api::device_api::d3d12 &&
+                        SourceResolutionOverrideActive() ?
+                        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET :
+                        D3D12_RESOURCE_FLAG_NONE)) ||
+            (g_present_api == reshade::api::device_api::d3d12 &&
+                SourceResolutionOverrideActive() &&
+                !CreateTexture(capture_width, capture_height, input_format, false,
+                    D3D12_RESOURCE_STATE_COMMON, slot.capture_input)))
             return false;
     }
     for (PresentationFrameSlot &slot : g_presentation_slots)
@@ -4545,6 +5021,7 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
     g_next_pipeline_slot = 0;
     g_next_presentation_slot = 0;
     g_pending_pipeline_slot = -1;
+    if (!InitializeD3D12SourceDownsample(input_format)) return false;
     const float motion_clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     const float depth_clear[4] = {g_depth_reversed ? 0.0f : 1.0f, 0.0f, 0.0f, 0.0f};
     if (!CreateGuideTexture(iw, ih, DXGI_FORMAT_R16G16_FLOAT, motion_clear, 0, g_fallback_motion) ||
@@ -4562,12 +5039,13 @@ static bool EnsureStandaloneResources(UINT iw, UINT ih, DXGI_FORMAT input_format
     }
     SetStatus("active on present: %s + %s (fallback guides)",
         g_nr_enabled ? "NR" : "NR disabled", SrModeName());
-    Log("resources ready on present: compact packed/NR=%ux%u, %s=%ux%u, input fmt=%u result fmt=%u; fallback guides=%ux%u; buffered pipeline slots=%u presenter-owned output slots=%u",
-        iw, ih, SrModeName(), ow, oh, static_cast<unsigned int>(input_format),
+    Log("resources ready on present: capture=%ux%u compact packed/NR=%ux%u, %s=%ux%u, input fmt=%u result fmt=%u; fallback guides=%ux%u; buffered pipeline slots=%u presenter-owned output slots=%u",
+        capture_width, capture_height, iw, ih, SrModeName(), ow, oh, static_cast<unsigned int>(input_format),
         static_cast<unsigned int>(result_format), iw, ih, kPipelineFrameSlotCount,
         kPresentationFrameSlotCount);
-    Log("resolution configuration active without restart: input=%ux%u output=%ux%u mode=%s",
-        iw, ih, ow, oh, SrModeName());
+    Log("resolution configuration active without restart: game=%ux%u source=%ux%u output=%ux%u mode=%s override=%s",
+        capture_width, capture_height, iw, ih, ow, oh, SrModeName(),
+        SourceResolutionOverrideActive() ? "active" : "off");
     ResetContractCandidate();
     return true;
 }
@@ -5114,6 +5592,67 @@ static D3D12_RESOURCE_BARRIER Transition(ID3D12Resource *resource,
     return barrier;
 }
 
+static bool RecordD3D12SourceDownsample(ID3D12GraphicsCommandList *commands,
+    UINT slot_index, ID3D12Resource *backbuffer)
+{
+    if (!commands || !backbuffer || slot_index >= kPipelineFrameSlotCount ||
+        !g_downsample_root_signature || !g_downsample_pipeline ||
+        !g_downsample_srv_heap || !g_downsample_rtv_heap)
+        return false;
+    PipelineFrameSlot &slot = g_pipeline_slots[slot_index];
+    if (!slot.capture_input || !slot.original_input) return false;
+
+    D3D12_RESOURCE_BARRIER copy_begin[2] = {
+        Transition(backbuffer, D3D12_RESOURCE_STATE_PRESENT,
+            D3D12_RESOURCE_STATE_COPY_SOURCE),
+        Transition(slot.capture_input.Get(), D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_COPY_DEST)
+    };
+    commands->ResourceBarrier(2, copy_begin);
+    commands->CopyResource(slot.capture_input.Get(), backbuffer);
+    D3D12_RESOURCE_BARRIER draw_begin[3] = {
+        Transition(backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_PRESENT),
+        Transition(slot.capture_input.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+        Transition(slot.original_input.Get(), D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_RENDER_TARGET)
+    };
+    commands->ResourceBarrier(3, draw_begin);
+
+    ID3D12DescriptorHeap *heaps[] = {g_downsample_srv_heap.Get()};
+    commands->SetDescriptorHeaps(1, heaps);
+    commands->SetGraphicsRootSignature(g_downsample_root_signature.Get());
+    commands->SetPipelineState(g_downsample_pipeline.Get());
+    D3D12_GPU_DESCRIPTOR_HANDLE srv =
+        g_downsample_srv_heap->GetGPUDescriptorHandleForHeapStart();
+    srv.ptr += static_cast<UINT64>(slot_index) * g_downsample_srv_stride;
+    commands->SetGraphicsRootDescriptorTable(0, srv);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv =
+        g_downsample_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += static_cast<SIZE_T>(slot_index) * g_downsample_rtv_stride;
+    commands->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    const D3D12_VIEWPORT viewport = {0.0f, 0.0f,
+        static_cast<float>(g_resource_input_width),
+        static_cast<float>(g_resource_input_height), 0.0f, 1.0f};
+    const D3D12_RECT scissor = {0, 0,
+        static_cast<LONG>(g_resource_input_width),
+        static_cast<LONG>(g_resource_input_height)};
+    commands->RSSetViewports(1, &viewport);
+    commands->RSSetScissorRects(1, &scissor);
+    commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    commands->DrawInstanced(3, 1, 0, 0);
+
+    D3D12_RESOURCE_BARRIER draw_end[2] = {
+        Transition(slot.capture_input.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COMMON),
+        Transition(slot.original_input.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_COMMON)
+    };
+    commands->ResourceBarrier(2, draw_end);
+    return true;
+}
+
 static bool CaptureAsyncD3D12Backbuffer(PipelineFrameSlot &slot,
     ID3D12Resource *backbuffer, ID3D12Resource *destination)
 {
@@ -5127,6 +5666,15 @@ static bool CaptureAsyncD3D12Backbuffer(PipelineFrameSlot &slot,
         Fail("async graphics capture command-list reset", static_cast<unsigned int>(hr));
         return false;
     }
+    const UINT slot_index = static_cast<UINT>(&slot - g_pipeline_slots);
+    if (SourceResolutionOverrideActive())
+    {
+        if (!RecordD3D12SourceDownsample(slot.capture_list.Get(), slot_index,
+                backbuffer))
+            return false;
+    }
+    else
+    {
     D3D12_RESOURCE_BARRIER begin[2] = {
         Transition(backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
         Transition(destination, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)
@@ -5147,6 +5695,7 @@ static bool CaptureAsyncD3D12Backbuffer(PipelineFrameSlot &slot,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
     };
     slot.capture_list->ResourceBarrier(2, end);
+    }
     hr = slot.capture_list->Close();
     if (FAILED(hr))
     {
@@ -5300,9 +5849,13 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     ScopedPresentationReservation direct_reservation;
     const bool ringed_d3d11_input = legacy_input && !mailbox_d3d11_input &&
         g_present_api == reshade::api::device_api::d3d11;
+    const bool d3d12_source_override = !legacy_input &&
+        g_present_api == reshade::api::device_api::d3d12 &&
+        SourceResolutionOverrideActive();
     ID3D12Resource *packed_color = mailbox_d3d11_input ?
         g_legacy_capture_slots[prepared_capture_slot].input12.Get() :
-        ((ringed_d3d11_input || (g_async_compute_active && !legacy_input)) ?
+        ((ringed_d3d11_input || d3d12_source_override ||
+            (g_async_compute_active && !legacy_input)) ?
             pipeline_slot.original_input.Get() : g_packed_color.Get());
     if (!packed_color)
     {
@@ -5323,9 +5876,10 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     const bool evaluate_nr = g_nr_enabled && g_nr_feature != nullptr;
 
     bool use_external_guides = false;
-    if (!legacy_input)
+    if (!legacy_input && !SourceResolutionOverrideActive())
         use_external_guides = RenderCurrentFrameGuides(backbuffer);
-    else if (g_present_api == reshade::api::device_api::d3d11 && !mailbox_d3d11_input)
+    else if (!SourceResolutionOverrideActive() &&
+        g_present_api == reshade::api::device_api::d3d11 && !mailbox_d3d11_input)
     {
         use_external_guides = g_legacy_guides_ready && CapturedGuidesMatchInput();
         g_legacy_guides_ready = false;
@@ -5377,7 +5931,19 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
                 D3D12_QUERY_TYPE_TIMESTAMP, index);
     };
     timestamp(0);
-    if (!legacy_input && !g_async_compute_active)
+    if (d3d12_source_override && !g_async_compute_active)
+    {
+        if (!RecordD3D12SourceDownsample(commands, slot_index, backbuffer))
+        {
+            AbortNeuralFrameCommands(slot_index);
+            return false;
+        }
+        D3D12_RESOURCE_BARRIER input_to_srv = Transition(packed_color,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        commands->ResourceBarrier(1, &input_to_srv);
+    }
+    else if (!legacy_input && !g_async_compute_active)
     {
         D3D12_RESOURCE_BARRIER copy_begin[2] = {
             Transition(backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -5680,7 +6246,8 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
         };
         commands->ResourceBarrier(2, snapshot_end);
     }
-    else if (!legacy_input && g_async_compute_active)
+    else if (!legacy_input &&
+        (g_async_compute_active || SourceResolutionOverrideActive()))
     {
         // The per-slot capture texture is both the NGX input and the immutable
         // raw-frame source used by F10. Hand it to the graphics compositor in
@@ -10315,7 +10882,8 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
                     Log("D3D11 capture skipped: all shared input slots are occupied (skip=%llu)", skipped);
                 return;
             }
-            if (api == reshade::api::device_api::d3d11)
+            if (api == reshade::api::device_api::d3d11 &&
+                !SourceResolutionOverrideActive())
                 RenderLegacyCurrentFrameGuides(backbuffer_resource);
             if (!CopyLegacyFrameToD3D12(reinterpret_cast<void *>(backbuffer_resource.handle), false,
                     prepared_slot) ||
@@ -10835,6 +11403,45 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         ColorSpaceName(g_detected_color_space), static_cast<unsigned int>(g_detected_swapchain_format));
     ImGui::TextDisabled("Changes apply live after a brief pipeline rebuild. Re-detect selects Auto and reads the current primary swapchain again.");
     ImGui::TextDisabled("Use a manual profile only when a game reports its output color space incorrectly.");
+
+    const SourceResolutionChoice &selected_source = RequestedSourceResolution();
+    if (ImGui::BeginCombo("Pipeline source resolution override", selected_source.label))
+    {
+        for (int index = 0;
+            index < static_cast<int>(std::size(kSourceResolutionChoices)); ++index)
+        {
+            const bool selected = index == g_source_resolution_choice;
+            if (ImGui::Selectable(kSourceResolutionChoices[index].label, selected))
+            {
+                g_source_resolution_choice = index;
+                char value[16] = {};
+                sprintf_s(value, "%d", index);
+                reshade::set_config_value(nullptr, section,
+                    "SourceResolutionOverride", static_cast<const char *>(value));
+                g_need_history_reset = true;
+                ResetContractCandidate();
+                SetStatus("source resolution change queued for next stable Present");
+                Log("pipeline source resolution override changed to %s; live rebuild queued",
+                    kSourceResolutionChoices[index].label);
+            }
+            if (selected) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    if (g_neural_ready)
+        ImGui::TextDisabled("Game: %ux%u | NR/DLSS source: %ux%u | Output: %ux%u",
+            g_resource_capture_width, g_resource_capture_height,
+            g_resource_input_width, g_resource_input_height,
+            g_resource_output_width, g_resource_output_height);
+    else
+        ImGui::TextDisabled("Waiting for a stable game backbuffer before resolving the source override.");
+    if (g_source_resolution_override_rejected &&
+        selected_source.width != 0 && selected_source.height != 0)
+        ImGui::TextWrapped("The selected size is larger than the game backbuffer or has a different aspect ratio, so the addon is using the game resolution instead.");
+    ImGui::TextWrapped("Optional. Downsamples the captured game frame before Neural Rendering, reducing NR expense when a game cannot expose a lower-resolution backbuffer. Choose a size matching the monitor aspect ratio. The game window and final output size are not changed.");
+    if (g_vort_guides_enabled && SourceResolutionOverrideActive())
+        ImGui::TextDisabled("VORT guides are bypassed while source downsampling is active; guide resampling is not yet validated.");
+
     static constexpr DlssRenderPreset preset_values[] = {
         DlssRenderPreset::Default,
         DlssRenderPreset::J, DlssRenderPreset::K, DlssRenderPreset::L, DlssRenderPreset::M};
@@ -11268,6 +11875,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         // ColorProfile to HDR10 globally, so importing that value would retain
         // the cross-game color bug instead of migrating installations to Auto.
         read_setting("InputColorProfile", "0", value, sizeof(value)); g_color_profile = static_cast<ColorProfile>(std::clamp(atoi(value), 0, 4));
+        read_setting("SourceResolutionOverride", "0", value, sizeof(value));
+        g_source_resolution_choice = std::clamp(atoi(value), 0,
+            static_cast<int>(std::size(kSourceResolutionChoices)) - 1);
         g_pending_color_profile = static_cast<int>(ColorProfile::Srgb);
         g_color_profile_reconfigure_requested = false;
         g_color_profile_redetect_requested = false;
@@ -11324,8 +11934,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             reshade::set_config_value(nullptr, section, "SynchronousProxyPresentation", "1");
         }
         g_requested_synchronous_proxy_presentation = g_synchronous_proxy_presentation;
-        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s DLSS_render_preset=%s model=%d style=%u NR=%s NR_passes=%u async_compute=%s adaptive_governor=%s NR-mask=%s strength=%.2f VORT=%s early_proxy=%s auto_presentation=%s windowed_virtualization=%s logical_client=%s input_coordinates=%s detached_output=%s detached_cursor=%s opaque_composition=%s presenter=%s telemetry=%s",
-            ADDON_VERSION, ProfileName(g_color_profile), DlssRenderPresetName(g_dlss_render_preset),
+        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s source_override=%s DLSS_render_preset=%s model=%d style=%u NR=%s NR_passes=%u async_compute=%s adaptive_governor=%s NR-mask=%s strength=%.2f VORT=%s early_proxy=%s auto_presentation=%s windowed_virtualization=%s logical_client=%s input_coordinates=%s detached_output=%s detached_cursor=%s opaque_composition=%s presenter=%s telemetry=%s",
+            ADDON_VERSION, ProfileName(g_color_profile), RequestedSourceResolution().label,
+            DlssRenderPresetName(g_dlss_render_preset),
             g_nr_model, NrStyle(), g_nr_enabled ? "enabled" : "disabled",
             g_nr_pass_count,
             g_async_compute_requested ? "requested" : "disabled",
@@ -11449,6 +12060,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         g_nr_second_stage.Reset(); g_nr_third_stage.Reset();
         g_post_reshade_color.Reset(); g_post_reshade_color_ready = false;
         g_packed_color.Reset();
+        g_downsample_pipeline.Reset(); g_downsample_root_signature.Reset();
+        g_downsample_srv_heap.Reset(); g_downsample_rtv_heap.Reset();
         g_guide_telemetry_fence.Reset(); g_guide_telemetry_readback.Reset();
         g_guide_telemetry_query_heap.Reset();
         for (PipelineFrameSlot &slot : g_pipeline_slots)
@@ -11456,6 +12069,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             slot.generated_output.Reset();
             slot.real_output.Reset();
             slot.original_input.Reset();
+            slot.capture_input.Reset();
+            slot.legacy_input_rtv.Reset();
             slot.list.Reset();
             slot.allocator.Reset();
             slot.capture_list.Reset();
