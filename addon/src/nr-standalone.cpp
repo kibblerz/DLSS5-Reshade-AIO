@@ -34,7 +34,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.9-source-override-dpi-optin-prototype"
+#define ADDON_VERSION "2.0.9-source-override-resolution-header-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -11294,6 +11294,39 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g_present_api == reshade::api::device_api::vulkan ? "Vulkan -> D3D12 shared timeline" :
         g_present_api == reshade::api::device_api::d3d12 ? "D3D12 native" : "waiting";
     ImGui::Text("Graphics transport: %s", api_name);
+    const UINT detected_source_width = g_resource_input_width != 0 ?
+        g_resource_input_width : g_input_width.load();
+    const UINT detected_source_height = g_resource_input_height != 0 ?
+        g_resource_input_height : g_input_height.load();
+    const UINT detected_native_width = g_resource_output_width != 0 ?
+        g_resource_output_width : g_output_width.load();
+    const UINT detected_native_height = g_resource_output_height != 0 ?
+        g_resource_output_height : g_output_height.load();
+    if (detected_source_width != 0 && detected_source_height != 0)
+        ImGui::Text("Detected source resolution: %ux%u%s",
+            detected_source_width, detected_source_height,
+            SourceResolutionOverrideActive() ? " (override)" : "");
+    else
+        ImGui::TextUnformatted("Detected source resolution: waiting");
+    if (detected_native_width != 0 && detected_native_height != 0)
+        ImGui::Text("Detected native resolution: %ux%u",
+            detected_native_width, detected_native_height);
+    else
+        ImGui::TextUnformatted("Detected native resolution: waiting");
+    if (detected_source_width != 0 && detected_source_height != 0 &&
+        detected_native_width != 0 && detected_native_height != 0)
+    {
+        const bool source_exceeds_native = detected_source_width > detected_native_width ||
+            detected_source_height > detected_native_height;
+        const bool native_contract = detected_source_width == detected_native_width &&
+            detected_source_height == detected_native_height;
+        ImGui::Text("Resolution mode: %s",
+            source_exceeds_native ? "INVALID CONTRACT" :
+            (native_contract ? "DLAA (native source)" : "DLSS (reduced source)"));
+        if (source_exceeds_native)
+            ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.15f, 1.0f),
+                "Source exceeds detected native resolution. Check the DPI native-resolution option under Compatibility / troubleshooting.");
+    }
     if (ImGui::Checkbox("Enable addon", &g_enabled))
     {
         reshade::set_config_value(nullptr, section, "Enabled", g_enabled ? "1" : "0");
