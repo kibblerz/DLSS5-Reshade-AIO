@@ -34,7 +34,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.7-experimental.1"
+#define ADDON_VERSION "2.0.8-runtime-color-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -478,6 +478,10 @@ enum class DlssRenderPreset : int
 // game swapchain, with a format fallback for older ReShade/DXGI paths.
 static ColorProfile g_color_profile = ColorProfile::Auto;
 static ColorProfile g_active_color_profile = ColorProfile::Srgb;
+static std::atomic<int> g_pending_color_profile{static_cast<int>(ColorProfile::Srgb)};
+static std::atomic<bool> g_color_profile_reconfigure_requested{false};
+static std::atomic<bool> g_color_profile_redetect_requested{false};
+static bool g_color_profile_resources_retired;
 static reshade::api::color_space g_detected_color_space = reshade::api::color_space::unknown;
 static DXGI_FORMAT g_detected_swapchain_format = DXGI_FORMAT_UNKNOWN;
 static DlssRenderPreset g_dlss_render_preset = DlssRenderPreset::L;
@@ -1017,6 +1021,7 @@ static void ReleaseLegacyFrameResources();
 static bool EnsureStandaloneResources(ID3D12Resource *backbuffer);
 static void UpdateProxyCursorClip(bool active);
 static bool EnsureSecondNrStage();
+static bool ApplyPendingColorProfileChange(UINT width, UINT height, DXGI_FORMAT format);
 static NgxPopulateParameters g_nr_populate;
 static NgxPopulateParameters g_nr_compute_scaling_ratio;
 static float g_nr_scaling_ratio = 1.0f;
@@ -1450,9 +1455,13 @@ static void RefreshColorProfile(reshade::api::swapchain *swapchain, DXGI_FORMAT 
 
     if (g_neural_ready && resolved != g_active_color_profile)
     {
-        if (observation_changed)
-            Log("color auto-detect changed after NGX creation at %s: swapchain=%s fmt=%u resolved=%s; restart required",
-                boundary, ColorSpaceName(color_space), static_cast<unsigned int>(format), ProfileName(resolved));
+        g_pending_color_profile.store(static_cast<int>(resolved), std::memory_order_release);
+        g_color_profile_reconfigure_requested.store(true, std::memory_order_release);
+        Log("color profile change detected at %s: requested=%s swapchain=%s fmt=%u active=%s pending=%s; live rebuild queued",
+            boundary, ProfileName(g_color_profile), ColorSpaceName(color_space),
+            static_cast<unsigned int>(format), ProfileName(g_active_color_profile), ProfileName(resolved));
+        SetStatus("switching color profile from %s to %s",
+            ProfileName(g_active_color_profile), ProfileName(resolved));
         return;
     }
 
@@ -1462,6 +1471,14 @@ static void RefreshColorProfile(reshade::api::swapchain *swapchain, DXGI_FORMAT 
         Log("color profile resolved at %s: requested=%s swapchain=%s fmt=%u active=%s",
             boundary, ProfileName(g_color_profile), ColorSpaceName(color_space),
             static_cast<unsigned int>(format), ProfileName(g_active_color_profile));
+    }
+    else if (strcmp(boundary, "runtime re-detect") == 0)
+    {
+        Log("color profile re-detect confirmed at %s: requested=%s swapchain=%s fmt=%u active=%s",
+            boundary, ProfileName(g_color_profile), ColorSpaceName(color_space),
+            static_cast<unsigned int>(format), ProfileName(g_active_color_profile));
+        SetStatus("color profile confirmed: %s", ProfileName(g_active_color_profile));
+        ShowPipelineNotice("COLOR %s", ProfileName(g_active_color_profile));
     }
 }
 
@@ -7931,6 +7948,124 @@ static DWORD WINAPI ProxyWindowThread(void *)
     return 0;
 }
 
+static bool RetireProxyPresentationForColorProfileChange()
+{
+    if (g_proxy_present_thread != nullptr)
+    {
+        if (g_proxy_present_stop_event) SetEvent(g_proxy_present_stop_event);
+        if (g_proxy_present_event) SetEvent(g_proxy_present_event);
+        const DWORD wait = WaitForSingleObject(g_proxy_present_thread, 0);
+        if (wait == WAIT_TIMEOUT)
+            return false;
+        if (wait != WAIT_OBJECT_0)
+        {
+            Log("color profile proxy-worker retirement failed: wait=%lu error=%lu",
+                wait, GetLastError());
+            return false;
+        }
+        CloseHandle(g_proxy_present_thread);
+        g_proxy_present_thread = nullptr;
+    }
+
+    if (g_proxy_present_event) CloseHandle(g_proxy_present_event);
+    if (g_proxy_present_stop_event) CloseHandle(g_proxy_present_stop_event);
+    if (g_proxy_pacing_timer) CloseHandle(g_proxy_pacing_timer);
+    if (g_proxy_fence_event) CloseHandle(g_proxy_fence_event);
+    if (g_proxy_frame_latency_waitable) CloseHandle(g_proxy_frame_latency_waitable);
+    g_proxy_present_event = nullptr;
+    g_proxy_present_stop_event = nullptr;
+    g_proxy_pacing_timer = nullptr;
+    g_proxy_fence_event = nullptr;
+    g_proxy_frame_latency_waitable = nullptr;
+
+    if (g_composition_target && g_composition_device)
+    {
+        g_composition_target->SetRoot(nullptr);
+        g_composition_device->Commit();
+    }
+    g_composition_effect.Reset();
+    g_composition_visual.Reset();
+    g_composition_target.Reset();
+    g_composition_device.Reset();
+    g_same_window_compositor = false;
+    g_composition_target_window = nullptr;
+    g_composition_retarget_pending = nullptr;
+    g_proxy_runtime = nullptr;
+
+    g_proxy_pipeline.Reset();
+    g_proxy_root_signature.Reset();
+    g_proxy_srv_heap.Reset();
+    g_proxy_rtv_heap.Reset();
+    for (UINT index = 0; index < kProxyCommandSlotCount; ++index)
+    {
+        g_proxy_lists[index].Reset();
+        g_proxy_allocators[index].Reset();
+        g_proxy_command_fence_values[index] = 0;
+    }
+    g_proxy_telemetry_readback.Reset();
+    g_proxy_telemetry_query_heap.Reset();
+    g_proxy_telemetry_pending = false;
+    g_proxy_fence.Reset();
+    g_proxy_swapchain.Reset();
+    g_proxy_present_request_state = 0;
+    g_proxy_fence_value = 0;
+    g_next_proxy_command_slot = 0;
+    g_proxy_present_format = DXGI_FORMAT_UNKNOWN;
+    g_proxy_explicit_pacing_active = false;
+    g_proxy_pacing_qpc_frequency = 0;
+    g_proxy_pacing_interval_qpc = 0;
+    g_proxy_next_present_qpc = 0;
+    g_proxy_activation_frames = 0;
+    g_proxy_early_pending_activation = false;
+    g_proxy_initialized_early = false;
+    g_proxy_failed = false;
+    g_proxy_initializing = false;
+    Log("color profile transition retired the old proxy swapchain and presentation resources");
+    return true;
+}
+
+static bool ApplyPendingColorProfileChange(UINT width, UINT height, DXGI_FORMAT format)
+{
+    if (!g_color_profile_reconfigure_requested.load(std::memory_order_acquire))
+        return true;
+
+    const ColorProfile pending = static_cast<ColorProfile>(
+        std::clamp(g_pending_color_profile.load(std::memory_order_acquire),
+            static_cast<int>(ColorProfile::Srgb), static_cast<int>(ColorProfile::Hdr10Hlg)));
+    if (pending == g_active_color_profile && !g_color_profile_resources_retired)
+    {
+        g_color_profile_reconfigure_requested = false;
+        return true;
+    }
+
+    g_proxy_transition_hold = true;
+    UpdateProxyCursorClip(false);
+    RequestProxyVisibility(false);
+    if (!g_color_profile_resources_retired)
+    {
+        if (!RetireResolutionDependentResources(width, height, TypedInputFormat(format)))
+            return false;
+        g_color_profile_resources_retired = true;
+    }
+    if (!RetireProxyPresentationForColorProfileChange())
+        return false;
+
+    const ColorProfile previous = g_active_color_profile;
+    g_active_color_profile = pending;
+    g_color_profile_resources_retired = false;
+    g_color_profile_reconfigure_requested = false;
+    g_need_history_reset = true;
+    g_fg_frames = 0;
+    g_last_neural_source_sequence = 0;
+    g_proxy_transition_hold = false;
+    ResetQueuePressureObservation(true);
+    SetStatus("color profile switched live: %s", ProfileName(g_active_color_profile));
+    Log("live color profile transition complete: %s -> %s; NGX resources and proxy will rebuild on this Present",
+        ProfileName(previous), ProfileName(g_active_color_profile));
+    ShowPipelineNotice("COLOR %s", ProfileName(g_active_color_profile));
+    return true;
+}
+
 static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
 {
     if ((!early && source == nullptr) || g_command_queue == nullptr || g_game_window == nullptr)
@@ -9801,14 +9936,21 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         }
     }
     const reshade::api::device_api api = queue->get_device()->get_api();
-    if (!g_neural_ready)
+    const bool color_redetect_requested =
+        g_color_profile_redetect_requested.exchange(false, std::memory_order_acq_rel);
+    if ((!g_neural_ready &&
+            !g_color_profile_reconfigure_requested.load(std::memory_order_acquire)) ||
+        color_redetect_requested)
     {
         const auto color_resource = swapchain->get_current_back_buffer();
         if (color_resource.handle)
         {
             const auto color_desc = swapchain->get_device()->get_resource_desc(color_resource);
-            RefreshColorProfile(swapchain, static_cast<DXGI_FORMAT>(color_desc.texture.format), "first present");
+            RefreshColorProfile(swapchain, static_cast<DXGI_FORMAT>(color_desc.texture.format),
+                color_redetect_requested ? "runtime re-detect" : "first present");
         }
+        else if (color_redetect_requested)
+            g_color_profile_redetect_requested = true;
     }
     if (api == reshade::api::device_api::d3d12)
     {
@@ -9917,11 +10059,14 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     if (!backbuffer_resource.handle) return;
     if (api == reshade::api::device_api::d3d12)
     {
-        if (!AdmitNewestFrameForFgPair()) return;
         auto *backbuffer = reinterpret_cast<ID3D12Resource *>(backbuffer_resource.handle);
         const D3D12_RESOURCE_DESC backbuffer_desc = backbuffer->GetDesc();
         g_input_width = static_cast<UINT>(backbuffer_desc.Width);
         g_input_height = backbuffer_desc.Height;
+        if (!ApplyPendingColorProfileChange(g_input_width.load(), g_input_height.load(),
+                backbuffer_desc.Format))
+            return;
+        if (!AdmitNewestFrameForFgPair()) return;
         if (!ExecuteOnPresentPipeline(backbuffer))
         {
             // A genuinely full pipeline ring is fail-open: the existing proxy
@@ -9936,6 +10081,10 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         const UINT height = desc.texture.height;
         const DXGI_FORMAT format = static_cast<DXGI_FORMAT>(desc.texture.format);
         g_input_width = width; g_input_height = height;
+        if (api == reshade::api::device_api::d3d11 &&
+            g_color_profile_reconfigure_requested.load(std::memory_order_acquire))
+            UpdateLegacyCaptureMailboxMode(false);
+        if (!ApplyPendingColorProfileChange(width, height, format)) return;
         if (api == reshade::api::device_api::d3d11 &&
             g_capture_mailbox_was_enabled.load(std::memory_order_acquire) &&
             g_neural_ready && (width != g_resource_input_width || height != g_resource_input_height ||
@@ -10015,12 +10164,13 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     }
     else
     {
-        if (!AdmitNewestFrameForFgPair()) return;
         const auto desc = swapchain->get_device()->get_resource_desc(backbuffer_resource);
         const UINT width = static_cast<UINT>(desc.texture.width);
         const UINT height = desc.texture.height;
         const DXGI_FORMAT format = VulkanSharedFormat(static_cast<DXGI_FORMAT>(desc.texture.format));
         g_input_width = width; g_input_height = height;
+        if (!ApplyPendingColorProfileChange(width, height, format)) return;
+        if (!AdmitNewestFrameForFgPair()) return;
         if (!EnsureStandaloneResources(width, height, format)) return;
         g_vulkan_waiting_for_effects = true;
         SetStatus("Vulkan resources ready; waiting for ReShade effects boundary");
@@ -10498,11 +10648,22 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g_color_profile = static_cast<ColorProfile>(profile);
         char value[16]; sprintf_s(value, "%d", profile);
         reshade::set_config_value(nullptr, section, "InputColorProfile", static_cast<const char *>(value));
-        SetStatus("color profile changed; restart required");
+        g_color_profile_redetect_requested.store(true, std::memory_order_release);
+        SetStatus("color profile change queued for next Present");
+        Log("runtime color profile change requested: %s", ProfileName(g_color_profile));
+    }
+    if (ImGui::Button("Re-detect color profile now"))
+    {
+        g_color_profile = ColorProfile::Auto;
+        reshade::set_config_value(nullptr, section, "InputColorProfile", "0");
+        g_color_profile_redetect_requested.store(true, std::memory_order_release);
+        SetStatus("color profile re-detection queued for next Present");
+        Log("runtime color profile re-detection requested");
     }
     ImGui::TextDisabled("Active: %s | detected: %s (format %u)", ProfileName(g_active_color_profile),
         ColorSpaceName(g_detected_color_space), static_cast<unsigned int>(g_detected_swapchain_format));
-    ImGui::TextDisabled("Auto follows the primary swapchain; use a manual profile only when a game reports it incorrectly.");
+    ImGui::TextDisabled("Changes apply live after a brief pipeline rebuild. Re-detect selects Auto and reads the current primary swapchain again.");
+    ImGui::TextDisabled("Use a manual profile only when a game reports its output color space incorrectly.");
     static constexpr DlssRenderPreset preset_values[] = {
         DlssRenderPreset::Default,
         DlssRenderPreset::J, DlssRenderPreset::K, DlssRenderPreset::L, DlssRenderPreset::M};
@@ -10924,6 +11085,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         // ColorProfile to HDR10 globally, so importing that value would retain
         // the cross-game color bug instead of migrating installations to Auto.
         read_setting("InputColorProfile", "0", value, sizeof(value)); g_color_profile = static_cast<ColorProfile>(std::clamp(atoi(value), 0, 4));
+        g_pending_color_profile = static_cast<int>(ColorProfile::Srgb);
+        g_color_profile_reconfigure_requested = false;
+        g_color_profile_redetect_requested = false;
+        g_color_profile_resources_retired = false;
         read_setting("DlssRenderPreset", "12", value, sizeof(value));
         switch (atoi(value))
         {
