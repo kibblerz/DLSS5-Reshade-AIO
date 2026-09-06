@@ -34,7 +34,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.9-source-override-dpi-fit-prototype"
+#define ADDON_VERSION "2.0.9-source-override-dpi-optin-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -323,6 +323,7 @@ static std::atomic<unsigned int> g_auto_windowed_host_drift_count{0};
 static std::atomic<unsigned long long> g_auto_windowed_activation_tick{0};
 static bool g_windowed_logical_size_messages;
 static bool g_windowed_input_scaling;
+static bool g_dpi_physical_output_correction;
 static bool g_detached_presentation;
 static std::atomic<bool> g_auto_detached_presentation_active{false};
 static bool g_hide_detached_system_cursor;
@@ -7381,8 +7382,21 @@ static HRESULT ApplyCompositionHostTransform(HWND target_window, bool log_change
 {
     if (target_window == nullptr || !g_composition_visual)
         return E_INVALIDARG;
+    if (!g_dpi_physical_output_correction)
+    {
+        const D2D_MATRIX_3X2_F identity = {1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
+        return g_composition_visual->SetTransform(identity);
+    }
     RECT client = {};
-    if (!GetClientRect(target_window, &client))
+    // Compatibility virtualization intentionally lies to game callers about
+    // the logical client size. The compositor must never consume that same
+    // synthetic rectangle or it will treat a 4K surface as a 4K-DIP visual on
+    // a 2560x1440 DPI-virtualized host and crop the output. Read through the
+    // original API whenever our hook is installed.
+    const BOOL client_result = g_original_get_client_rect != nullptr ?
+        g_original_get_client_rect(target_window, &client) :
+        GetClientRect(target_window, &client);
+    if (!client_result)
         return HRESULT_FROM_WIN32(GetLastError());
     const LONG client_width = client.right - client.left;
     const LONG client_height = client.bottom - client.top;
@@ -11113,7 +11127,8 @@ static void OnInitSwapchain(reshade::api::swapchain *swapchain, bool)
         UINT physical_height = logical_height;
         DEVMODEW display_mode = {};
         display_mode.dmSize = sizeof(display_mode);
-        if (EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &display_mode) &&
+        if (g_dpi_physical_output_correction &&
+            EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &display_mode) &&
             display_mode.dmPelsWidth != 0 && display_mode.dmPelsHeight != 0)
         {
             physical_width = display_mode.dmPelsWidth;
@@ -11381,6 +11396,16 @@ static void DrawOverlay(reshade::api::effect_runtime *)
             g_windowed_input_scaling ? "scaled-to-render" : "native-client");
     }
     ImGui::TextWrapped("Use when the picture is correct but mouse clicks land in the wrong place, the cursor is limited to one corner, or menus only respond in part of the screen. It maps the full-screen cursor back to the game's lower-resolution coordinates and automatically enables the required reduced-window virtualization.");
+
+    if (ImGui::Checkbox("Correct DPI-virtualized native resolution", &g_dpi_physical_output_correction))
+    {
+        reshade::set_config_value(nullptr, section, "DpiPhysicalOutputCorrection",
+            g_dpi_physical_output_correction ? "1" : "0");
+        SetStatus("DPI output correction changed; restart required");
+        Log("DPI physical-output correction changed to %s; restart required",
+            g_dpi_physical_output_correction ? "enabled" : "disabled");
+    }
+    ImGui::TextWrapped("Try enabling this if the addon's detected native resolution is wrong, especially when Windows display scaling makes a 4K screen appear as 2560x1440. It uses the monitor's physical resolution and fits that output into the game's logical window. Leave it disabled when native resolution is already correct. Restart after changing it.");
 
     if (ImGui::Checkbox("Detached native output (Vulkan compatibility)", &g_detached_presentation))
     {
@@ -11989,6 +12014,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("WindowedVirtualization", "0", value, sizeof(value)); g_windowed_virtualization_enabled = strcmp(value, "0") != 0;
         read_setting("WindowedLogicalSizeMessages", "0", value, sizeof(value)); g_windowed_logical_size_messages = strcmp(value, "0") != 0;
         read_setting("WindowedInputScaling", "0", value, sizeof(value)); g_windowed_input_scaling = strcmp(value, "0") != 0;
+        read_setting("DpiPhysicalOutputCorrection", "0", value, sizeof(value)); g_dpi_physical_output_correction = strcmp(value, "0") != 0;
         if (g_windowed_input_scaling && !g_windowed_virtualization_enabled)
         {
             g_windowed_virtualization_enabled = true;
@@ -12004,7 +12030,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             reshade::set_config_value(nullptr, section, "SynchronousProxyPresentation", "1");
         }
         g_requested_synchronous_proxy_presentation = g_synchronous_proxy_presentation;
-        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s source_override=%s DLSS_render_preset=%s model=%d style=%u NR=%s NR_passes=%u async_compute=%s adaptive_governor=%s NR-mask=%s strength=%.2f VORT=%s early_proxy=%s auto_presentation=%s windowed_virtualization=%s logical_client=%s input_coordinates=%s detached_output=%s detached_cursor=%s opaque_composition=%s presenter=%s telemetry=%s",
+        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s source_override=%s DLSS_render_preset=%s model=%d style=%u NR=%s NR_passes=%u async_compute=%s adaptive_governor=%s NR-mask=%s strength=%.2f VORT=%s early_proxy=%s auto_presentation=%s windowed_virtualization=%s logical_client=%s input_coordinates=%s dpi_physical_output=%s detached_output=%s detached_cursor=%s opaque_composition=%s presenter=%s telemetry=%s",
             ADDON_VERSION, ProfileName(g_color_profile), RequestedSourceResolution().label,
             DlssRenderPresetName(g_dlss_render_preset),
             g_nr_model, NrStyle(), g_nr_enabled ? "enabled" : "disabled",
@@ -12018,6 +12044,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             g_windowed_virtualization_enabled ? "enabled" : "disabled",
             g_windowed_logical_size_messages ? "enabled" : "disabled",
             g_windowed_input_scaling ? "scaled-to-render" : "native-client",
+            g_dpi_physical_output_correction ? "enabled" : "disabled",
             g_detached_presentation ? "enabled" : "disabled",
             g_hide_detached_system_cursor ? "hidden-during-gameplay" : "visible",
             g_opaque_composition ? "enabled" : "disabled",
