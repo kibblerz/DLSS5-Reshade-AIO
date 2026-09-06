@@ -18,4 +18,3 @@ NVIDIA, DLSS, and related product names are trademarks or registered trademarks 
 ## ReShade
 
 ReShade is developed by Patrick Mours and contributors and is governed by its own license. This project is a ReShade addon and is not affiliated with or endorsed by the ReShade project. Relevant ReShade notices are retained in the dependency tree.
-
