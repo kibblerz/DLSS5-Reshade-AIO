@@ -2,6 +2,8 @@
 
 Bring Neural Rendering, DLAA/DLSS Super Resolution, and Frame Generation to supported 64-bit Windows games even when the game does not include those features. This is experimental software and currently supports D3D9, D3D11, D3D12, and Vulkan through ReShade.
 
+This project's original code and documentation are licensed under the [Apache License 2.0](LICENSE). Forks and redistributed derivatives must preserve the license and the attribution in [`NOTICE`](NOTICE), retain applicable notices, and mark modified files. Third-party components and NVIDIA runtime files remain under their own terms; see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
 > [!IMPORTANT]
 > **Version 2.0 uses a new presentation and window-compatibility system.** It fixes input and reduced-window behavior in many games, but game compatibility can differ from the 1.x series. If a game has problems in 2.0 that it did not have before, install the [latest 1.x release (v1.7.24)](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/tag/v1.7.24). Do not mix the 1.x and 2.0 addon binaries.
 
