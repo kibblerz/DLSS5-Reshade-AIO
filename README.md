@@ -37,6 +37,8 @@ Reduced-resolution DLSS SR can provide major performance improvements. Native-re
 
 > [!IMPORTANT]
 > **If performance is unexpectedly low or stuttery, set an in-game or external frame cap below the uncapped source frame rate.** NR and Frame Generation can overwhelm the pipeline when the game submits frames faster than NGX can process them. Counterintuitively, a lower cap may increase the final displayed FPS and eliminate stuttering: in testing, a game struggling around 45 FPS with NR + FG became a consistent 60 FPS after its source frame rate was capped at 30. Start with a 30 FPS source cap for a 60 FPS FG target, then raise it gradually while watching frame pacing.
+>
+> Version 2.0.5 detects sustained queue pressure after roughly 25 seconds and displays a conservative recommended cap on the game output. Follow the displayed value or choose a lower cap; lowering the game resolution is another option. The recommendation follows a rolling sample instead of one brief hitch, updates as conditions change, and disappears after the queue remains healthy. F10 comparisons are excluded from the measurement.
 
 - Press **F10** to compare the processed image with the original game output.
 - Press **Ctrl+Alt+P** to cycle through the modern DLSS render presets **J → K → L → M**. NVIDIA Default remains selectable in ReShade. A three-second corner notice shows the selected preset and the mode it was designed to target; the ReShade status separately reports the pipeline's actual active DLAA/DLSS mode.
@@ -67,7 +69,7 @@ Open **ReShade > Add-ons > Standalone DLSS-NR + SR**, then expand **Compatibilit
 
 | What you see | Setting or action to use |
 | --- | --- |
-| **Performance is much lower than expected, FPS fluctuates, or motion stutters despite NR/FG being active** | Apply a frame cap **below the current uncapped source FPS**. With Frame Generation, try a 30 FPS source cap for a stable 60 FPS output, then increase it gradually. A lower cap can produce a higher and smoother final frame rate by preventing the game from flooding the NGX pipeline. |
+| **The `LOWER FPS CAP ...` warning appears, performance is unexpectedly low, or motion stutters** | Set an in-game or external FPS cap **at or below the displayed recommendation**. The addon rounds its rolling low estimate down to leave processing headroom. You can also lower the game resolution. The warning clears after the queue stays healthy; use **Hide queue-full performance warning** only if you intentionally want to suppress it. |
 | **The image is small, stuck in a corner, or only occupies part of the screen** | Enable **Force reduced-window virtualization**. This is the first option to try for a wrongly sized image. Restart if the image does not settle immediately. |
 | **The picture is correct, but mouse clicks land in the wrong place or only part of the screen is clickable** | Enable **Scale window input coordinates to render resolution**. It automatically enables **Force reduced-window virtualization**, which it requires. |
 | **The game does not capture the mouse, the pointer escapes, or camera rotation stops at a screen edge** | Enable **Hide detached Windows cursor**. Turn it back off if the game needs the normal Windows cursor for its menus; automatic cursor handling works in most games. |
@@ -114,6 +116,12 @@ The new **Compatibility / troubleshooting** panel provides opt-in fixes for game
 Resolution transitions are serialized outside the game's DXGI callback, failed sessions can recover into serialized mode by holding **F8** during launch, and startup contract changes hold the last completed native frame instead of repeatedly exposing the low-resolution game surface.
 
 Because presentation behavior varies substantially between engines, 2.0 may work better or worse than 1.x in a particular game. Keep [v1.7.24](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/tag/v1.7.24) available as the stable 1.x fallback and report regressions with the game name, graphics API, display mode, and persistent addon log.
+
+### Version 2.0.5
+
+The addon now detects sustained NGX queue pressure and shows a native-output FPS-cap recommendation before an overloaded pipeline turns into persistent stutter or poor Frame Generation throughput. Detection waits roughly 25 seconds, ignores startup, resizing, ReShade/F10 comparisons, and other invalid samples, and uses a rolling low average so a single hitch cannot permanently force an excessively low recommendation. The suggested cap is deliberately rounded down to leave GPU headroom, updates when old samples expire, and clears after five healthy seconds.
+
+A saved **Hide queue-full performance warning** checkbox is available under the addon's compatibility/troubleshooting controls. It hides the message without disabling monitoring or changing the pipeline.
 
 ### Version 2.0.4
 
