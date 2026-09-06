@@ -32,6 +32,7 @@ Bring Neural Rendering, DLAA/DLSS Super Resolution, and Frame Generation to supp
    - **Lower than the monitor:** the addon uses **DLSS Super Resolution** to reconstruct the image to the monitor's native size.
 4. If a lower game resolution still reports **DLAA**, the game is still presenting a native-size backbuffer. Try windowed mode first, then borderless or fullscreen; restart after changing modes if necessary. Use whichever mode makes the overlay report **DLSS SR**.
 5. Neural Rendering and Frame Generation are enabled by default and can be toggled independently in ReShade. Disabling both leaves an SR/DLAA-only pipeline.
+6. **Enable second NR pass (experimental)** is an optional high-cost quality experiment. It is always off when the game starts and is never saved, so a crash during a two-pass test cannot leave the next launch stuck in that mode.
 
 Reduced-resolution DLSS SR can provide major performance improvements. Native-resolution DLAA instead prioritizes image quality.
 
@@ -62,6 +63,12 @@ These presets tune reconstruction behavior; they do not change the input resolut
 VORT motion integration is **disabled by default** because its optical-flow and guide-conversion passes can have a substantial performance cost. The addon normally uses its zero-motion fallback and does not require VORT.
 
 To experiment with motion guidance, install VORT Motion and `DLSS5_AIO_Feed.fx` in the same ReShade shader search path, then enable **Enable VORT motion integration (experimental)** under the addon's Neural Rendering controls. The addon schedules both effects itself; leave their ordinary ReShade technique checkboxes disabled. Turn the option back off if performance drops or image quality does not improve. The option now supports both native D3D12 and the addon's D3D11-to-D3D12 transport.
+
+### Experimental second NR pass
+
+Enable **Enable second NR pass (experimental)** under the addon's Neural Rendering controls to process the first NR result through a separate NR feature before DLSS/DLAA. This can strengthen the neural effect, but it can roughly double NR cost and may reduce throughput substantially. Start with a low source resolution and a conservative frame cap.
+
+This option is deliberately session-only: it is disabled on every game launch, never written to `ReShade.ini`, and ignores stale settings left by older prototypes. If the second feature cannot be created or evaluated, the addon falls back to the normal single NR pass.
 
 ## Troubleshooting — start here
 
@@ -116,6 +123,12 @@ The new **Compatibility / troubleshooting** panel provides opt-in fixes for game
 Resolution transitions are serialized outside the game's DXGI callback, failed sessions can recover into serialized mode by holding **F8** during launch, and startup contract changes hold the last completed native frame instead of repeatedly exposing the low-resolution game surface.
 
 Because presentation behavior varies substantially between engines, 2.0 may work better or worse than 1.x in a particular game. Keep [v1.7.24](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/tag/v1.7.24) available as the stable 1.x fallback and report regressions with the game name, graphics API, display mode, and persistent addon log.
+
+### Version 2.0.6
+
+An optional second Neural Rendering pass is available as a manual quality experiment. It uses a separate feature handle, temporal history, and input-resolution intermediate texture, then sends the second result into the existing DLSS/DLAA and Frame Generation stages. Normal one-pass behavior creates none of those additional resources and retains the original command and telemetry sequence.
+
+The second pass is never persisted and therefore always starts disabled. Creation or evaluation failures fall back to the first pass, and live toggles recreate the required NGX features without requiring a game restart.
 
 ### Version 2.0.5
 
