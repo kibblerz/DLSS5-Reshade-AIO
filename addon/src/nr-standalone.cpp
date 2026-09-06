@@ -34,7 +34,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.9-source-override-dpi-prototype"
+#define ADDON_VERSION "2.0.9-source-override-dpi-fit-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -7377,6 +7377,37 @@ static DWORD WINAPI DeferredFullscreenWorker(void *parameter)
     return 0;
 }
 
+static HRESULT ApplyCompositionHostTransform(HWND target_window, bool log_change = true)
+{
+    if (target_window == nullptr || !g_composition_visual)
+        return E_INVALIDARG;
+    RECT client = {};
+    if (!GetClientRect(target_window, &client))
+        return HRESULT_FROM_WIN32(GetLastError());
+    const LONG client_width = client.right - client.left;
+    const LONG client_height = client.bottom - client.top;
+    const UINT output_width = g_output_width.load();
+    const UINT output_height = g_output_height.load();
+    if (client_width <= 0 || client_height <= 0 || output_width == 0 || output_height == 0)
+        return E_INVALIDARG;
+
+    // DirectComposition lays a swapchain out in the target HWND's logical
+    // coordinate space. Older DPI-unaware games can therefore expose a 4K
+    // physical swapchain through a 2560x1440 logical host at 150% scaling.
+    // Keep the neural/presentation buffers at physical resolution and fit the
+    // visual into the logical client instead of cropping its lower/right side.
+    const float scale_x = static_cast<float>(client_width) / output_width;
+    const float scale_y = static_cast<float>(client_height) / output_height;
+    const D2D_MATRIX_3X2_F scale = {scale_x, 0.0f, 0.0f, scale_y, 0.0f, 0.0f};
+    const HRESULT hr = g_composition_visual->SetTransform(scale);
+    if (SUCCEEDED(hr) && log_change &&
+        (std::abs(scale_x - 1.0f) > 0.001f || std::abs(scale_y - 1.0f) > 0.001f))
+        Log("composition host fitted physical output to logical client: output=%ux%u client=%ldx%ld scale=%.4fx%.4f hwnd=%p",
+            output_width, output_height, client_width, client_height,
+            scale_x, scale_y, target_window);
+    return hr;
+}
+
 static bool RetargetCompositionWindow(HWND target_window)
 {
     if (target_window == nullptr || !IsWindow(target_window) ||
@@ -7400,6 +7431,8 @@ static bool RetargetCompositionWindow(HWND target_window)
     if (old_target)
         old_target->SetRoot(nullptr);
     hr = new_target->SetRoot(g_composition_visual.Get());
+    if (SUCCEEDED(hr) && !g_proxy_overlay_preview.load())
+        hr = ApplyCompositionHostTransform(target_window);
     if (SUCCEEDED(hr))
         hr = g_composition_device->Commit();
     if (FAILED(hr))
@@ -7489,17 +7522,19 @@ static void ApplyProxyOverlayPreview(HWND hwnd, bool enable)
 
     if (!enable)
     {
-        const D2D_MATRIX_3X2_F identity = {1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
-        g_composition_visual->SetTransform(identity);
-        g_composition_device->Commit();
         const RECT &screen = monitor_info.rcMonitor;
         if (g_proxy_preview_window != nullptr)
             ShowWindow(g_proxy_preview_window, SW_HIDE);
+        g_proxy_overlay_preview = false;
         RetargetCompositionWindow(g_proxy_window);
         SetWindowPos(hwnd, HWND_TOPMOST, screen.left, screen.top,
             screen.right - screen.left, screen.bottom - screen.top,
             SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
-        g_proxy_overlay_preview = false;
+        if (g_composition_target_window.load() == g_proxy_window)
+        {
+            ApplyCompositionHostTransform(g_proxy_window, false);
+            g_composition_device->Commit();
+        }
         Log("ReShade side preview closed; detached compositor restored to %ldx%ld",
             screen.right - screen.left, screen.bottom - screen.top);
         return;
@@ -7666,10 +7701,18 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
         HMONITOR monitor = MonitorFromWindow(g_game_window, MONITOR_DEFAULTTONEAREST);
         MONITORINFO info = {sizeof(info)};
         if (GetMonitorInfoW(monitor, &info))
+        {
             SetWindowPos(hwnd, HWND_TOPMOST, info.rcMonitor.left, info.rcMonitor.top,
                 info.rcMonitor.right - info.rcMonitor.left, info.rcMonitor.bottom - info.rcMonitor.top,
                 SWP_NOACTIVATE | (g_proxy_hidden || g_proxy_overlay_bypass || g_proxy_failed ||
                     g_proxy_early_pending_activation ? 0 : SWP_SHOWWINDOW));
+            if (g_composition_target_window.load() == hwnd && g_composition_device &&
+                !g_proxy_overlay_preview.load())
+            {
+                ApplyCompositionHostTransform(hwnd, false);
+                g_composition_device->Commit();
+            }
+        }
         return 0;
     }
     if (message == kProxyRetargetCompositionMessage)
@@ -8974,6 +9017,7 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
     if (SUCCEEDED(hr)) { failed_stage = "CreateEffectGroup"; hr = g_composition_device->CreateEffectGroup(&g_composition_effect); }
     if (SUCCEEDED(hr)) { failed_stage = "SetEffect"; hr = g_composition_visual->SetEffect(g_composition_effect.Get()); }
     if (SUCCEEDED(hr)) { failed_stage = "SetContent"; hr = g_composition_visual->SetContent(g_proxy_swapchain.Get()); }
+    if (SUCCEEDED(hr)) { failed_stage = "Fit composition host"; hr = ApplyCompositionHostTransform(composition_window); }
     if (SUCCEEDED(hr)) { failed_stage = "SetRoot"; hr = g_composition_target->SetRoot(g_composition_visual.Get()); }
     if (SUCCEEDED(hr))
     {
@@ -11087,6 +11131,12 @@ static void OnInitSwapchain(reshade::api::swapchain *swapchain, bool)
     GetClientRect(hwnd, &client);
     const LONG client_width = client.right - client.left;
     const LONG client_height = client.bottom - client.top;
+    if (g_composition_target_window.load() == hwnd && g_composition_device &&
+        !g_proxy_overlay_preview.load())
+    {
+        ApplyCompositionHostTransform(hwnd);
+        g_composition_device->Commit();
+    }
     Log("adopted primary swapchain: render=%ux%u client=%ldx%ld monitor=%ux%u hwnd=%p mode=%s",
         g_input_width.load(), g_input_height.load(), client_width, client_height,
         g_output_width.load(), g_output_height.load(), hwnd,
