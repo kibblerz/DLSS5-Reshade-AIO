@@ -34,7 +34,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.5-queue-pressure-warning-prototype3"
+#define ADDON_VERSION "2.0.5-queue-pressure-warning-prototype4"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -6989,6 +6989,15 @@ static void ResetQueuePressureObservation(bool clear_warning)
     }
 }
 
+static unsigned int ConservativeQueueFrameCap(unsigned int observed_ceiling)
+{
+    // The recommendation must be meaningfully below the saturated rate so the
+    // game actually yields GPU time to NGX. Subtracting before rounding makes
+    // exact decades conservative too: 70 -> 60, while 69 -> 60.
+    if (observed_ceiling <= 10) return 10;
+    return std::max(10u, ((observed_ceiling - 1) / 10) * 10);
+}
+
 static void UpdateQueuePressureMonitor(ULONGLONG now, bool primary_foreground)
 {
     static constexpr ULONGLONG kSampleIntervalMs = 1000;
@@ -7091,29 +7100,32 @@ static void UpdateQueuePressureMonitor(ULONGLONG now, bool primary_foreground)
             !g_queue_pressure_warning_active.load(std::memory_order_acquire))
         {
             g_queue_pressure_last_progress_bucket = progress_bucket;
-            const unsigned int recommendation = std::min(
+            const unsigned int observed_ceiling = std::min(
                 g_queue_pressure_minimum_source_fps, g_queue_pressure_minimum_output_fps);
-            Log("queue-pressure monitor: sustained=%llums/25000 source=%llu processed=%llu discarded=%llu explicit_events=%llu source_floor=%u output_floor=%u recommendation_below=%u FPS",
+            const unsigned int recommendation = observed_ceiling == UINT_MAX ? 0 :
+                ConservativeQueueFrameCap(observed_ceiling);
+            Log("queue-pressure monitor: sustained=%llums/25000 source=%llu processed=%llu discarded=%llu explicit_events=%llu source_floor=%u output_floor=%u recommended_cap=%u FPS",
                 g_queue_pressure_overload_ms, source_delta, processed_delta,
                 discarded_delta, pressure_delta,
                 g_queue_pressure_minimum_source_fps == UINT_MAX ? 0 :
                     g_queue_pressure_minimum_source_fps,
                 g_queue_pressure_minimum_output_fps == UINT_MAX ? 0 :
                     g_queue_pressure_minimum_output_fps,
-                recommendation == UINT_MAX ? 0 : recommendation);
+                recommendation);
         }
         if (g_queue_pressure_overload_ms >= kWarningThresholdMs &&
             g_queue_pressure_minimum_source_fps != UINT_MAX &&
             g_queue_pressure_minimum_output_fps != UINT_MAX)
         {
-            const unsigned int recommendation = std::min(
+            const unsigned int observed_ceiling = std::min(
                 g_queue_pressure_minimum_source_fps, g_queue_pressure_minimum_output_fps);
+            const unsigned int recommendation = ConservativeQueueFrameCap(observed_ceiling);
             const unsigned int prior_cap = g_queue_pressure_recommended_cap.exchange(
                 recommendation, std::memory_order_acq_rel);
             const bool was_active = g_queue_pressure_warning_active.exchange(
                 true, std::memory_order_acq_rel);
             if (!was_active || prior_cap != recommendation)
-                Log("sustained queue pressure: source=%llu processed=%llu discarded=%llu pressure_events=%llu source_floor=%u output_floor=%u; recommend lowering game framecap below %u FPS and/or lowering render resolution",
+                Log("sustained queue pressure: source=%llu processed=%llu discarded=%llu pressure_events=%llu source_floor=%u output_floor=%u; recommend lowering game framecap to %u FPS and/or lowering render resolution",
                     source_delta, processed_delta, discarded_delta, pressure_delta,
                     g_queue_pressure_minimum_source_fps,
                     g_queue_pressure_minimum_output_fps, recommendation);
@@ -7134,7 +7146,7 @@ static void UpdateQueuePressureMonitor(ULONGLONG now, bool primary_foreground)
         {
             const unsigned int prior_cap = g_queue_pressure_recommended_cap.load();
             ResetQueuePressureObservation(true);
-            Log("queue pressure recovered for 10 seconds; cleared frame-cap warning (prior recommendation below %u FPS)",
+            Log("queue pressure recovered for 10 seconds; cleared frame-cap warning (prior recommended cap %u FPS)",
                 prior_cap);
         }
     }
@@ -8194,7 +8206,7 @@ static bool PresentProxySourcesOnWorker(ID3D12Resource *real_source,
         !g_suppress_queue_pressure_warning.load(std::memory_order_acquire))
     {
         char warning[kPipelineNoticeTextLength + 1] = {};
-        sprintf_s(warning, "QUEUE: LOWER FRAMECAP <%u AND/OR RES",
+        sprintf_s(warning, "QUEUE: LOWER FRAMECAP TO %u AND/OR RES",
             g_queue_pressure_recommended_cap.load(std::memory_order_acquire));
         constants.notice_visible = 1u;
         for (; constants.notice_length < kPipelineNoticeTextLength &&
@@ -10102,7 +10114,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     }
     ImGui::TextDisabled("Per-game override. When visible, lower the game's framecap and/or its render resolution.");
     if (g_queue_pressure_warning_active.load(std::memory_order_acquire))
-        ImGui::Text("Queue recommendation: lower framecap below %u FPS and/or lower resolution%s",
+        ImGui::Text("Queue recommendation: lower framecap to %u FPS and/or lower resolution%s",
             g_queue_pressure_recommended_cap.load(std::memory_order_acquire),
             suppress_queue_warning ? " (warning hidden)" : "");
     if (ImGui::Checkbox("Collect performance telemetry", &g_performance_telemetry_enabled))
