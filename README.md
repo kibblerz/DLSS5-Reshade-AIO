@@ -2,6 +2,8 @@
 
 Bring Neural Rendering, DLAA/DLSS Super Resolution, and Frame Generation to supported 64-bit Windows games even when the game does not include those features. This is experimental software and currently supports D3D9, D3D11, D3D12, and Vulkan through ReShade.
 
+This project's original code and documentation are licensed under the [Apache License 2.0](LICENSE). Forks and redistributed derivatives must preserve the license and the attribution in [`NOTICE`](NOTICE), retain applicable notices, and mark modified files. Third-party components and NVIDIA runtime files remain under their own terms; see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
 > [!WARNING]
 > **v2.0.7-experimental.1 is a prerelease test of the adaptive GPU pressure governor.** It is enabled by default and automatically slows excessive game Presents only after sustained pipeline starvation, allowing NR, DLSS/DLAA, and Frame Generation more consistent GPU time. It can be disabled in the addon's ReShade settings, and that choice persists across restarts. If this experimental pacing causes a regression, install the [prior stable release, v2.0.6](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/tag/v2.0.6).
 
