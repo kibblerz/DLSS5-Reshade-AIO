@@ -34,7 +34,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.6-two-pass-nr-prototype1"
+#define ADDON_VERSION "2.0.6-two-pass-nr-prototype2"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -166,13 +166,11 @@ static unsigned int g_source_fps_sample_frames;
 static ULONGLONG g_output_fps_sample_start;
 static unsigned int g_output_fps_sample_frames;
 static bool g_performance_telemetry_enabled = true;
-static constexpr UINT kTelemetryQueryCount = 7;
+static constexpr UINT kTelemetryQueryCount = 6;
 static UINT64 g_telemetry_timestamp_frequency;
 static std::atomic<bool> g_gpu_telemetry_available{false};
 static std::atomic<unsigned int> g_gpu_prep_us{0};
 static std::atomic<unsigned int> g_gpu_nr_us{0};
-static std::atomic<unsigned int> g_gpu_nr_first_us{0};
-static std::atomic<unsigned int> g_gpu_nr_second_us{0};
 static std::atomic<unsigned int> g_gpu_sr_us{0};
 static std::atomic<unsigned int> g_gpu_fg_us{0};
 static std::atomic<unsigned int> g_gpu_cleanup_us{0};
@@ -1504,8 +1502,7 @@ static void RecordPeakMicroseconds(std::atomic<unsigned int> &destination, unsig
 
 static void ResetPerformanceTelemetry()
 {
-    g_gpu_prep_us = 0; g_gpu_nr_us = 0;
-    g_gpu_nr_first_us = 0; g_gpu_nr_second_us = 0; g_gpu_sr_us = 0;
+    g_gpu_prep_us = 0; g_gpu_nr_us = 0; g_gpu_sr_us = 0;
     g_gpu_fg_us = 0; g_gpu_cleanup_us = 0; g_gpu_total_us = 0;
     g_source_frame_avg_us = 0; g_source_frame_p99_us = 0; g_source_frame_max_us = 0;
     g_addon_cpu_current_us = 0; g_addon_cpu_avg_us = 0; g_addon_cpu_peak_us = 0;
@@ -1613,14 +1610,12 @@ static void ConsumeGpuTelemetry(PipelineFrameSlot &slot)
     slot.telemetry_pending = false;
 
     SmoothMicroseconds(g_gpu_prep_us, TimestampDeltaMicroseconds(values[0], values[1]));
-    SmoothMicroseconds(g_gpu_nr_first_us, TimestampDeltaMicroseconds(values[1], values[2]));
-    SmoothMicroseconds(g_gpu_nr_second_us, TimestampDeltaMicroseconds(values[2], values[3]));
-    SmoothMicroseconds(g_gpu_nr_us, TimestampDeltaMicroseconds(values[1], values[3]));
-    SmoothMicroseconds(g_gpu_sr_us, TimestampDeltaMicroseconds(values[3], values[4]));
+    SmoothMicroseconds(g_gpu_nr_us, TimestampDeltaMicroseconds(values[1], values[2]));
+    SmoothMicroseconds(g_gpu_sr_us, TimestampDeltaMicroseconds(values[2], values[3]));
     if (!slot.fg_split_submission)
-        SmoothMicroseconds(g_gpu_fg_us, TimestampDeltaMicroseconds(values[4], values[5]));
-    SmoothMicroseconds(g_gpu_cleanup_us, TimestampDeltaMicroseconds(values[5], values[6]));
-    SmoothMicroseconds(g_gpu_total_us, TimestampDeltaMicroseconds(values[0], values[6]));
+        SmoothMicroseconds(g_gpu_fg_us, TimestampDeltaMicroseconds(values[3], values[4]));
+    SmoothMicroseconds(g_gpu_cleanup_us, TimestampDeltaMicroseconds(values[4], values[5]));
+    SmoothMicroseconds(g_gpu_total_us, TimestampDeltaMicroseconds(values[0], values[5]));
     ++g_telemetry_samples;
     g_gpu_telemetry_available = true;
 }
@@ -5329,7 +5324,6 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
             return false;
         }
     }
-    timestamp(2);
     ID3D12Resource *sr_color = packed_color;
     bool second_nr_succeeded = false;
     if (evaluate_nr)
@@ -5371,7 +5365,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
             }
         }
     }
-    timestamp(3);
+    timestamp(2);
     // Keep motion-guided NR, but do not let generic optical-flow errors persist
     // through DLSS SR's temporal accumulator in the stable mode.
     ID3D12Resource *sr_motion = g_stable_sr_history ? g_fallback_motion.Get() : motion;
@@ -5386,7 +5380,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
         Fail("on-present DLSS SR evaluation exception", exception);
         return false;
     }
-    timestamp(4);
+    timestamp(3);
     NVSDK_NGX_Result fg_result = static_cast<NVSDK_NGX_Result>(0xBAD00004);
     bool evaluate_fg = EffectiveFramegenEnabled() && !g_framegen_failed && g_fg_feature &&
         NVSDK_NGX_SUCCEED(nr_result) && NVSDK_NGX_SUCCEED(sr_result);
@@ -5425,7 +5419,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
             return false;
         }
     }
-    timestamp(5);
+    timestamp(4);
 
     D3D12_RESOURCE_BARRIER restore[12] = {};
     UINT restore_count = 0;
@@ -5492,7 +5486,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
         commands->ResourceBarrier(1, &input_to_common);
     }
-    timestamp(6);
+    timestamp(5);
     if (record_gpu_telemetry)
         commands->ResolveQueryData(pipeline_slot.telemetry_query_heap.Get(),
             D3D12_QUERY_TYPE_TIMESTAMP, 0, kTelemetryQueryCount,
@@ -7495,13 +7489,12 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
         (g_last_telemetry_log_tick == 0 || now - g_last_telemetry_log_tick >= 5000))
     {
         g_last_telemetry_log_tick = now;
-        Log("performance telemetry: source=%u fps avg=%.3fms p99=%.3fms max=%.3fms; proxy=%u fps; addon CPU current=%.3fms avg=%.3fms peak=%.3fms; GPU prep=%.3fms NR=%.3fms (pass1=%.3fms pass2=%.3fms) %s=%.3fms FG=%.3fms cleanup=%.3fms total=%.3fms; skips neural=%llu proxy=%llu; async coalesced=%llu timeouts=%llu",
+        Log("performance telemetry: source=%u fps avg=%.3fms p99=%.3fms max=%.3fms; proxy=%u fps; addon CPU current=%.3fms avg=%.3fms peak=%.3fms; GPU prep=%.3fms NR=%.3fms %s=%.3fms FG=%.3fms cleanup=%.3fms total=%.3fms; skips neural=%llu proxy=%llu; async coalesced=%llu timeouts=%llu",
             g_source_fps.load(), g_source_frame_avg_us.load() / 1000.0f,
             g_source_frame_p99_us.load() / 1000.0f, g_source_frame_max_us.load() / 1000.0f,
             g_proxy_fps.load(), g_addon_cpu_current_us.load() / 1000.0f,
             g_addon_cpu_avg_us.load() / 1000.0f, g_addon_cpu_peak_us.load() / 1000.0f,
             g_gpu_prep_us.load() / 1000.0f, g_gpu_nr_us.load() / 1000.0f,
-            g_gpu_nr_first_us.load() / 1000.0f, g_gpu_nr_second_us.load() / 1000.0f,
             SrModeName(), g_gpu_sr_us.load() / 1000.0f, g_gpu_fg_us.load() / 1000.0f,
             g_gpu_cleanup_us.load() / 1000.0f, g_gpu_total_us.load() / 1000.0f,
             g_neural_busy_frame_skips.load(), g_proxy_busy_frame_skips.load(),
@@ -10243,8 +10236,6 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::TextDisabled("Off skips NR evaluation; DLSS Super Resolution and optional Frame Generation remain active.");
     if (ImGui::Checkbox("Enable second NR pass (experimental)", &g_nr_second_pass_enabled))
     {
-        reshade::set_config_value(nullptr, section, "SecondNrPass",
-            g_nr_second_pass_enabled ? "1" : "0");
         g_nr_second_pass_failed = false;
         g_nr_second_frames = 0;
         g_need_history_reset = true;
@@ -10255,7 +10246,8 @@ static void DrawOverlay(reshade::api::effect_runtime *)
             g_nr_second_pass_enabled ? "enabled" : "disabled",
             g_neural_ready && g_nr_enabled ? "queued" : "not required yet");
     }
-    ImGui::TextDisabled("Manual opt-in only. Runs a separate NR feature over pass one before DLSS and can roughly double NR cost.");
+    ImGui::TextDisabled("Session-only manual opt-in. Always starts off after relaunch so a bad two-pass test cannot persist.");
+    ImGui::TextDisabled("Runs a separate NR feature over pass one before DLSS and can roughly double NR cost.");
     if (g_nr_second_pass_enabled)
         ImGui::TextDisabled("Second pass: %s; completed evaluations: %llu",
             g_nr_second_pass_failed ? "failed - pass-one fallback active" :
@@ -10470,9 +10462,8 @@ static void DrawOverlay(reshade::api::effect_runtime *)
             g_addon_cpu_peak_us.load() / 1000.0f);
         if (g_gpu_telemetry_available.load())
         {
-            ImGui::Text("Pipeline GPU: prep/copy %.3f | NR %.3f (P1 %.3f, P2 %.3f) | %s %.3f | FG %.3f | cleanup %.3f ms",
+            ImGui::Text("Pipeline GPU: prep/copy %.3f | NR %.3f | %s %.3f | FG %.3f | cleanup %.3f ms",
                 g_gpu_prep_us.load() / 1000.0f, g_gpu_nr_us.load() / 1000.0f,
-                g_gpu_nr_first_us.load() / 1000.0f, g_gpu_nr_second_us.load() / 1000.0f,
                 SrModeName(), g_gpu_sr_us.load() / 1000.0f, g_gpu_fg_us.load() / 1000.0f,
                 g_gpu_cleanup_us.load() / 1000.0f);
             ImGui::Text("Pipeline GPU total: %.3f ms (%llu samples)",
@@ -10627,7 +10618,6 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("StableSrHistory", "0", value, sizeof(value)); g_stable_sr_history = strcmp(value, "0") != 0;
         read_setting("VortGuides", "0", value, sizeof(value)); g_vort_guides_enabled = strcmp(value, "0") != 0;
         read_setting("NeuralRendering", "1", value, sizeof(value)); g_nr_enabled = strcmp(value, "0") != 0;
-        read_setting("SecondNrPass", "0", value, sizeof(value)); g_nr_second_pass_enabled = strcmp(value, "0") != 0;
         read_setting("AsyncComputePipeline", "1", value, sizeof(value)); g_async_compute_requested = strcmp(value, "0") != 0;
         read_setting("FrameGeneration", "1", value, sizeof(value)); g_framegen_enabled = strcmp(value, "0") != 0;
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
