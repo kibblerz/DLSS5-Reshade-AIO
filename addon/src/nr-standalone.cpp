@@ -34,7 +34,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.9-source-override-prototype"
+#define ADDON_VERSION "2.0.9-source-override-dpi-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -8667,7 +8667,9 @@ static DWORD WINAPI ProxyWindowThread(void *)
         const DWORD window_style = WS_POPUP | (g_proxy_window_start_hidden ? 0 : WS_VISIBLE);
         g_proxy_window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             wc.lpszClassName, L"Standalone DLSS-NR Native Output", window_style,
-            info.rcMonitor.left, info.rcMonitor.top, g_output_width.load(), g_output_height.load(),
+            info.rcMonitor.left, info.rcMonitor.top,
+            info.rcMonitor.right - info.rcMonitor.left,
+            info.rcMonitor.bottom - info.rcMonitor.top,
             nullptr, nullptr, g_self, nullptr);
     }
     if (g_proxy_window) SetTimer(g_proxy_window, 1, 500, nullptr);
@@ -11055,11 +11057,29 @@ static void OnInitSwapchain(reshade::api::swapchain *swapchain, bool)
     g_game_window = hwnd;
     g_input_width = width;
     g_input_height = height;
-    MONITORINFO info = {sizeof(info)};
+    MONITORINFOEXW info = {};
+    info.cbSize = sizeof(info);
     if (hwnd != nullptr && GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &info))
     {
-        g_output_width = static_cast<unsigned int>(info.rcMonitor.right - info.rcMonitor.left);
-        g_output_height = static_cast<unsigned int>(info.rcMonitor.bottom - info.rcMonitor.top);
+        const UINT logical_width = static_cast<unsigned int>(
+            std::max<LONG>(1, info.rcMonitor.right - info.rcMonitor.left));
+        const UINT logical_height = static_cast<unsigned int>(
+            std::max<LONG>(1, info.rcMonitor.bottom - info.rcMonitor.top));
+        UINT physical_width = logical_width;
+        UINT physical_height = logical_height;
+        DEVMODEW display_mode = {};
+        display_mode.dmSize = sizeof(display_mode);
+        if (EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &display_mode) &&
+            display_mode.dmPelsWidth != 0 && display_mode.dmPelsHeight != 0)
+        {
+            physical_width = display_mode.dmPelsWidth;
+            physical_height = display_mode.dmPelsHeight;
+        }
+        g_output_width = physical_width;
+        g_output_height = physical_height;
+        if (physical_width != logical_width || physical_height != logical_height)
+            Log("DPI-virtualized monitor corrected: logical=%ux%u physical=%ux%u device=%ls",
+                logical_width, logical_height, physical_width, physical_height, info.szDevice);
         if (g_proxy_window != nullptr)
             PostMessageW(g_proxy_window, kProxyResizeToMonitorMessage, 0, 0);
     }
