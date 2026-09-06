@@ -34,7 +34,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.6"
+#define ADDON_VERSION "2.0.7-adaptive-governor-prototype1"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -161,6 +161,22 @@ static std::array<unsigned int, kQueuePressureRecommendationSamples>
     g_queue_pressure_recommendation_samples = {};
 static size_t g_queue_pressure_recommendation_sample_count;
 static size_t g_queue_pressure_recommendation_sample_index;
+// Session-only prototype. The governor deliberately does not persist: a bad
+// per-game pacing interaction must disappear on the next process launch.
+static bool g_adaptive_governor_enabled = true;
+static std::atomic<bool> g_adaptive_governor_active{false};
+static std::atomic<unsigned int> g_adaptive_governor_target_fps{0};
+static std::atomic<unsigned int> g_adaptive_governor_wait_us{0};
+static std::atomic<unsigned long long> g_adaptive_governor_waits{0};
+static HANDLE g_adaptive_governor_timer;
+static LONGLONG g_adaptive_governor_qpc_frequency;
+static LONGLONG g_adaptive_governor_next_present_qpc;
+static ULONGLONG g_adaptive_governor_valid_since_tick;
+static ULONGLONG g_adaptive_governor_pressure_ms;
+static ULONGLONG g_adaptive_governor_healthy_ms;
+static UINT g_adaptive_governor_contract_width;
+static UINT g_adaptive_governor_contract_height;
+static bool g_adaptive_governor_context_was_valid;
 static ULONGLONG g_source_fps_sample_start;
 static unsigned int g_source_fps_sample_frames;
 static ULONGLONG g_output_fps_sample_start;
@@ -1534,6 +1550,8 @@ static void ResetPerformanceTelemetry()
     g_async_fg_completed_in_time = 0; g_async_fg_phase_waits = 0;
     g_async_fg_common_phase_deferrals = 0;
     g_async_fg_common_phase_logged = false;
+    g_adaptive_governor_wait_us = 0;
+    g_adaptive_governor_waits = 0;
     g_telemetry_samples = 0;
     g_guide_telemetry_samples = 0; g_proxy_telemetry_samples = 0;
     g_gpu_telemetry_available = false; g_guide_gpu_telemetry_available = false;
@@ -7220,6 +7238,270 @@ static unsigned int ConservativeQueueFrameCap(unsigned int observed_ceiling)
     return std::max(10u, ((observed_ceiling - 1) / 10) * 10);
 }
 
+static bool AdaptiveGovernorContextValid(bool primary_foreground)
+{
+    return g_adaptive_governor_enabled && primary_foreground && g_enabled &&
+        !g_neural_failed && g_neural_ready && g_show_neural_output &&
+        !g_reshade_overlay_open.load(std::memory_order_acquire) &&
+        !g_proxy_overlay_open.load(std::memory_order_acquire) &&
+        !g_proxy_overlay_preview.load(std::memory_order_acquire) &&
+        !g_proxy_hidden.load(std::memory_order_acquire) &&
+        !g_proxy_transition_hold.load(std::memory_order_acquire) &&
+        !g_feature_recreate_requested.load(std::memory_order_acquire);
+}
+
+static unsigned int AdaptiveGovernorMaximumRealFps()
+{
+    const unsigned int refresh = g_proxy_refresh_hz >= 24 ?
+        g_proxy_refresh_hz : 120;
+    // FG presents one generated and one real output. There is no benefit in
+    // asking the game for more real frames than half the display cadence.
+    return EffectiveFramegenEnabled() && !g_framegen_failed ?
+        std::max(20u, refresh / 2) : std::max(30u, refresh);
+}
+
+static unsigned int AdaptiveGovernorCapacityTarget(
+    unsigned int measured_processed_fps)
+{
+    unsigned int capacity = measured_processed_fps;
+    const unsigned int gpu_total_us = g_gpu_total_us.load(std::memory_order_relaxed);
+    if (gpu_total_us >= 1000)
+        capacity = std::max(capacity, static_cast<unsigned int>(
+            std::min<unsigned long long>(240, 1000000ULL / gpu_total_us)));
+    capacity = std::clamp(capacity, 20u, AdaptiveGovernorMaximumRealFps());
+    // Five-FPS steps avoid reacting to measurement noise while allowing the
+    // controller to walk toward recovered capacity after contention falls.
+    return std::max(20u, std::min(AdaptiveGovernorMaximumRealFps(),
+        ((capacity + 2) / 5) * 5));
+}
+
+static void SuspendAdaptiveGovernor(const char *reason)
+{
+    const bool was_active = g_adaptive_governor_active.exchange(
+        false, std::memory_order_acq_rel);
+    const unsigned int prior_target = g_adaptive_governor_target_fps.exchange(
+        0, std::memory_order_acq_rel);
+    g_adaptive_governor_next_present_qpc = 0;
+    g_adaptive_governor_pressure_ms = 0;
+    g_adaptive_governor_healthy_ms = 0;
+    if (was_active)
+        Log("adaptive pressure governor suspended at %u FPS: %s",
+            prior_target, reason);
+}
+
+static void UpdateAdaptiveGovernorSample(
+    ULONGLONG now,
+    bool context_valid,
+    ULONGLONG elapsed,
+    unsigned long long source_delta,
+    unsigned long long processed_delta,
+    bool overloaded)
+{
+    static constexpr ULONGLONG kStartupGraceMs = 5000;
+    static constexpr ULONGLONG kActivationPressureMs = 3000;
+    static constexpr ULONGLONG kReductionPressureMs = 2000;
+    static constexpr ULONGLONG kRecoveryStepMs = 4000;
+
+    if (!context_valid)
+    {
+        g_adaptive_governor_context_was_valid = false;
+        g_adaptive_governor_valid_since_tick = 0;
+        SuspendAdaptiveGovernor("pipeline transition, overlay, bypass, or focus loss");
+        return;
+    }
+    if (!g_adaptive_governor_context_was_valid)
+    {
+        g_adaptive_governor_context_was_valid = true;
+        g_adaptive_governor_valid_since_tick = now;
+        g_adaptive_governor_pressure_ms = 0;
+        g_adaptive_governor_healthy_ms = 0;
+        return;
+    }
+    if (g_adaptive_governor_valid_since_tick == 0)
+        g_adaptive_governor_valid_since_tick = now;
+    if (now - g_adaptive_governor_valid_since_tick < kStartupGraceMs)
+        return;
+
+    const unsigned int source_fps = static_cast<unsigned int>(
+        std::clamp<unsigned long long>(source_delta * 1000ULL / elapsed, 1, 999));
+    const unsigned int processed_fps = static_cast<unsigned int>(
+        std::clamp<unsigned long long>(processed_delta * 1000ULL / elapsed, 1, 999));
+    const unsigned long long discarded_delta = source_delta > processed_delta ?
+        source_delta - processed_delta : 0;
+    const bool active = g_adaptive_governor_active.load(std::memory_order_acquire);
+
+    if (!active)
+    {
+        if (!overloaded)
+        {
+            g_adaptive_governor_pressure_ms = 0;
+            return;
+        }
+        g_adaptive_governor_pressure_ms += elapsed;
+        if (g_adaptive_governor_pressure_ms < kActivationPressureMs)
+            return;
+
+        const unsigned int target = AdaptiveGovernorCapacityTarget(processed_fps);
+        g_adaptive_governor_target_fps.store(target, std::memory_order_release);
+        g_adaptive_governor_active.store(true, std::memory_order_release);
+        g_adaptive_governor_next_present_qpc = 0;
+        g_adaptive_governor_pressure_ms = 0;
+        g_adaptive_governor_healthy_ms = 0;
+        Log("adaptive pressure governor ACTIVE: source=%u processed=%u target=%u FPS GPU_pipeline=%.3fms display_limit=%u real FPS",
+            source_fps, processed_fps, target,
+            g_gpu_total_us.load(std::memory_order_relaxed) / 1000.0f,
+            AdaptiveGovernorMaximumRealFps());
+        return;
+    }
+
+    unsigned int target = g_adaptive_governor_target_fps.load(
+        std::memory_order_acquire);
+    if (overloaded)
+    {
+        g_adaptive_governor_healthy_ms = 0;
+        g_adaptive_governor_pressure_ms += elapsed;
+        if (g_adaptive_governor_pressure_ms < kReductionPressureMs)
+            return;
+        const unsigned int measured_target =
+            AdaptiveGovernorCapacityTarget(processed_fps);
+        unsigned int reduced = std::min(target, measured_target);
+        // If the governor is already controlling source cadence and frames are
+        // still being discarded, leave another five-FPS GPU margin.
+        if (source_fps <= target + 5 && reduced >= target)
+            reduced = target > 20 ? target - 5 : 20;
+        reduced = std::max(20u, reduced);
+        if (reduced < target)
+        {
+            g_adaptive_governor_target_fps.store(reduced, std::memory_order_release);
+            g_adaptive_governor_next_present_qpc = 0;
+            Log("adaptive pressure governor reduced: source=%u processed=%u discarded=%llu target=%u->%u FPS",
+                source_fps, processed_fps, discarded_delta, target, reduced);
+        }
+        g_adaptive_governor_pressure_ms = 0;
+        return;
+    }
+
+    g_adaptive_governor_pressure_ms = 0;
+    const unsigned long long healthy_allowance = std::max<unsigned long long>(
+        2, source_delta / 10);
+    if (processed_delta == 0 || discarded_delta > healthy_allowance ||
+        source_fps + 3 < target)
+    {
+        g_adaptive_governor_healthy_ms = 0;
+        return;
+    }
+
+    g_adaptive_governor_healthy_ms += elapsed;
+    const unsigned int maximum = AdaptiveGovernorMaximumRealFps();
+    if (g_adaptive_governor_healthy_ms >= kRecoveryStepMs && target < maximum)
+    {
+        const unsigned int raised = std::min(maximum, target + 5);
+        g_adaptive_governor_target_fps.store(raised, std::memory_order_release);
+        g_adaptive_governor_next_present_qpc = 0;
+        g_adaptive_governor_healthy_ms = 0;
+        Log("adaptive pressure governor recovery probe: healthy source=%u processed=%u target=%u->%u FPS",
+            source_fps, processed_fps, target, raised);
+    }
+}
+
+static void ApplyAdaptiveGovernorPacing()
+{
+    const ULONGLONG now_tick = GetTickCount64();
+    const bool primary_foreground = IsGameProcessForeground(GetForegroundWindow());
+    const bool context_valid = AdaptiveGovernorContextValid(primary_foreground);
+    const UINT contract_width = g_resource_input_width;
+    const UINT contract_height = g_resource_input_height;
+    if (!context_valid)
+    {
+        if (g_adaptive_governor_active.load(std::memory_order_acquire))
+            SuspendAdaptiveGovernor("runtime context became unsafe");
+        g_adaptive_governor_context_was_valid = false;
+        g_adaptive_governor_valid_since_tick = 0;
+        g_adaptive_governor_next_present_qpc = 0;
+        return;
+    }
+    if (contract_width != g_adaptive_governor_contract_width ||
+        contract_height != g_adaptive_governor_contract_height)
+    {
+        g_adaptive_governor_contract_width = contract_width;
+        g_adaptive_governor_contract_height = contract_height;
+        g_adaptive_governor_context_was_valid = true;
+        g_adaptive_governor_valid_since_tick = now_tick;
+        SuspendAdaptiveGovernor("render contract changed");
+        return;
+    }
+    if (!g_adaptive_governor_active.load(std::memory_order_acquire))
+        return;
+
+    const unsigned int target = g_adaptive_governor_target_fps.load(
+        std::memory_order_acquire);
+    if (target < 10) return;
+    if (g_adaptive_governor_qpc_frequency <= 0)
+    {
+        LARGE_INTEGER frequency = {};
+        if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0)
+        {
+            SuspendAdaptiveGovernor("high-resolution clock unavailable");
+            return;
+        }
+        g_adaptive_governor_qpc_frequency = frequency.QuadPart;
+    }
+    if (g_adaptive_governor_timer == nullptr)
+    {
+        g_adaptive_governor_timer = CreateWaitableTimerExW(nullptr, nullptr,
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        if (g_adaptive_governor_timer == nullptr)
+            g_adaptive_governor_timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+        if (g_adaptive_governor_timer == nullptr)
+        {
+            SuspendAdaptiveGovernor("waitable timer unavailable");
+            return;
+        }
+    }
+
+    LARGE_INTEGER now = {};
+    QueryPerformanceCounter(&now);
+    const LONGLONG interval = std::max<LONGLONG>(1,
+        (g_adaptive_governor_qpc_frequency + target / 2) / target);
+    if (g_adaptive_governor_next_present_qpc == 0 ||
+        now.QuadPart - g_adaptive_governor_next_present_qpc > interval)
+    {
+        // First frame and genuine hitches reanchor instead of causing a burst
+        // of immediate Presents in an attempt to catch up.
+        g_adaptive_governor_next_present_qpc = now.QuadPart + interval;
+        return;
+    }
+
+    const LONGLONG remaining = g_adaptive_governor_next_present_qpc - now.QuadPart;
+    if (remaining > 0)
+    {
+        const unsigned long long relative_100ns = std::max<unsigned long long>(1,
+            (static_cast<unsigned long long>(remaining) * 10000000ULL +
+                static_cast<unsigned long long>(g_adaptive_governor_qpc_frequency) - 1) /
+                static_cast<unsigned long long>(g_adaptive_governor_qpc_frequency));
+        LARGE_INTEGER due = {};
+        due.QuadPart = -static_cast<LONGLONG>(relative_100ns);
+        if (SetWaitableTimer(g_adaptive_governor_timer, &due, 0,
+                nullptr, nullptr, FALSE))
+        {
+            const DWORD timeout_ms = static_cast<DWORD>(
+                std::min<unsigned long long>(100, relative_100ns / 10000 + 5));
+            if (WaitForSingleObject(g_adaptive_governor_timer, timeout_ms) == WAIT_OBJECT_0)
+            {
+                LARGE_INTEGER finished = {};
+                QueryPerformanceCounter(&finished);
+                SmoothMicroseconds(g_adaptive_governor_wait_us,
+                    CounterDeltaMicroseconds(now, finished));
+                ++g_adaptive_governor_waits;
+                now = finished;
+            }
+        }
+    }
+    g_adaptive_governor_next_present_qpc += interval;
+    if (now.QuadPart >= g_adaptive_governor_next_present_qpc)
+        g_adaptive_governor_next_present_qpc = now.QuadPart + interval;
+}
+
 static void UpdateQueuePressureMonitor(ULONGLONG now, bool primary_foreground)
 {
     static constexpr ULONGLONG kSampleIntervalMs = 1000;
@@ -7261,6 +7543,8 @@ static void UpdateQueuePressureMonitor(ULONGLONG now, bool primary_foreground)
 
     if (!g_enabled || g_neural_failed)
     {
+        UpdateAdaptiveGovernorSample(now, false, elapsed,
+            source_delta, processed_delta, false);
         ResetQueuePressureObservation(true);
         return;
     }
@@ -7272,6 +7556,8 @@ static void UpdateQueuePressureMonitor(ULONGLONG now, bool primary_foreground)
         g_proxy_hidden.load() || g_proxy_transition_hold.load() ||
         g_feature_recreate_requested.load())
     {
+        UpdateAdaptiveGovernorSample(now, false, elapsed,
+            source_delta, processed_delta, false);
         g_queue_pressure_overload_ms = 0;
         g_queue_pressure_healthy_ms = 0;
         g_queue_pressure_minimum_source_fps = UINT_MAX;
@@ -7291,6 +7577,8 @@ static void UpdateQueuePressureMonitor(ULONGLONG now, bool primary_foreground)
     // ordinary asynchronous one-frame latency and normal FPS jitter.
     const bool overloaded = processed_delta != 0 && source_delta >= 10 &&
         discarded_delta >= 3 && discarded_delta * 5 >= source_delta;
+    UpdateAdaptiveGovernorSample(now, true, elapsed,
+        source_delta, processed_delta, overloaded);
     if (overloaded)
     {
         g_queue_pressure_healthy_ms = 0;
@@ -7563,6 +7851,14 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
             g_async_fg_completed_in_time.load(), g_async_fg_busy_bypasses.load(),
             g_async_fg_deadline_drops.load(),
             g_gpu_fg_us.load() / 1000.0f, g_gpu_total_us.load() / 1000.0f);
+        Log("performance adaptive governor: enabled=%u active=%u target=%u real_FPS pacing_wait=%.3fms waits=%llu pressure=%llums healthy=%llums",
+            g_adaptive_governor_enabled ? 1u : 0u,
+            g_adaptive_governor_active.load() ? 1u : 0u,
+            g_adaptive_governor_target_fps.load(),
+            g_adaptive_governor_wait_us.load() / 1000.0f,
+            g_adaptive_governor_waits.load(),
+            g_adaptive_governor_pressure_ms,
+            g_adaptive_governor_healthy_ms);
         if (g_windowed_virtualization_active.load() || DetachedPresentationEnabled())
             Log("presentation compatibility: host=%s window_virtualization=%s logical_client=%s input_coordinates=%s render=%ux%u output=%ux%u resolution_intents=%llu WM_SIZE=%llu client_queries=%llu coordinate_APIs=%llu mouse_messages=%llu cursor_queries=%llu cursor_warps=%llu cursor_clips=%llu resize_pins=%llu",
                 DetachedPresentationEnabled() ? "detached" : "attached",
@@ -7594,6 +7890,11 @@ struct PresentCpuTelemetryScope
 struct SharedPerformanceTelemetryScope
 {
     ~SharedPerformanceTelemetryScope() { UpdateSharedPerformanceTelemetry(); }
+};
+
+struct AdaptiveGovernorPresentScope
+{
+    ~AdaptiveGovernorPresentScope() { ApplyAdaptiveGovernorPacing(); }
 };
 
 static DWORD WINAPI ProxyWindowThread(void *)
@@ -9362,6 +9663,9 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     // Declare this before the CPU timer so reverse destruction order publishes
     // the just-completed CPU measurement rather than the previous frame's.
     SharedPerformanceTelemetryScope shared_telemetry;
+    // Run after addon work has been submitted, but exclude intentional pacing
+    // sleep from the addon's CPU-overhead metric.
+    AdaptiveGovernorPresentScope adaptive_governor_pacing;
     PresentCpuTelemetryScope cpu_telemetry;
     const ULONGLONG present_tick = GetTickCount64();
     g_last_primary_present_tick = present_tick;
@@ -10355,6 +10659,25 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         reshade::set_config_value(nullptr, section, "CompositeReshade", g_composite_reshade_output ? "1" : "0");
     if (ImGui::Checkbox("Show native output FPS counter", &g_show_proxy_fps))
         reshade::set_config_value(nullptr, section, "ShowProxyFps", g_show_proxy_fps ? "1" : "0");
+    bool adaptive_governor = g_adaptive_governor_enabled;
+    if (ImGui::Checkbox("Adaptive GPU pressure governor (prototype)", &adaptive_governor))
+    {
+        g_adaptive_governor_enabled = adaptive_governor;
+        g_adaptive_governor_context_was_valid = false;
+        g_adaptive_governor_valid_since_tick = 0;
+        SuspendAdaptiveGovernor(adaptive_governor ?
+            "user requested a fresh learning window" : "disabled by user");
+        Log("adaptive pressure governor %s; session-only setting",
+            adaptive_governor ? "enabled" : "disabled");
+    }
+    ImGui::TextDisabled("Session-only and enabled for this prototype. It limits game Presents only after sustained pipeline starvation.");
+    if (g_adaptive_governor_active.load(std::memory_order_acquire))
+        ImGui::Text("Governor active: %u real FPS | pacing wait %.3f ms | waits %llu",
+            g_adaptive_governor_target_fps.load(std::memory_order_acquire),
+            g_adaptive_governor_wait_us.load(std::memory_order_acquire) / 1000.0f,
+            g_adaptive_governor_waits.load(std::memory_order_acquire));
+    else
+        ImGui::TextDisabled("Governor inactive: observing source and completed reconstruction cadence.");
     bool suppress_queue_warning = g_suppress_queue_pressure_warning.load(std::memory_order_acquire);
     if (ImGui::Checkbox("Hide queue-full performance warning", &suppress_queue_warning))
     {
@@ -10714,8 +11037,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         if (g_proxy_present_event) CloseHandle(g_proxy_present_event);
         if (g_proxy_present_stop_event) CloseHandle(g_proxy_present_stop_event);
         if (g_proxy_pacing_timer) CloseHandle(g_proxy_pacing_timer);
+        if (g_adaptive_governor_timer) CloseHandle(g_adaptive_governor_timer);
         if (g_proxy_fence_event) CloseHandle(g_proxy_fence_event);
         g_proxy_pacing_timer = nullptr;
+        g_adaptive_governor_timer = nullptr;
         g_proxy_pipeline.Reset(); g_proxy_root_signature.Reset(); g_proxy_srv_heap.Reset(); g_proxy_rtv_heap.Reset();
         for (UINT index = 0; index < kProxyCommandSlotCount; ++index)
         {
