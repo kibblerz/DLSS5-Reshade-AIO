@@ -34,7 +34,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.9-source-override-resolution-header-prototype"
+#define ADDON_VERSION "2.0.9-source-override-help-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -11533,6 +11533,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::TextDisabled("Use a manual profile only when a game reports its output color space incorrectly.");
 
     const SourceResolutionChoice &selected_source = RequestedSourceResolution();
+    ImGui::TextWrapped("Use this if the detected game source resolution is incorrect, or to downsample a higher-resolution game frame before Neural Rendering for better performance without lowering the game's own resolution.");
     if (ImGui::BeginCombo("Pipeline source resolution override", selected_source.label))
     {
         for (int index = 0;
@@ -11566,7 +11567,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     if (g_source_resolution_override_rejected &&
         selected_source.width != 0 && selected_source.height != 0)
         ImGui::TextWrapped("The selected size is larger than the game backbuffer or has a different aspect ratio, so the addon is using the game resolution instead.");
-    ImGui::TextWrapped("Optional. Downsamples the captured game frame before Neural Rendering, reducing NR expense when a game cannot expose a lower-resolution backbuffer. Choose a size matching the monitor aspect ratio. The game window and final output size are not changed.");
+    ImGui::TextWrapped("Choose a size matching the monitor aspect ratio. The addon downsamples only the captured frame sent into NR; the game window and final native output size are not changed.");
     if (g_vort_guides_enabled && SourceResolutionOverrideActive())
         ImGui::TextDisabled("VORT guides are bypassed while source downsampling is active; guide resampling is not yet validated.");
 
