@@ -34,7 +34,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.5-queue-pressure-warning-prototype7"
+#define ADDON_VERSION "2.0.5-queue-pressure-warning-prototype8"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -139,8 +139,7 @@ static unsigned long long g_last_logged_mouse_event;
 static bool g_show_proxy_fps = true;
 static std::atomic<unsigned int> g_proxy_fps{0};
 static std::atomic<unsigned int> g_source_fps{0};
-static constexpr size_t kPipelineNoticeTextLength = 56;
-static constexpr size_t kPipelineNoticePackedWords = 16;
+static constexpr size_t kPipelineNoticeTextLength = 40;
 static constexpr ULONGLONG kPipelineNoticeDurationMs = 3000;
 static std::array<std::atomic<UINT>, kPipelineNoticeTextLength> g_pipeline_notice_text = {};
 static std::atomic<UINT> g_pipeline_notice_length{0};
@@ -7665,8 +7664,7 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
     root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     root_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     root_parameters[1].Constants.ShaderRegister = 0;
-    root_parameters[1].Constants.Num32BitValues =
-        static_cast<UINT>(12 + kPipelineNoticePackedWords);
+    root_parameters[1].Constants.Num32BitValues = 52;
     root_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_STATIC_SAMPLER_DESC sampler = {};
     // Native neural output remains a 1:1 sample. The same sampler also gives
@@ -7682,10 +7680,10 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
     if (SUCCEEDED(hr)) { failed_stage = "CreateRootSignature"; hr = device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&g_proxy_root_signature)); }
     static const char *shader_source =
         "Texture2D<float3> Neural:register(t0); Texture2D<float3> Original:register(t1); Texture2D<float3> Post:register(t2);"
-        "SamplerState Samp:register(s0); cbuffer C:register(b0){uint Mode;uint Fps;uint ShowFps;float Threshold;float2 CursorInput;float2 PreviousCursorInput;uint NoticeVisible;uint NoticeLength;uint2 NoticePadding;uint4 NoticeText[4];}"
+        "SamplerState Samp:register(s0); cbuffer C:register(b0){uint Mode;uint Fps;uint ShowFps;float Threshold;float2 CursorInput;float2 PreviousCursorInput;uint NoticeVisible;uint NoticeLength;uint2 NoticePadding;uint4 NoticeText[10];}"
         "struct O{float4 p:SV_Position;float2 uv:TEXCOORD0;};"
         "O VS(uint id:SV_VertexID){O o; float2 p=float2((id<<1)&2,id&2); o.uv=p; o.p=float4(p*float2(2,-2)+float2(-1,1),0,1); return o;}"
-        "uint GlyphRow(uint c,uint y){static const uint r[273]={"
+        "uint GlyphRow(uint c,uint y){static const uint r[266]={"
         "14,17,17,17,17,17,14,4,12,4,4,4,4,14,14,17,1,2,4,8,31,30,1,1,14,1,1,30,"
         "2,6,10,18,31,2,2,31,16,16,30,1,1,30,14,16,16,30,17,17,14,31,1,2,4,8,8,8,"
         "14,17,17,14,17,17,14,14,17,17,15,1,1,14,"
@@ -7695,15 +7693,15 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
         "17,27,21,21,17,17,17,17,25,21,19,17,17,17,14,17,17,17,17,17,14,30,17,17,30,16,16,16,"
         "14,17,17,17,21,18,13,30,17,17,30,20,18,17,15,16,16,14,1,1,30,31,4,4,4,4,4,4,"
         "17,17,17,17,17,17,14,17,17,17,17,17,10,4,17,17,17,21,21,21,10,17,17,10,4,10,17,17,"
-        "17,17,10,4,4,4,4,31,1,2,4,8,16,31,2,4,8,8,8,4,2,8,4,2,2,2,4,8,0,4,4,0,4,4,0};"
-        "uint i=999;if(c>=48&&c<=57)i=c-48;else if(c>=65&&c<=90)i=10+c-65;else if(c==40)i=36;else if(c==41)i=37;else if(c==58)i=38;return(i<39&&y<7)?r[i*7+y]:0;}"
+        "17,17,10,4,4,4,4,31,1,2,4,8,16,31,2,4,8,8,8,4,2,8,4,2,2,2,4,8};"
+        "uint i=999;if(c>=48&&c<=57)i=c-48;else if(c>=65&&c<=90)i=10+c-65;else if(c==40)i=36;else if(c==41)i=37;return(i<38&&y<7)?r[i*7+y]:0;}"
         "float3 AddFps(float3 color,float2 pos){if(ShowFps==0)return color;const uint scale=4;"
         "int2 q=int2(pos)-int2(16,16);if(q.x< -8||q.y< -6||q.x>=176||q.y>=36)return color;"
         "color*=0.25;if(q.x<0||q.y<0)return color;uint ch=(uint)q.x/(6*scale);uint x=((uint)q.x%(6*scale))/scale;uint y=(uint)q.y/scale;"
         "uint code=0;if(ch==0)code=70;else if(ch==1)code=80;else if(ch==2)code=83;else if(ch==4)code=48+min(Fps,999)/100;"
         "else if(ch==5)code=48+(min(Fps,999)/10)%10;else if(ch==6)code=48+min(Fps,999)%10;"
         "if(x<5&&y<7&&((GlyphRow(code,y)>>(4-x))&1)!=0)return float3(0.25,0.95,0.35);return color;}"
-        "uint NoticeCode(uint ch){uint4 group=NoticeText[ch>>4];uint packed=group[(ch>>2)&3];return(packed>>((ch&3)*8))&255;}"
+        "uint NoticeCode(uint ch){uint4 group=NoticeText[ch>>2];return group[ch&3];}"
         "float3 AddNotice(float3 color,float2 pos){if(NoticeVisible==0||NoticeLength==0)return color;const uint scale=4;"
         "int top=ShowFps!=0?58:16;int2 q=int2(pos)-int2(16,top);uint width=NoticeLength*6*scale;"
         "if(q.x< -8||q.y< -6||q.x>=int(width+8)||q.y>=36)return color;color*=0.22;"
@@ -8182,10 +8180,9 @@ static bool PresentProxySourcesOnWorker(ID3D12Resource *real_source,
         UINT mode; UINT fps; UINT show_fps; float threshold;
         float cursor_x; float cursor_y; float previous_cursor_x; float previous_cursor_y;
         UINT notice_visible; UINT notice_length; UINT notice_padding[2];
-        UINT notice_text[kPipelineNoticePackedWords];
+        UINT notice_text[kPipelineNoticeTextLength];
     } constants = {};
-    static_assert(sizeof(ProxyConstants) ==
-        (12 + kPipelineNoticePackedWords) * sizeof(UINT));
+    static_assert(sizeof(ProxyConstants) == 52 * sizeof(UINT));
     constants.mode = g_composite_reshade_output && composite_post ?
         (g_show_neural_output ? 2u : 3u) : (g_show_neural_output ? 1u : 0u);
     constants.fps = g_proxy_fps.load();
@@ -8203,22 +8200,19 @@ static bool PresentProxySourcesOnWorker(ID3D12Resource *real_source,
             g_pipeline_notice_length.load(std::memory_order_acquire),
             static_cast<UINT>(kPipelineNoticeTextLength));
         for (UINT index = 0; index < constants.notice_length; ++index)
-            constants.notice_text[index >> 2] |=
-                (g_pipeline_notice_text[index].load(std::memory_order_relaxed) & 0xFFu) <<
-                ((index & 3u) * 8u);
+            constants.notice_text[index] = g_pipeline_notice_text[index].load(std::memory_order_relaxed);
     }
     else if (g_queue_pressure_warning_active.load(std::memory_order_acquire) &&
         !g_suppress_queue_pressure_warning.load(std::memory_order_acquire))
     {
         char warning[kPipelineNoticeTextLength + 1] = {};
-        sprintf_s(warning, "LOWER FPS CAP TO %u OR BELOW FOR IMPROVED STABILITY:",
+        sprintf_s(warning, "LOWER FPS CAP %u OR BELOW FOR STABILITY",
             g_queue_pressure_recommended_cap.load(std::memory_order_acquire));
         constants.notice_visible = 1u;
         for (; constants.notice_length < kPipelineNoticeTextLength &&
             warning[constants.notice_length] != '\0'; ++constants.notice_length)
-            constants.notice_text[constants.notice_length >> 2] |=
-                static_cast<UINT>(static_cast<unsigned char>(warning[constants.notice_length])) <<
-                ((constants.notice_length & 3u) * 8u);
+            constants.notice_text[constants.notice_length] =
+                static_cast<unsigned char>(warning[constants.notice_length]);
     }
     previous_cursor_x = cursor_x; previous_cursor_y = cursor_y;
     D3D12_VIEWPORT viewport = {0, 0, static_cast<float>(g_output_width.load()), static_cast<float>(g_output_height.load()), 0, 1};
