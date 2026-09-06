@@ -34,7 +34,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.5-queue-pressure-warning-prototype"
+#define ADDON_VERSION "2.0.5-queue-pressure-warning-prototype2"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -153,7 +153,8 @@ static ULONGLONG g_queue_pressure_healthy_ms;
 static unsigned long long g_queue_pressure_previous_source_frames;
 static unsigned long long g_queue_pressure_previous_processed_frames;
 static unsigned long long g_queue_pressure_previous_events;
-static unsigned int g_queue_pressure_minimum_processed_fps = UINT_MAX;
+static unsigned int g_queue_pressure_minimum_output_fps = UINT_MAX;
+static unsigned int g_queue_pressure_last_progress_bucket;
 static ULONGLONG g_source_fps_sample_start;
 static unsigned int g_source_fps_sample_frames;
 static ULONGLONG g_output_fps_sample_start;
@@ -6977,7 +6978,8 @@ static void ResetQueuePressureObservation(bool clear_warning)
     g_queue_pressure_previous_source_frames = g_source_frame_sequence.load(std::memory_order_relaxed);
     g_queue_pressure_previous_processed_frames = g_sr_frames.load(std::memory_order_relaxed);
     g_queue_pressure_previous_events = QueuePressureEventCount();
-    g_queue_pressure_minimum_processed_fps = UINT_MAX;
+    g_queue_pressure_minimum_output_fps = UINT_MAX;
+    g_queue_pressure_last_progress_bucket = 0;
     if (clear_warning)
     {
         g_queue_pressure_warning_active.store(false, std::memory_order_release);
@@ -7038,42 +7040,63 @@ static void UpdateQueuePressureMonitor(ULONGLONG now, bool primary_foreground)
     {
         g_queue_pressure_overload_ms = 0;
         g_queue_pressure_healthy_ms = 0;
-        g_queue_pressure_minimum_processed_fps = UINT_MAX;
+        g_queue_pressure_minimum_output_fps = UINT_MAX;
+        g_queue_pressure_last_progress_bucket = 0;
         return;
     }
 
     const unsigned long long discarded_delta = source_delta > processed_delta ?
         source_delta - processed_delta : 0;
-    // Require at least 20% of source Presents to miss the reconstruction path,
-    // at least three such frames in the sample, and direct evidence that an
-    // internal queue/ring was full. This avoids diagnosing ordinary FPS jitter.
+    // The D3D11 latest-frame transport can decline excess source Presents
+    // before any explicit ring-full counter changes. The source/completed
+    // deficit is therefore the authoritative pressure signal; internal queue
+    // events remain useful supporting telemetry but are not mandatory.
+    // Requiring a 20% deficit and at least three missed frames still excludes
+    // ordinary asynchronous one-frame latency and normal FPS jitter.
     const bool overloaded = processed_delta != 0 && source_delta >= 10 &&
-        discarded_delta >= 3 && discarded_delta * 5 >= source_delta &&
-        pressure_delta != 0;
+        discarded_delta >= 3 && discarded_delta * 5 >= source_delta;
     if (overloaded)
     {
         g_queue_pressure_healthy_ms = 0;
         g_queue_pressure_overload_ms = std::min<ULONGLONG>(
             kWarningThresholdMs, g_queue_pressure_overload_ms + elapsed);
-        const unsigned long long measured_processed_fps = processed_delta * 1000ULL / elapsed;
-        if (measured_processed_fps != 0)
+        unsigned long long measured_output_fps = g_proxy_fps.load(std::memory_order_relaxed);
+        if (measured_output_fps == 0)
         {
-            const unsigned int processed_fps = static_cast<unsigned int>(
-                std::clamp<unsigned long long>(measured_processed_fps, 15, 999));
-            g_queue_pressure_minimum_processed_fps = std::min(
-                g_queue_pressure_minimum_processed_fps, processed_fps);
+            measured_output_fps = processed_delta * 1000ULL / elapsed;
+            if (EffectiveFramegenEnabled() && !g_framegen_failed)
+                measured_output_fps *= 2;
+        }
+        if (measured_output_fps != 0)
+        {
+            const unsigned int output_fps = static_cast<unsigned int>(
+                std::clamp<unsigned long long>(measured_output_fps, 15, 999));
+            g_queue_pressure_minimum_output_fps = std::min(
+                g_queue_pressure_minimum_output_fps, output_fps);
+        }
+        const unsigned int progress_bucket = static_cast<unsigned int>(
+            g_queue_pressure_overload_ms / 5000);
+        if (progress_bucket != 0 && progress_bucket > g_queue_pressure_last_progress_bucket &&
+            !g_queue_pressure_warning_active.load(std::memory_order_acquire))
+        {
+            g_queue_pressure_last_progress_bucket = progress_bucket;
+            Log("queue-pressure monitor: sustained=%llums/25000 source=%llu processed=%llu discarded=%llu explicit_events=%llu observed_output_floor=%u FPS",
+                g_queue_pressure_overload_ms, source_delta, processed_delta,
+                discarded_delta, pressure_delta,
+                g_queue_pressure_minimum_output_fps == UINT_MAX ? 0 :
+                    g_queue_pressure_minimum_output_fps);
         }
         if (g_queue_pressure_overload_ms >= kWarningThresholdMs &&
-            g_queue_pressure_minimum_processed_fps != UINT_MAX)
+            g_queue_pressure_minimum_output_fps != UINT_MAX)
         {
             const unsigned int prior_cap = g_queue_pressure_recommended_cap.exchange(
-                g_queue_pressure_minimum_processed_fps, std::memory_order_acq_rel);
+                g_queue_pressure_minimum_output_fps, std::memory_order_acq_rel);
             const bool was_active = g_queue_pressure_warning_active.exchange(
                 true, std::memory_order_acq_rel);
-            if (!was_active || prior_cap != g_queue_pressure_minimum_processed_fps)
-                Log("sustained queue pressure: source=%llu processed=%llu discarded=%llu pressure_events=%llu; recommend game cap <= %u FPS or lower render resolution",
+            if (!was_active || prior_cap != g_queue_pressure_minimum_output_fps)
+                Log("sustained queue pressure: source=%llu processed=%llu discarded=%llu pressure_events=%llu; recommend game cap below %u FPS or lower render resolution",
                     source_delta, processed_delta, discarded_delta, pressure_delta,
-                    g_queue_pressure_minimum_processed_fps);
+                    g_queue_pressure_minimum_output_fps);
         }
         return;
     }
@@ -7081,7 +7104,8 @@ static void UpdateQueuePressureMonitor(ULONGLONG now, bool primary_foreground)
     // A brief good sample does not erase a real warning. Ten continuous
     // healthy seconds after lowering the cap/resolution clears it automatically.
     g_queue_pressure_overload_ms = 0;
-    g_queue_pressure_minimum_processed_fps = UINT_MAX;
+    g_queue_pressure_minimum_output_fps = UINT_MAX;
+    g_queue_pressure_last_progress_bucket = 0;
     if (g_queue_pressure_warning_active.load(std::memory_order_acquire))
     {
         g_queue_pressure_healthy_ms += elapsed;
@@ -7089,7 +7113,7 @@ static void UpdateQueuePressureMonitor(ULONGLONG now, bool primary_foreground)
         {
             const unsigned int prior_cap = g_queue_pressure_recommended_cap.load();
             ResetQueuePressureObservation(true);
-            Log("queue pressure recovered for 10 seconds; cleared frame-cap warning (prior recommendation <= %u FPS)",
+            Log("queue pressure recovered for 10 seconds; cleared frame-cap warning (prior recommendation below %u FPS)",
                 prior_cap);
         }
     }
@@ -8149,7 +8173,7 @@ static bool PresentProxySourcesOnWorker(ID3D12Resource *real_source,
         !g_suppress_queue_pressure_warning.load(std::memory_order_acquire))
     {
         char warning[kPipelineNoticeTextLength + 1] = {};
-        sprintf_s(warning, "QUEUE FULL: CAP <= %u FPS / LOWER RES",
+        sprintf_s(warning, "QUEUE FULL: CAP < %u FPS / LOWER RES",
             g_queue_pressure_recommended_cap.load(std::memory_order_acquire));
         constants.notice_visible = 1u;
         for (; constants.notice_length < kPipelineNoticeTextLength &&
@@ -10057,7 +10081,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     }
     ImGui::TextDisabled("Per-game override. When visible, lower the game's FPS cap to the suggested rate or lower its render resolution.");
     if (g_queue_pressure_warning_active.load(std::memory_order_acquire))
-        ImGui::Text("Queue recommendation: cap <= %u FPS or lower resolution%s",
+        ImGui::Text("Queue recommendation: cap below %u FPS or lower resolution%s",
             g_queue_pressure_recommended_cap.load(std::memory_order_acquire),
             suppress_queue_warning ? " (warning hidden)" : "");
     if (ImGui::Checkbox("Collect performance telemetry", &g_performance_telemetry_enabled))
