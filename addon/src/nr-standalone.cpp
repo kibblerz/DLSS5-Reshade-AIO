@@ -34,7 +34,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.4"
+#define ADDON_VERSION "2.0.5-queue-pressure-warning-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -144,6 +144,16 @@ static constexpr ULONGLONG kPipelineNoticeDurationMs = 3000;
 static std::array<std::atomic<UINT>, kPipelineNoticeTextLength> g_pipeline_notice_text = {};
 static std::atomic<UINT> g_pipeline_notice_length{0};
 static std::atomic<ULONGLONG> g_pipeline_notice_until_tick{0};
+static std::atomic<bool> g_suppress_queue_pressure_warning{false};
+static std::atomic<bool> g_queue_pressure_warning_active{false};
+static std::atomic<unsigned int> g_queue_pressure_recommended_cap{0};
+static ULONGLONG g_queue_pressure_sample_tick;
+static ULONGLONG g_queue_pressure_overload_ms;
+static ULONGLONG g_queue_pressure_healthy_ms;
+static unsigned long long g_queue_pressure_previous_source_frames;
+static unsigned long long g_queue_pressure_previous_processed_frames;
+static unsigned long long g_queue_pressure_previous_events;
+static unsigned int g_queue_pressure_minimum_processed_fps = UINT_MAX;
 static ULONGLONG g_source_fps_sample_start;
 static unsigned int g_source_fps_sample_frames;
 static ULONGLONG g_output_fps_sample_start;
@@ -6942,6 +6952,151 @@ static void UpdateSourceFps()
     g_source_fps_sample_start = now;
 }
 
+static unsigned long long QueuePressureEventCount()
+{
+    // These counters overlap semantically, so their sum is used only as proof
+    // that an internal queue or resource ring was under pressure. The actual
+    // discarded-frame estimate comes from source versus completed SR/DLAA
+    // frames below and is therefore not inflated by double counting.
+    return g_neural_busy_frame_skips.load(std::memory_order_relaxed) +
+        g_proxy_busy_frame_skips.load(std::memory_order_relaxed) +
+        g_capture_mailbox_no_slot.load(std::memory_order_relaxed) +
+        g_capture_mailbox_stale_drops.load(std::memory_order_relaxed) +
+        g_fg_admission_deferrals.load(std::memory_order_relaxed) +
+        g_fg_admission_inflight_deferrals.load(std::memory_order_relaxed) +
+        g_fg_admission_capacity_deferrals.load(std::memory_order_relaxed) +
+        g_async_fg_common_phase_deferrals.load(std::memory_order_relaxed) +
+        g_neural_gpu_deferrals.load(std::memory_order_relaxed);
+}
+
+static void ResetQueuePressureObservation(bool clear_warning)
+{
+    g_queue_pressure_sample_tick = 0;
+    g_queue_pressure_overload_ms = 0;
+    g_queue_pressure_healthy_ms = 0;
+    g_queue_pressure_previous_source_frames = g_source_frame_sequence.load(std::memory_order_relaxed);
+    g_queue_pressure_previous_processed_frames = g_sr_frames.load(std::memory_order_relaxed);
+    g_queue_pressure_previous_events = QueuePressureEventCount();
+    g_queue_pressure_minimum_processed_fps = UINT_MAX;
+    if (clear_warning)
+    {
+        g_queue_pressure_warning_active.store(false, std::memory_order_release);
+        g_queue_pressure_recommended_cap.store(0, std::memory_order_release);
+    }
+}
+
+static void UpdateQueuePressureMonitor(ULONGLONG now, bool primary_foreground)
+{
+    static constexpr ULONGLONG kSampleIntervalMs = 1000;
+    static constexpr ULONGLONG kMaximumContinuousSampleMs = 2500;
+    static constexpr ULONGLONG kWarningThresholdMs = 25000;
+    static constexpr ULONGLONG kHealthyClearMs = 10000;
+
+    const unsigned long long source_frames = g_source_frame_sequence.load(std::memory_order_relaxed);
+    const unsigned long long processed_frames = g_sr_frames.load(std::memory_order_relaxed);
+    const unsigned long long pressure_events = QueuePressureEventCount();
+    if (g_queue_pressure_sample_tick == 0)
+    {
+        g_queue_pressure_sample_tick = now;
+        g_queue_pressure_previous_source_frames = source_frames;
+        g_queue_pressure_previous_processed_frames = processed_frames;
+        g_queue_pressure_previous_events = pressure_events;
+        return;
+    }
+
+    const ULONGLONG elapsed = now - g_queue_pressure_sample_tick;
+    if (elapsed < kSampleIntervalMs) return;
+    if (elapsed > kMaximumContinuousSampleMs ||
+        source_frames < g_queue_pressure_previous_source_frames ||
+        processed_frames < g_queue_pressure_previous_processed_frames ||
+        pressure_events < g_queue_pressure_previous_events)
+    {
+        ResetQueuePressureObservation(true);
+        g_queue_pressure_sample_tick = now;
+        return;
+    }
+
+    const unsigned long long source_delta = source_frames - g_queue_pressure_previous_source_frames;
+    const unsigned long long processed_delta = processed_frames - g_queue_pressure_previous_processed_frames;
+    const unsigned long long pressure_delta = pressure_events - g_queue_pressure_previous_events;
+    g_queue_pressure_sample_tick = now;
+    g_queue_pressure_previous_source_frames = source_frames;
+    g_queue_pressure_previous_processed_frames = processed_frames;
+    g_queue_pressure_previous_events = pressure_events;
+
+    if (!g_enabled || g_neural_failed)
+    {
+        ResetQueuePressureObservation(true);
+        return;
+    }
+    // Menus, focus loss, startup, resize and feature recreation intentionally
+    // disturb cadence. Exclude them rather than turning expected transitions
+    // into a performance warning.
+    if (!primary_foreground || !g_neural_ready || g_reshade_overlay_open.load() ||
+        g_proxy_hidden.load() || g_proxy_transition_hold.load() ||
+        g_feature_recreate_requested.load())
+    {
+        g_queue_pressure_overload_ms = 0;
+        g_queue_pressure_healthy_ms = 0;
+        g_queue_pressure_minimum_processed_fps = UINT_MAX;
+        return;
+    }
+
+    const unsigned long long discarded_delta = source_delta > processed_delta ?
+        source_delta - processed_delta : 0;
+    // Require at least 20% of source Presents to miss the reconstruction path,
+    // at least three such frames in the sample, and direct evidence that an
+    // internal queue/ring was full. This avoids diagnosing ordinary FPS jitter.
+    const bool overloaded = processed_delta != 0 && source_delta >= 10 &&
+        discarded_delta >= 3 && discarded_delta * 5 >= source_delta &&
+        pressure_delta != 0;
+    if (overloaded)
+    {
+        g_queue_pressure_healthy_ms = 0;
+        g_queue_pressure_overload_ms = std::min<ULONGLONG>(
+            kWarningThresholdMs, g_queue_pressure_overload_ms + elapsed);
+        const unsigned long long measured_processed_fps = processed_delta * 1000ULL / elapsed;
+        if (measured_processed_fps != 0)
+        {
+            const unsigned int processed_fps = static_cast<unsigned int>(
+                std::clamp<unsigned long long>(measured_processed_fps, 15, 999));
+            g_queue_pressure_minimum_processed_fps = std::min(
+                g_queue_pressure_minimum_processed_fps, processed_fps);
+        }
+        if (g_queue_pressure_overload_ms >= kWarningThresholdMs &&
+            g_queue_pressure_minimum_processed_fps != UINT_MAX)
+        {
+            const unsigned int prior_cap = g_queue_pressure_recommended_cap.exchange(
+                g_queue_pressure_minimum_processed_fps, std::memory_order_acq_rel);
+            const bool was_active = g_queue_pressure_warning_active.exchange(
+                true, std::memory_order_acq_rel);
+            if (!was_active || prior_cap != g_queue_pressure_minimum_processed_fps)
+                Log("sustained queue pressure: source=%llu processed=%llu discarded=%llu pressure_events=%llu; recommend game cap <= %u FPS or lower render resolution",
+                    source_delta, processed_delta, discarded_delta, pressure_delta,
+                    g_queue_pressure_minimum_processed_fps);
+        }
+        return;
+    }
+
+    // A brief good sample does not erase a real warning. Ten continuous
+    // healthy seconds after lowering the cap/resolution clears it automatically.
+    g_queue_pressure_overload_ms = 0;
+    g_queue_pressure_minimum_processed_fps = UINT_MAX;
+    if (g_queue_pressure_warning_active.load(std::memory_order_acquire))
+    {
+        g_queue_pressure_healthy_ms += elapsed;
+        if (g_queue_pressure_healthy_ms >= kHealthyClearMs)
+        {
+            const unsigned int prior_cap = g_queue_pressure_recommended_cap.load();
+            ResetQueuePressureObservation(true);
+            Log("queue pressure recovered for 10 seconds; cleared frame-cap warning (prior recommendation <= %u FPS)",
+                prior_cap);
+        }
+    }
+    else
+        g_queue_pressure_healthy_ms = 0;
+}
+
 static void UpdateOutputFps()
 {
     const ULONGLONG now = GetTickCount64();
@@ -7980,12 +8135,28 @@ static bool PresentProxySourcesOnWorker(ID3D12Resource *real_source,
     constants.previous_cursor_x = previous_cursor_x;
     constants.previous_cursor_y = previous_cursor_y;
     const ULONGLONG notice_until_tick = g_pipeline_notice_until_tick.load(std::memory_order_acquire);
-    constants.notice_visible = notice_until_tick != 0 && GetTickCount64() < notice_until_tick ? 1u : 0u;
-    constants.notice_length = constants.notice_visible ?
-        std::min<UINT>(g_pipeline_notice_length.load(std::memory_order_acquire),
-            static_cast<UINT>(kPipelineNoticeTextLength)) : 0u;
-    for (UINT index = 0; index < constants.notice_length; ++index)
-        constants.notice_text[index] = g_pipeline_notice_text[index].load(std::memory_order_relaxed);
+    const bool transient_notice = notice_until_tick != 0 && GetTickCount64() < notice_until_tick;
+    if (transient_notice)
+    {
+        constants.notice_visible = 1u;
+        constants.notice_length = std::min<UINT>(
+            g_pipeline_notice_length.load(std::memory_order_acquire),
+            static_cast<UINT>(kPipelineNoticeTextLength));
+        for (UINT index = 0; index < constants.notice_length; ++index)
+            constants.notice_text[index] = g_pipeline_notice_text[index].load(std::memory_order_relaxed);
+    }
+    else if (g_queue_pressure_warning_active.load(std::memory_order_acquire) &&
+        !g_suppress_queue_pressure_warning.load(std::memory_order_acquire))
+    {
+        char warning[kPipelineNoticeTextLength + 1] = {};
+        sprintf_s(warning, "QUEUE FULL: CAP <= %u FPS / LOWER RES",
+            g_queue_pressure_recommended_cap.load(std::memory_order_acquire));
+        constants.notice_visible = 1u;
+        for (; constants.notice_length < kPipelineNoticeTextLength &&
+            warning[constants.notice_length] != '\0'; ++constants.notice_length)
+            constants.notice_text[constants.notice_length] =
+                static_cast<unsigned char>(warning[constants.notice_length]);
+    }
     previous_cursor_x = cursor_x; previous_cursor_y = cursor_y;
     D3D12_VIEWPORT viewport = {0, 0, static_cast<float>(g_output_width.load()), static_cast<float>(g_output_height.load()), 0, 1};
     D3D12_RECT scissor = {0, 0, static_cast<LONG>(g_output_width.load()), static_cast<LONG>(g_output_height.load())};
@@ -9078,6 +9249,7 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     DetectNativeStreamlinePresentHook();
     UpdateSourceFps();
     ++g_source_frame_sequence;
+    UpdateQueuePressureMonitor(present_tick, primary_foreground);
     const unsigned long long routed_mouse_events = g_overlay_mouse_events.load();
     if (routed_mouse_events != g_last_logged_mouse_event && routed_mouse_events <= 8)
     {
@@ -9872,6 +10044,22 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         reshade::set_config_value(nullptr, section, "CompositeReshade", g_composite_reshade_output ? "1" : "0");
     if (ImGui::Checkbox("Show native output FPS counter", &g_show_proxy_fps))
         reshade::set_config_value(nullptr, section, "ShowProxyFps", g_show_proxy_fps ? "1" : "0");
+    bool suppress_queue_warning = g_suppress_queue_pressure_warning.load(std::memory_order_acquire);
+    if (ImGui::Checkbox("Hide queue-full performance warning", &suppress_queue_warning))
+    {
+        g_suppress_queue_pressure_warning.store(suppress_queue_warning, std::memory_order_release);
+        reshade::set_config_value(nullptr, section, "SuppressQueuePressureWarning",
+            suppress_queue_warning ? "1" : "0");
+        if (!suppress_queue_warning)
+            ResetQueuePressureObservation(false);
+        Log("persistent queue-pressure warning display %s by user setting",
+            suppress_queue_warning ? "suppressed" : "enabled");
+    }
+    ImGui::TextDisabled("Per-game override. When visible, lower the game's FPS cap to the suggested rate or lower its render resolution.");
+    if (g_queue_pressure_warning_active.load(std::memory_order_acquire))
+        ImGui::Text("Queue recommendation: cap <= %u FPS or lower resolution%s",
+            g_queue_pressure_recommended_cap.load(std::memory_order_acquire),
+            suppress_queue_warning ? " (warning hidden)" : "");
     if (ImGui::Checkbox("Collect performance telemetry", &g_performance_telemetry_enabled))
     {
         reshade::set_config_value(nullptr, section, "PerformanceTelemetry",
@@ -10123,6 +10311,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("FrameGeneration", "1", value, sizeof(value)); g_framegen_enabled = strcmp(value, "0") != 0;
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
+        read_setting("SuppressQueuePressureWarning", "0", value, sizeof(value)); g_suppress_queue_pressure_warning = strcmp(value, "0") != 0;
         read_setting("PerformanceTelemetry", "1", value, sizeof(value)); g_performance_telemetry_enabled = strcmp(value, "0") != 0;
         read_setting("EarlyProxyInitialization", "0", value, sizeof(value)); g_early_proxy_initialization = strcmp(value, "0") != 0;
         read_setting("AutoWindowedVirtualization", "1", value, sizeof(value)); g_auto_windowed_virtualization = strcmp(value, "0") != 0;
