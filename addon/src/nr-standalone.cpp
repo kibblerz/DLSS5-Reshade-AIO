@@ -34,7 +34,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.7-adaptive-governor-prototype1"
+#define ADDON_VERSION "2.0.7-experimental.1"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -161,8 +161,8 @@ static std::array<unsigned int, kQueuePressureRecommendationSamples>
     g_queue_pressure_recommendation_samples = {};
 static size_t g_queue_pressure_recommendation_sample_count;
 static size_t g_queue_pressure_recommendation_sample_index;
-// Session-only prototype. The governor deliberately does not persist: a bad
-// per-game pacing interaction must disappear on the next process launch.
+// Experimental feedback governor. Missing configuration defaults to enabled,
+// while an explicit user opt-out persists across process launches.
 static bool g_adaptive_governor_enabled = true;
 static std::atomic<bool> g_adaptive_governor_active{false};
 static std::atomic<unsigned int> g_adaptive_governor_target_fps{0};
@@ -10663,14 +10663,17 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     if (ImGui::Checkbox("Adaptive GPU pressure governor (prototype)", &adaptive_governor))
     {
         g_adaptive_governor_enabled = adaptive_governor;
+        reshade::set_config_value(nullptr, section, "AdaptivePressureGovernor",
+            g_adaptive_governor_enabled ? "1" : "0");
         g_adaptive_governor_context_was_valid = false;
         g_adaptive_governor_valid_since_tick = 0;
         SuspendAdaptiveGovernor(adaptive_governor ?
             "user requested a fresh learning window" : "disabled by user");
-        Log("adaptive pressure governor %s; session-only setting",
+        Log("adaptive pressure governor %s; persisted for future launches",
             adaptive_governor ? "enabled" : "disabled");
     }
-    ImGui::TextDisabled("Session-only and enabled for this prototype. It limits game Presents only after sustained pipeline starvation.");
+    ImGui::TextDisabled("Enabled by default. Disable here to opt out; the choice persists after restarting the game.");
+    ImGui::TextDisabled("It limits game Presents only after sustained pipeline starvation, then probes for recovered capacity.");
     if (g_adaptive_governor_active.load(std::memory_order_acquire))
         ImGui::Text("Governor active: %u real FPS | pacing wait %.3f ms | waits %llu",
             g_adaptive_governor_target_fps.load(std::memory_order_acquire),
@@ -10945,6 +10948,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("FrameGeneration", "1", value, sizeof(value)); g_framegen_enabled = strcmp(value, "0") != 0;
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
+        read_setting("AdaptivePressureGovernor", "1", value, sizeof(value)); g_adaptive_governor_enabled = strcmp(value, "0") != 0;
         read_setting("SuppressQueuePressureWarning", "0", value, sizeof(value)); g_suppress_queue_pressure_warning = strcmp(value, "0") != 0;
         read_setting("PerformanceTelemetry", "1", value, sizeof(value)); g_performance_telemetry_enabled = strcmp(value, "0") != 0;
         read_setting("EarlyProxyInitialization", "0", value, sizeof(value)); g_early_proxy_initialization = strcmp(value, "0") != 0;
@@ -10967,11 +10971,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             reshade::set_config_value(nullptr, section, "SynchronousProxyPresentation", "1");
         }
         g_requested_synchronous_proxy_presentation = g_synchronous_proxy_presentation;
-        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s DLSS_render_preset=%s model=%d style=%u NR=%s NR_passes=%u async_compute=%s NR-mask=%s strength=%.2f VORT=%s early_proxy=%s auto_presentation=%s windowed_virtualization=%s logical_client=%s input_coordinates=%s detached_output=%s detached_cursor=%s opaque_composition=%s presenter=%s telemetry=%s",
+        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s DLSS_render_preset=%s model=%d style=%u NR=%s NR_passes=%u async_compute=%s adaptive_governor=%s NR-mask=%s strength=%.2f VORT=%s early_proxy=%s auto_presentation=%s windowed_virtualization=%s logical_client=%s input_coordinates=%s detached_output=%s detached_cursor=%s opaque_composition=%s presenter=%s telemetry=%s",
             ADDON_VERSION, ProfileName(g_color_profile), DlssRenderPresetName(g_dlss_render_preset),
             g_nr_model, NrStyle(), g_nr_enabled ? "enabled" : "disabled",
             g_nr_second_pass_enabled ? 2u : 1u,
             g_async_compute_requested ? "requested" : "disabled",
+            g_adaptive_governor_enabled ? "enabled" : "disabled",
             g_nr_rejection_mask_enabled ? "enabled" : "disabled", g_nr_rejection_mask_strength,
             g_vort_guides_enabled ? "enabled" : "disabled",
             g_early_proxy_initialization ? "enabled" : "disabled",

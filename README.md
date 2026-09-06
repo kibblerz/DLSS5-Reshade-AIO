@@ -2,6 +2,9 @@
 
 Bring Neural Rendering, DLAA/DLSS Super Resolution, and Frame Generation to supported 64-bit Windows games even when the game does not include those features. This is experimental software and currently supports D3D9, D3D11, D3D12, and Vulkan through ReShade.
 
+> [!WARNING]
+> **v2.0.7-experimental.1 is a prerelease test of the adaptive GPU pressure governor.** It is enabled by default and automatically slows excessive game Presents only after sustained pipeline starvation, allowing NR, DLSS/DLAA, and Frame Generation more consistent GPU time. It can be disabled in the addon's ReShade settings, and that choice persists across restarts. If this experimental pacing causes a regression, install the [prior stable release, v2.0.6](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/tag/v2.0.6).
+
 > [!IMPORTANT]
 > **Version 2.0 uses a new presentation and window-compatibility system.** It fixes input and reduced-window behavior in many games, but game compatibility can differ from the 1.x series. If a game has problems in 2.0 that it did not have before, install the [latest 1.x release (v1.7.24)](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/tag/v1.7.24). Do not mix the 1.x and 2.0 addon binaries.
 
@@ -40,6 +43,8 @@ Reduced-resolution DLSS SR can provide major performance improvements. Native-re
 > **If performance is unexpectedly low or stuttery, set an in-game or external frame cap below the uncapped source frame rate.** NR and Frame Generation can overwhelm the pipeline when the game submits frames faster than NGX can process them. Counterintuitively, a lower cap may increase the final displayed FPS and eliminate stuttering: in testing, a game struggling around 45 FPS with NR + FG became a consistent 60 FPS after its source frame rate was capped at 30. Start with a 30 FPS source cap for a 60 FPS FG target, then raise it gradually while watching frame pacing.
 >
 > Version 2.0.5 detects sustained queue pressure after roughly 25 seconds and displays a conservative recommended cap on the game output. Follow the displayed value or choose a lower cap; lowering the game resolution is another option. The recommendation follows a rolling sample instead of one brief hitch, updates as conditions change, and disappears after the queue remains healthy. F10 comparisons are excluded from the measurement.
+
+The v2.0.7 experimental prerelease adds an **Adaptive GPU pressure governor**. It starts enabled when no prior preference exists. After a stable startup grace period, sustained source-versus-processed queue pressure activates an automatic real-frame limit based on measured reconstruction capacity. The controller relaxes that limit in small steps when capacity recovers. Uncheck **Adaptive GPU pressure governor (experimental)** to disable it for that game; the opt-out is saved for future launches.
 
 - Press **F10** to compare the processed image with the original game output.
 - Press **Ctrl+Alt+P** to cycle through the modern DLSS render presets **J → K → L → M**. NVIDIA Default remains selectable in ReShade. A three-second corner notice shows the selected preset and the mode it was designed to target; the ReShade status separately reports the pipeline's actual active DLAA/DLSS mode.
