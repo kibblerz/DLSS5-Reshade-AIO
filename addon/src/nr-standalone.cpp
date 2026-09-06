@@ -34,7 +34,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.8-runtime-color-prototype"
+#define ADDON_VERSION "2.0.8-nr3x-pre-rest"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -509,8 +509,9 @@ static bool g_vort_guides_enabled = false;
 static bool g_nr_rejection_mask_enabled = false;
 static float g_nr_rejection_mask_strength = 1.0f;
 static bool g_nr_enabled = true;
-static bool g_nr_second_pass_enabled = false;
+static unsigned int g_nr_pass_count = 1;
 static bool g_nr_second_pass_failed = false;
+static bool g_nr_third_pass_failed = false;
 static bool g_framegen_enabled = true;
 static bool g_framegen_failed = false;
 static std::atomic<bool> g_feature_recreate_requested{false};
@@ -524,6 +525,7 @@ static bool g_using_external_guides = false;
 static char g_neural_status[256] = "waiting for first game present";
 static std::atomic<unsigned long long> g_nr_frames{0};
 static std::atomic<unsigned long long> g_nr_second_frames{0};
+static std::atomic<unsigned long long> g_nr_third_frames{0};
 static std::atomic<unsigned long long> g_sr_frames{0};
 static std::atomic<unsigned long long> g_fg_frames{0};
 
@@ -710,6 +712,7 @@ static Microsoft::WRL::ComPtr<ID3D12Resource> g_post_reshade_color;
 static std::atomic<bool> g_post_reshade_color_ready{false};
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_nr_stage;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_nr_second_stage;
+static Microsoft::WRL::ComPtr<ID3D12Resource> g_nr_third_stage;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_sr_stage;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_fg_stage;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_fallback_motion;
@@ -836,6 +839,7 @@ static HMODULE g_bridge_module;
 static NVSDK_NGX_Parameter *g_ngx_params;
 static NVSDK_NGX_Handle *g_nr_feature;
 static NVSDK_NGX_Handle *g_nr_second_feature;
+static NVSDK_NGX_Handle *g_nr_third_feature;
 static NVSDK_NGX_Handle *g_sr_feature;
 static NVSDK_NGX_Handle *g_fg_feature;
 static void Log(const char *format, ...);
@@ -1021,6 +1025,7 @@ static void ReleaseLegacyFrameResources();
 static bool EnsureStandaloneResources(ID3D12Resource *backbuffer);
 static void UpdateProxyCursorClip(bool active);
 static bool EnsureSecondNrStage();
+static bool EnsureThirdNrStage();
 static bool ApplyPendingColorProfileChange(UINT width, UINT height, DXGI_FORMAT format);
 static NgxPopulateParameters g_nr_populate;
 static NgxPopulateParameters g_nr_compute_scaling_ratio;
@@ -2812,6 +2817,7 @@ static bool CreateFeatures()
     DWORD exception = 0;
     NVSDK_NGX_Result result = NVSDK_NGX_Result_Success;
     g_nr_second_pass_failed = false;
+    g_nr_third_pass_failed = false;
     if (g_nr_enabled)
     {
         SetNrCreationContract();
@@ -2822,7 +2828,7 @@ static bool CreateFeatures()
         Log("CreateFeature(feature=18) = 0x%08X (%s), handle=%p", static_cast<unsigned int>(result), ResultName(result), g_nr_feature);
         if (NVSDK_NGX_FAILED(result) || !g_nr_feature) { Fail("NR feature creation", static_cast<unsigned int>(result)); return false; }
 
-        if (g_nr_second_pass_enabled)
+        if (g_nr_pass_count >= 2)
         {
             if (!EnsureSecondNrStage())
             {
@@ -2867,12 +2873,62 @@ static bool CreateFeatures()
             g_nr_second_feature = nullptr;
             g_nr_second_stage.Reset();
         }
+
+        if (g_nr_pass_count >= 3 && !g_nr_second_pass_failed && g_nr_second_feature)
+        {
+            if (!EnsureThirdNrStage())
+            {
+                Log("third NR pass texture allocation failed; continuing with two NR passes");
+                g_nr_third_pass_failed = true;
+            }
+            else
+            {
+                SetNrCreationContract();
+                if (!BeginNeuralCommands(kInitializationGpuWaitMs, true)) return false;
+                exception = 0;
+                result = SafeCreate(true, &exception, &g_nr_third_feature);
+                if (exception)
+                {
+                    NeuralCommandList()->Close();
+                    Log("third NR feature creation exception 0x%08X; continuing with two NR passes",
+                        exception);
+                    g_nr_third_feature = nullptr;
+                    g_nr_third_pass_failed = true;
+                }
+                else
+                {
+                    if (!SubmitNeuralCommands(true)) return false;
+                    Log("CreateFeature(feature=18, pass=3) = 0x%08X (%s), handle=%p",
+                        static_cast<unsigned int>(result), ResultName(result), g_nr_third_feature);
+                    if (NVSDK_NGX_FAILED(result) || !g_nr_third_feature)
+                    {
+                        if (g_nr_third_feature)
+                        {
+                            DWORD release_exception = 0;
+                            SafeRelease(g_nr_release, g_nr_third_feature, &release_exception);
+                        }
+                        g_nr_third_feature = nullptr;
+                        g_nr_third_pass_failed = true;
+                        Log("third NR feature was rejected; continuing with two NR passes");
+                    }
+                }
+            }
+        }
+        else
+        {
+            g_nr_third_feature = nullptr;
+            g_nr_third_stage.Reset();
+            if (g_nr_pass_count >= 3)
+                g_nr_third_pass_failed = true;
+        }
     }
     else
     {
         g_nr_feature = nullptr;
         g_nr_second_feature = nullptr;
+        g_nr_third_feature = nullptr;
         g_nr_second_stage.Reset();
+        g_nr_third_stage.Reset();
         Log("CreateFeature(feature=18) skipped: Neural Rendering is disabled; SR + FG-only mode");
     }
 
@@ -2962,8 +3018,8 @@ static bool CreateFeatures()
     }
     Log("standalone contract ready: NR=%s passes=%u requested=%u at %ux%u, %s (%s preset %s) -> %ux%u, DLSS-G=%s, model=%d style=%u, profile=%s",
         g_nr_feature ? "feature 18 active" : "disabled",
-        g_nr_second_feature ? 2u : (g_nr_feature ? 1u : 0u),
-        g_nr_second_pass_enabled ? 2u : 1u,
+        g_nr_third_feature ? 3u : (g_nr_second_feature ? 2u : (g_nr_feature ? 1u : 0u)),
+        g_nr_pass_count,
         g_resource_input_width, g_resource_input_height, SrModeName(),
         DlssQualityName(g_active_dlss_quality), DlssRenderPresetName(g_active_dlss_render_preset),
         g_resource_output_width, g_resource_output_height,
@@ -3004,6 +3060,18 @@ static bool RecreateFeatures()
         return false;
     }
     g_sr_feature = nullptr;
+    if (g_nr_third_feature)
+    {
+        NVSDK_NGX_Result third_result = SafeRelease(
+            g_nr_release, g_nr_third_feature, &exception);
+        if (exception || NVSDK_NGX_FAILED(third_result))
+        {
+            Fail(exception ? "third NR release exception" : "third NR release",
+                exception ? exception : static_cast<unsigned int>(third_result));
+            return false;
+        }
+        g_nr_third_feature = nullptr;
+    }
     if (g_nr_second_feature)
     {
         NVSDK_NGX_Result second_result = SafeRelease(
@@ -3027,18 +3095,21 @@ static bool RecreateFeatures()
         }
         g_nr_feature = nullptr;
     }
-    if (!g_nr_second_pass_enabled || !g_nr_enabled)
+    if (g_nr_pass_count < 2 || !g_nr_enabled)
         g_nr_second_stage.Reset();
+    if (g_nr_pass_count < 3 || !g_nr_enabled)
+        g_nr_third_stage.Reset();
     Log("released live features for pipeline change: NR=%s passes_requested=%u old_model=%d requested_model=%d",
         g_nr_enabled ? "enabled" : "disabled",
-        g_nr_second_pass_enabled ? 2u : 1u, g_active_nr_model, g_nr_model);
+        g_nr_pass_count, g_active_nr_model, g_nr_model);
     g_fg_frames = 0;
     g_need_history_reset = true;
     g_last_neural_source_sequence = 0;
     if (!CreateFeatures()) return false;
     Log("live pipeline switch complete: NR=%s passes_active=%u active_model=%d",
         g_nr_feature ? "enabled" : "disabled",
-        g_nr_second_feature ? 2u : (g_nr_feature ? 1u : 0u), g_active_nr_model);
+        g_nr_third_feature ? 3u : (g_nr_second_feature ? 2u : (g_nr_feature ? 1u : 0u)),
+        g_active_nr_model);
     return true;
 }
 
@@ -3076,7 +3147,7 @@ static bool CreateTexture(UINT width, UINT height, DXGI_FORMAT format, bool uav,
 
 static bool EnsureSecondNrStage()
 {
-    if (!g_nr_second_pass_enabled || !g_nr_enabled)
+    if (g_nr_pass_count < 2 || !g_nr_enabled)
     {
         g_nr_second_stage.Reset();
         return true;
@@ -3115,6 +3186,51 @@ static bool EnsureSecondNrStage()
         return false;
     }
     Log("second NR pass texture ready: %ux%u format=%u",
+        g_resource_input_width, g_resource_input_height, static_cast<unsigned int>(format));
+    return true;
+}
+
+static bool EnsureThirdNrStage()
+{
+    if (g_nr_pass_count < 3 || !g_nr_enabled)
+    {
+        g_nr_third_stage.Reset();
+        return true;
+    }
+    const DXGI_FORMAT format = g_active_color_profile == ColorProfile::Srgb ?
+        DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if (g_nr_third_stage)
+    {
+        const D3D12_RESOURCE_DESC current = g_nr_third_stage->GetDesc();
+        if (current.Width == g_resource_input_width &&
+            current.Height == g_resource_input_height && current.Format == format)
+            return true;
+        g_nr_third_stage.Reset();
+    }
+
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = g_resource_input_width;
+    desc.Height = g_resource_input_height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    const HRESULT hr = g_neural_device->CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        nullptr, IID_PPV_ARGS(&g_nr_third_stage));
+    if (FAILED(hr))
+    {
+        Log("third NR pass texture allocation failed: 0x%08X input=%ux%u format=%u",
+            static_cast<unsigned int>(hr), g_resource_input_width,
+            g_resource_input_height, static_cast<unsigned int>(format));
+        return false;
+    }
+    Log("third NR pass texture ready: %ux%u format=%u",
         g_resource_input_width, g_resource_input_height, static_cast<unsigned int>(format));
     return true;
 }
@@ -3342,6 +3458,19 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
         }
         g_sr_feature = nullptr;
     }
+    if (g_nr_third_feature)
+    {
+        const NVSDK_NGX_Result result = SafeRelease(
+            g_nr_release, g_nr_third_feature, &exception);
+        if (exception || NVSDK_NGX_FAILED(result))
+        {
+            Fail(exception ? "third NR release during resolution change" :
+                "third NR release during resolution change",
+                exception ? exception : static_cast<unsigned int>(result));
+            return false;
+        }
+        g_nr_third_feature = nullptr;
+    }
     if (g_nr_second_feature)
     {
         const NVSDK_NGX_Result result = SafeRelease(
@@ -3382,7 +3511,8 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
     g_legacy_guides_ready = false;
     g_fallback_motion.Reset(); g_fallback_depth.Reset();
     ReleaseLegacyFrameResources();
-    g_fg_stage.Reset(); g_sr_stage.Reset(); g_nr_stage.Reset(); g_nr_second_stage.Reset();
+    g_fg_stage.Reset(); g_sr_stage.Reset(); g_nr_stage.Reset();
+    g_nr_second_stage.Reset(); g_nr_third_stage.Reset();
     for (PipelineFrameSlot &slot : g_pipeline_slots)
     {
         slot.generated_output.Reset();
@@ -5345,8 +5475,10 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     ID3D12Resource *nr_control_mask = g_nr_rejection_mask_enabled &&
         g_nr_rejection_mask_strength > 0.0001f && use_external_guides &&
         g_nr_mask_available ? g_captured_nr_mask.Get() : nullptr;
-    const bool evaluate_second_nr = evaluate_nr && g_nr_second_pass_enabled &&
+    const bool evaluate_second_nr = evaluate_nr && g_nr_pass_count >= 2 &&
         !g_nr_second_pass_failed && g_nr_second_feature && g_nr_second_stage;
+    const bool evaluate_third_nr = evaluate_second_nr && g_nr_pass_count >= 3 &&
+        !g_nr_third_pass_failed && g_nr_third_feature && g_nr_third_stage;
     if (evaluate_nr)
     {
         SetNrEvaluationContract(packed_color, depth, motion, nr_control_mask,
@@ -5361,6 +5493,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     }
     ID3D12Resource *sr_color = packed_color;
     bool second_nr_succeeded = false;
+    bool third_nr_succeeded = false;
     if (evaluate_nr)
     {
         D3D12_RESOURCE_BARRIER nr_to_srv = Transition(g_nr_stage.Get(),
@@ -5391,6 +5524,38 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
                 commands->ResourceBarrier(1, &second_to_srv);
                 sr_color = g_nr_second_stage.Get();
                 second_nr_succeeded = true;
+
+                if (evaluate_third_nr)
+                {
+                    SetNrEvaluationContract(g_nr_second_stage.Get(), depth, motion,
+                        nr_control_mask, g_nr_third_stage.Get(), reset);
+                    exception = 0;
+                    const NVSDK_NGX_Result third_result = SafeEvaluate(
+                        true, &exception, g_nr_third_feature);
+                    if (exception)
+                    {
+                        AbortNeuralFrameCommands(slot_index);
+                        g_nr_third_pass_failed = true;
+                        Log("third NR pass evaluation exception 0x%08X; falling back to two passes",
+                            exception);
+                        return false;
+                    }
+                    if (NVSDK_NGX_SUCCEED(third_result))
+                    {
+                        D3D12_RESOURCE_BARRIER third_to_srv = Transition(
+                            g_nr_third_stage.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                        commands->ResourceBarrier(1, &third_to_srv);
+                        sr_color = g_nr_third_stage.Get();
+                        third_nr_succeeded = true;
+                    }
+                    else
+                    {
+                        g_nr_third_pass_failed = true;
+                        Log("third NR pass evaluation failed: 0x%08X (%s); falling back to pass two",
+                            static_cast<unsigned int>(third_result), ResultName(third_result));
+                    }
+                }
             }
             else
             {
@@ -5463,6 +5628,9 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (second_nr_succeeded)
         restore[restore_count++] = Transition(g_nr_second_stage.Get(),
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (third_nr_succeeded)
+        restore[restore_count++] = Transition(g_nr_third_stage.Get(),
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (evaluate_fg && !split_fg)
     {
@@ -5612,20 +5780,23 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     const unsigned long long frame = ++g_sr_frames;
     if (evaluate_nr) ++g_nr_frames;
     if (second_nr_succeeded) ++g_nr_second_frames;
+    if (third_nr_succeeded) ++g_nr_third_frames;
+    const unsigned int completed_nr_passes = third_nr_succeeded ? 3u :
+        (second_nr_succeeded ? 2u : (evaluate_nr ? 1u : 0u));
     const char *fg_status = (!g_framegen_failed && g_fg_frames.load() > 1) ? "2x" : "warming/fallback";
     const char *guide_status = use_external_guides ? "same-frame motion" : "fallback";
     if (evaluate_nr)
         SetStatus("active on present: NR model %d (%u pass%s) + %s + FG %s (%s guides)",
-            g_active_nr_model, second_nr_succeeded ? 2u : 1u,
-            second_nr_succeeded ? "es" : "", SrModeName(), fg_status, guide_status);
+            g_active_nr_model, completed_nr_passes,
+            completed_nr_passes == 1 ? "" : "es", SrModeName(), fg_status, guide_status);
     else
         SetStatus("active on present: NR disabled + %s + FG %s (%s guides)",
             SrModeName(), fg_status, guide_status);
     if (frame <= 8 || frame % 1800 == 0)
-        Log("on-present frame %llu: NR=%s passes=%u second_evals=%llu, %s=Success, model=%d, NR-reset=%d, NR-guides=%s, NR-control-mask=%s strength=%.2f, SR-history=%s, DLSS history mask=%s, input=%ux%u, output=%ux%u",
+        Log("on-present frame %llu: NR=%s passes=%u pass2_evals=%llu pass3_evals=%llu, %s=Success, model=%d, NR-reset=%d, NR-guides=%s, NR-control-mask=%s strength=%.2f, SR-history=%s, DLSS history mask=%s, input=%ux%u, output=%ux%u",
             frame, evaluate_nr ? "Success" : "DISABLED",
-            second_nr_succeeded ? 2u : (evaluate_nr ? 1u : 0u),
-            g_nr_second_frames.load(), SrModeName(), g_active_nr_model,
+            completed_nr_passes, g_nr_second_frames.load(), g_nr_third_frames.load(),
+            SrModeName(), g_active_nr_model,
             reset ? 1 : 0, use_external_guides ? "same-frame-motion" : "fallback",
             nr_control_mask ? "BOUND" : "none", g_nr_rejection_mask_strength,
             g_stable_sr_history ? "per-frame-reset/zero-motion" : "temporal/VORT",
@@ -10699,25 +10870,37 @@ static void DrawOverlay(reshade::api::effect_runtime *)
             g_nr_enabled ? "NR + DLSS SR + FG" : "DLSS SR + FG only");
     }
     ImGui::TextDisabled("Off skips NR evaluation; DLSS Super Resolution and optional Frame Generation remain active.");
-    if (ImGui::Checkbox("Enable second NR pass (experimental)", &g_nr_second_pass_enabled))
+    int nr_pass_index = static_cast<int>(std::clamp(g_nr_pass_count, 1u, 3u)) - 1;
+    if (ImGui::Combo("NR pass count (experimental)", &nr_pass_index,
+        "1x (default)\0" "2x (very expensive)\0" "3x (extreme)\0"))
     {
+        g_nr_pass_count = static_cast<unsigned int>(nr_pass_index + 1);
         g_nr_second_pass_failed = false;
+        g_nr_third_pass_failed = false;
         g_nr_second_frames = 0;
+        g_nr_third_frames = 0;
         g_need_history_reset = true;
         g_fg_frames = 0;
         if (g_neural_ready && g_nr_enabled)
             g_feature_recreate_requested = true;
-        Log("second NR pass changed to %s; feature recreation=%s",
-            g_nr_second_pass_enabled ? "enabled" : "disabled",
+        Log("NR pass count changed to %u; feature recreation=%s",
+            g_nr_pass_count,
             g_neural_ready && g_nr_enabled ? "queued" : "not required yet");
     }
-    ImGui::TextDisabled("Session-only manual opt-in. Always starts off after relaunch so a bad two-pass test cannot persist.");
-    ImGui::TextDisabled("Runs a separate NR feature over pass one before DLSS and can roughly double NR cost.");
-    if (g_nr_second_pass_enabled)
-        ImGui::TextDisabled("Second pass: %s; completed evaluations: %llu",
+    ImGui::TextDisabled("Session-only manual opt-in. Always returns to 1x after relaunch so a bad multi-pass test cannot persist.");
+    ImGui::TextDisabled("Each extra pass runs a separate NR feature before DLSS. 2x can roughly double NR cost; 3x can roughly triple it.");
+    if (g_nr_pass_count >= 2)
+    {
+        ImGui::TextDisabled("Pass 2: %s; completed evaluations: %llu",
             g_nr_second_pass_failed ? "failed - pass-one fallback active" :
                 (g_nr_second_feature ? "active" : "starting"),
             g_nr_second_frames.load());
+        if (g_nr_pass_count >= 3)
+            ImGui::TextDisabled("Pass 3: %s; completed evaluations: %llu",
+                g_nr_third_pass_failed ? "failed - pass-two fallback active" :
+                    (g_nr_third_feature ? "active" : "starting"),
+                g_nr_third_frames.load());
+    }
     bool async_compute = g_async_compute_requested;
     if (ImGui::Checkbox("Asynchronous NGX compute (experimental)", &async_compute))
     {
@@ -10887,9 +11070,9 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::Separator();
     ImGui::Text("Status: %s", g_neural_status);
     ImGui::TextUnformatted("Activation boundary: game OnPresent (standalone private NGX runtime)");
-    ImGui::Text("Pipeline: NR=%s (%llu frames, pass2=%llu); %s/%s preset %s=%llu; generated=%llu; FG=%s; active model=%d",
+    ImGui::Text("Pipeline: NR=%s (%llu frames, pass2=%llu, pass3=%llu); %s/%s preset %s=%llu; generated=%llu; FG=%s; active model=%d",
         g_nr_enabled ? (g_nr_feature ? "enabled" : "starting") : "disabled",
-        g_nr_frames.load(), g_nr_second_frames.load(), SrModeName(),
+        g_nr_frames.load(), g_nr_second_frames.load(), g_nr_third_frames.load(), SrModeName(),
         g_active_dlss_quality >= 0 ? DlssQualityName(g_active_dlss_quality) : "waiting",
         DlssRenderPresetName(g_active_dlss_render_preset),
         g_sr_frames.load(), g_fg_frames.load(),
@@ -11109,6 +11292,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("StableSrHistory", "0", value, sizeof(value)); g_stable_sr_history = strcmp(value, "0") != 0;
         read_setting("VortGuides", "0", value, sizeof(value)); g_vort_guides_enabled = strcmp(value, "0") != 0;
         read_setting("NeuralRendering", "1", value, sizeof(value)); g_nr_enabled = strcmp(value, "0") != 0;
+        // Multi-pass NR is deliberately session-only. Never inherit a risky
+        // 2x/3x selection after a crash or normal restart.
+        g_nr_pass_count = 1;
+        g_nr_second_pass_failed = false;
+        g_nr_third_pass_failed = false;
         read_setting("AsyncComputePipeline", "1", value, sizeof(value)); g_async_compute_requested = strcmp(value, "0") != 0;
         read_setting("FrameGeneration", "1", value, sizeof(value)); g_framegen_enabled = strcmp(value, "0") != 0;
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
@@ -11139,7 +11327,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         Log("Standalone DLSS-NR + SR %s attached; requested profile=%s DLSS_render_preset=%s model=%d style=%u NR=%s NR_passes=%u async_compute=%s adaptive_governor=%s NR-mask=%s strength=%.2f VORT=%s early_proxy=%s auto_presentation=%s windowed_virtualization=%s logical_client=%s input_coordinates=%s detached_output=%s detached_cursor=%s opaque_composition=%s presenter=%s telemetry=%s",
             ADDON_VERSION, ProfileName(g_color_profile), DlssRenderPresetName(g_dlss_render_preset),
             g_nr_model, NrStyle(), g_nr_enabled ? "enabled" : "disabled",
-            g_nr_second_pass_enabled ? 2u : 1u,
+            g_nr_pass_count,
             g_async_compute_requested ? "requested" : "disabled",
             g_adaptive_governor_enabled ? "enabled" : "disabled",
             g_nr_rejection_mask_enabled ? "enabled" : "disabled", g_nr_rejection_mask_strength,
@@ -11257,7 +11445,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         g_capture_ready_event = nullptr;
         g_legacy_fence11.Reset(); g_legacy_fence12.Reset(); g_legacy_context4.Reset();
         g_legacy_context11.Reset(); g_legacy_device11.Reset();
-        g_fg_stage.Reset(); g_sr_stage.Reset(); g_nr_stage.Reset(); g_nr_second_stage.Reset();
+        g_fg_stage.Reset(); g_sr_stage.Reset(); g_nr_stage.Reset();
+        g_nr_second_stage.Reset(); g_nr_third_stage.Reset();
         g_post_reshade_color.Reset(); g_post_reshade_color_ready = false;
         g_packed_color.Reset();
         g_guide_telemetry_fence.Reset(); g_guide_telemetry_readback.Reset();
