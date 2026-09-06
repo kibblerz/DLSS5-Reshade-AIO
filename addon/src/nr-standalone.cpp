@@ -34,7 +34,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 
-#define ADDON_VERSION "2.0.5-queue-pressure-warning-prototype8"
+#define ADDON_VERSION "2.0.5-queue-pressure-warning-prototype9"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -8206,8 +8206,15 @@ static bool PresentProxySourcesOnWorker(ID3D12Resource *real_source,
         !g_suppress_queue_pressure_warning.load(std::memory_order_acquire))
     {
         char warning[kPipelineNoticeTextLength + 1] = {};
-        sprintf_s(warning, "LOWER FPS CAP %u OR BELOW FOR STABILITY",
-            g_queue_pressure_recommended_cap.load(std::memory_order_acquire));
+        // Keep the proven 40-character compositor layout. The full warning is
+        // presented as two timed clauses rather than expanding root constants
+        // or introducing another risky text-rendering path.
+        const ULONGLONG warning_phase = GetTickCount64() % 6000;
+        if (warning_phase >= 4000 && EffectiveFramegenEnabled() && !g_framegen_failed)
+            strcpy_s(warning, "AND IMPROVED FRAMEGEN");
+        else
+            sprintf_s(warning, "LOWER FPS CAP %u OR BELOW FOR STABILITY",
+                g_queue_pressure_recommended_cap.load(std::memory_order_acquire));
         constants.notice_visible = 1u;
         for (; constants.notice_length < kPipelineNoticeTextLength &&
             warning[constants.notice_length] != '\0'; ++constants.notice_length)
