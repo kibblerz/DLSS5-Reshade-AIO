@@ -50,7 +50,7 @@
 #include "feed_vk.h"   // raw-Vulkan interop, likewise -- compiled x86 here
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
 
-#define FEED_VERSION "2.0.9-x86-prototype.5"
+#define FEED_VERSION "2.0.9-x86-prototype.6"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR (32-bit wrapper) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -2582,9 +2582,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     {
         g_cfg.show_processed_output = show_processed_output ? 1 : 0;
         CfgSave();
-        CaptureGameFocus();
-        HostClose();
-        RestoreGameFocus();
+        HostApplySettings();
         Log("[feed32] virtual-screen startup output changed to %s; carrier restart requested",
             show_processed_output ? "processed" : "raw A/B");
     }

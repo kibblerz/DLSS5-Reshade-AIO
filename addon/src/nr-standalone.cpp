@@ -8975,8 +8975,15 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
         // client. Once the game itself enters native borderless, bind the same
         // visual directly to its HWND so independent-flip/z-order promotion
         // cannot cover the processed output.
-        composition_window = native_client ? g_game_window : g_proxy_window;
-        g_same_window_compositor = native_client;
+        // In the x86 carrier path g_game_window is the helper's HWND, not the
+        // actual game's HWND. Attaching the visual there puts the processed
+        // output behind the real game because the helper intentionally lives
+        // at the bottom of Z order. External carriers therefore always use the
+        // detached virtual-screen host, even when the helper client happens to
+        // match the native output size.
+        const bool attach_to_game_window = native_client && g_external_game_process_id == 0;
+        composition_window = attach_to_game_window ? g_game_window : g_proxy_window;
+        g_same_window_compositor = attach_to_game_window;
         if (!g_same_window_compositor && !InstallWindowQueryHooks())
             Log("detached cursor-coordinate hooks unavailable; proxy movement may not track the game cursor");
     }
@@ -10679,7 +10686,7 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
                     physical_width + 2 >= output_width && physical_height + 2 >= output_height;
                 QueueCompositionRetarget(g_proxy_overlay_preview.load() && g_proxy_preview_window != nullptr ?
                     g_proxy_preview_window :
-                    (native_client ? g_game_window : g_proxy_window));
+                    (native_client && g_external_game_process_id == 0 ? g_game_window : g_proxy_window));
             }
         }
     }
@@ -11248,12 +11255,13 @@ static void OnInitSwapchain(reshade::api::swapchain *swapchain, bool)
     {
         const bool native_client = client_width + 2 >= static_cast<LONG>(g_output_width.load()) &&
             client_height + 2 >= static_cast<LONG>(g_output_height.load());
+        const bool attach_to_game_window = native_client && g_external_game_process_id == 0;
         const HWND desired_host = g_proxy_overlay_preview.load() && g_proxy_preview_window != nullptr ?
             g_proxy_preview_window :
-            (native_client ? hwnd : g_proxy_window);
+            (attach_to_game_window ? hwnd : g_proxy_window);
         QueueCompositionRetarget(desired_host);
         Log("composition ownership evaluated after swapchain change: client=%ldx%ld desired=%s hwnd=%p",
-            client_width, client_height, native_client ? "attached/game-HWND" : "detached/proxy-HWND",
+            client_width, client_height, attach_to_game_window ? "attached/game-HWND" : "detached/proxy-HWND",
             desired_host);
     }
 
