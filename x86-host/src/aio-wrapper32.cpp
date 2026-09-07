@@ -240,6 +240,7 @@ static bool CfgReload()   // true when a build-affecting value changed
 // ---------------------------------------------------------------------------
 
 static const char *kEffectFile    = "DLSS5_Feed.fx";
+static const char *kD3D9EffectFile = "DLSS5_Feed_D3D9.fx";
 static const char *kTechnique     = "DLSS5_Feed";
 // Known motion-vector providers, keyed by the DLSS5_MV_PROVIDER value DLSS5_Feed.fx
 // was compiled with (0 texMotionVectors, 1 Launchpad, 2 VORT, 3 LumeniteFX Kernel,
@@ -2487,9 +2488,28 @@ static bool OnSetFullscreenState(reshade::api::swapchain *swapchain, bool fullsc
 
 static void ResolveHandles(reshade::api::effect_runtime *rt)
 {
-    g.technique = rt->find_technique(kEffectFile, kTechnique);
-    g.mv_var    = rt->find_texture_variable(kEffectFile, "DLSS5_MV");
-    g.depth_var = rt->find_texture_variable(kEffectFile, "DLSS5_Depth");
+    const bool native_d3d9 = rt->get_device()->get_api() == reshade::api::device_api::d3d9;
+    const char *effect_file = native_d3d9 ? kD3D9EffectFile : kEffectFile;
+    g.technique = rt->find_technique(effect_file, kTechnique);
+    g.mv_var    = rt->find_texture_variable(effect_file, "DLSS5_MV");
+    g.depth_var = rt->find_texture_variable(effect_file, "DLSS5_Depth");
+    if (native_d3d9)
+    {
+        g.launchpad = {};
+        g.depth_reversed = true;
+        g.handles_ok = g.technique.handle != 0;
+        g.missing_reported = false;
+        strcpy_s(g_mv_status, "Native D3D9: deterministic neutral motion/depth guides");
+        g_mv_problem[0] = '\0';
+        if (g.technique.handle != 0)
+        {
+            rt->set_technique_state(g.technique, true);
+            Log("[feed32] native D3D9 capture trigger found and enabled");
+        }
+        else
+            Warn("DLSS5_Feed_D3D9.fx is missing or failed to compile");
+        return;
+    }
     const int mode = ReadMvProviderMode(rt);
     g.launchpad = {};
     const char *provider = "none";
