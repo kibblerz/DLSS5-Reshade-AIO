@@ -50,7 +50,7 @@
 #include "feed_vk.h"   // raw-Vulkan interop, likewise -- compiled x86 here
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
 
-#define FEED_VERSION "2.0.9-x86-prototype.6"
+#define FEED_VERSION "2.0.9-x86-prototype.7"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR (32-bit wrapper) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -2313,6 +2313,57 @@ static void OnReloadedEffects(reshade::api::effect_runtime *rt)
     if (rt == g.runtime || g.runtime == nullptr) { g.runtime = rt; ResolveHandles(rt); }
 }
 
+struct HostProxyWindowSearch
+{
+    DWORD process_id;
+    HWND window;
+};
+
+static BOOL CALLBACK FindHostProxyWindowProc(HWND window, LPARAM parameter)
+{
+    auto *search = reinterpret_cast<HostProxyWindowSearch *>(parameter);
+    DWORD process_id = 0;
+    GetWindowThreadProcessId(window, &process_id);
+    if (process_id != search->process_id)
+        return TRUE;
+
+    wchar_t class_name[96] = {};
+    if (GetClassNameW(window, class_name, static_cast<int>(std::size(class_name))) != 0 &&
+        wcscmp(class_name, L"StandaloneDLSSNRNativeOutput") == 0)
+    {
+        search->window = window;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static HWND FindHostProxyWindow()
+{
+    if (!HostAlive()) return nullptr;
+    HostProxyWindowSearch search = {GetProcessId(g.hproc), nullptr};
+    if (search.process_id != 0)
+        EnumWindows(FindHostProxyWindowProc, reinterpret_cast<LPARAM>(&search));
+    return search.window;
+}
+
+static bool OnReshadeOpenOverlay(reshade::api::effect_runtime *runtime, bool open,
+    reshade::api::input_source)
+{
+    if (runtime != g.runtime) return false;
+
+    // WM_APP + 0x56 is the normal AIO's proxy side-preview command. Moving the
+    // x64 virtual screen into that preview exposes this process's real ReShade
+    // runtime, so mouse and keyboard input stay native to the 32-bit game.
+    const HWND proxy_window = FindHostProxyWindow();
+    if (proxy_window != nullptr && PostMessageW(proxy_window, WM_APP + 0x56, open ? 1 : 0, 0))
+        Log("[feed32] ReShade overlay %s; x64 virtual output %s",
+            open ? "opened" : "closed", open ? "moved to side preview" : "restored full-screen");
+    else
+        Log("[feed32] ReShade overlay %s before the x64 virtual output was available",
+            open ? "opened" : "closed");
+    return false;
+}
+
 static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::effect_technique technique,
                               reshade::api::command_list *cl, reshade::api::resource_view rtv,
                               reshade::api::resource_view /*rtv_srgb*/)
@@ -2688,6 +2739,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
         reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
+        reshade::register_event<reshade::addon_event::reshade_open_overlay>(OnReshadeOpenOverlay);
         reshade::register_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
         reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
         reshade::register_overlay(nullptr, DrawOverlay);
@@ -2700,6 +2752,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
         reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
+        reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(OnReshadeOpenOverlay);
         reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
         reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
         FeedVkHookRemove();   // before this code is unmapped -- ReShade reloads add-ons per Vulkan instance
