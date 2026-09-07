@@ -243,6 +243,13 @@ static bool CfgReload()   // true when a build-affecting value changed
 static const char *kEffectFile    = "DLSS5_Feed.fx";
 static const char *kD3D9EffectFile = "DLSS5_Feed_D3D9.fx";
 static const char *kTechnique     = "DLSS5_Feed";
+static constexpr UINT kProxySelectNrModelMessage = WM_APP + 0x57;
+static constexpr UINT kProxySelectDlssPresetMessage = WM_APP + 0x58;
+static constexpr UINT kProxySelectNrPassCountMessage = WM_APP + 0x59;
+static constexpr UINT kProxyVisibilityMessage = WM_APP + 0x53;
+static constexpr UINT kProxyShowProcessedMessage = WM_APP + 0x5A;
+static constexpr UINT kProxyEnableNrMessage = WM_APP + 0x5B;
+static constexpr UINT kProxyEnableFgMessage = WM_APP + 0x5C;
 // Known motion-vector providers, keyed by the DLSS5_MV_PROVIDER value DLSS5_Feed.fx
 // was compiled with (0 texMotionVectors, 1 Launchpad, 2 VORT, 3 LumeniteFX Kernel,
 // 4 LumeniteFX QuantMotion). Name checks only, for the status line and a mismatch warning.
@@ -358,6 +365,12 @@ struct Feed32
     ID3D11Query            *query11;
     IDirect3DTexture9      *d3d9_color_stage;
     IDirect3DTexture9      *d3d9_output_stage;
+    IDirect3DSurface9      *d3d9_cpu_readback;
+    bool                    d3d9_cpu_bridge;
+    UINT64                  d3d9_pending_frame;
+    ULONGLONG               d3d9_pending_deadline;
+    ULONGLONG               d3d9_resume_after;
+    bool                    d3d9_device_lost;
     ID3D11Texture2D        *d3d9_output_stage11;
     ID3D11RenderTargetView *d3d9_output_rtv;
     ID3D11Texture2D        *d3d9_zero_mv;
@@ -503,7 +516,12 @@ static void HostDrain()
     // a settings apply). Never let go of a live host before the last submitted frame
     // has been signalled. The host also catch-up-signals fence_out on its way out,
     // so with both sides healthy this resolves in milliseconds.
-    if (!g.fence_wait_queued) return;
+    // Classic D3D9's CPU fallback deliberately does not enqueue a D3D11 GPU wait:
+    // an unsignalled host fence would otherwise hold Present (and sometimes the
+    // entire desktop) hostage. It can still have one host frame outstanding, so
+    // drain that fence value from the CPU before releasing its shared resources.
+    const UINT64 cpu_pending = g.d3d9_cpu_bridge ? g.d3d9_pending_frame : 0;
+    if (!g.fence_wait_queued && cpu_pending == 0) return;
     if (g.is_vulkan)
     {
         // The imported timeline semaphore IS the host's D3D12 fence, so it can be both
@@ -546,6 +564,22 @@ static void HostDrain()
         return;
     }
     if (g.fence_out == nullptr) return;
+    if (cpu_pending != 0)
+    {
+        g.d3d9_pending_frame = 0;
+        g.d3d9_pending_deadline = 0;
+        if (g.fence_out->GetCompletedValue() >= cpu_pending) return;
+        HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (evt != nullptr)
+        {
+            if (SUCCEEDED(g.fence_out->SetEventOnCompletion(cpu_pending, evt)) &&
+                WaitForSingleObject(evt, 2000) != WAIT_OBJECT_0)
+                Log("[feed32] drain: classic D3D9 host frame %llu never signalled",
+                    static_cast<unsigned long long>(cpu_pending));
+            CloseHandle(evt);
+        }
+        return;
+    }
     g.fence_wait_queued = false;
     if (g.fence_out->GetCompletedValue() >= g.frame_n) return;
     if (g.hproc == nullptr || WaitForSingleObject(g.hproc, 0) != WAIT_TIMEOUT)
@@ -617,6 +651,7 @@ static void HostClose()
 // clicks Apply, so we capture it there and spend it a couple of seconds later.
 static HWND g_restore_focus;
 static int g_aio_nr_pass_count = 1;
+static bool g_aio_nr_pass_touched;
 
 static void CaptureGameFocus()
 {
@@ -848,10 +883,63 @@ static void LogHostNR(const char *what)
 }
 
 static void HostClose();   // below
+static HWND FindHostProxyWindow();
+static void HideClassicD3D9Proxy();
+
+static bool TryApplyLiveHostSettings()
+{
+    bool any = g_aio_nr_pass_touched;
+    for (int i = 0; i < NR_COUNT; ++i)
+    {
+        if (!g_nr_touched[i]) continue;
+        any = true;
+        if (strcmp(kNR[i].key, "Model") != 0 &&
+            strcmp(kNR[i].key, "DlssRenderPreset") != 0 &&
+            strcmp(kNR[i].key, "NeuralRendering") != 0 &&
+            strcmp(kNR[i].key, "FrameGeneration") != 0)
+            return false;
+    }
+    if (!any) return true;
+
+    const HWND proxy = FindHostProxyWindow();
+    if (proxy == nullptr) return false;
+    for (int i = 0; i < NR_COUNT; ++i)
+    {
+        if (!g_nr_touched[i]) continue;
+        const int encoded = static_cast<int>(EncodeAioValue(i, g_nr[i]));
+        UINT message = kProxySelectDlssPresetMessage;
+        if (strcmp(kNR[i].key, "Model") == 0) message = kProxySelectNrModelMessage;
+        else if (strcmp(kNR[i].key, "NeuralRendering") == 0) message = kProxyEnableNrMessage;
+        else if (strcmp(kNR[i].key, "FrameGeneration") == 0) message = kProxyEnableFgMessage;
+        if (!PostMessageW(proxy, message, static_cast<WPARAM>(encoded), 0))
+            return false;
+        g_nr_present[i] = true;
+        g_nr_touched[i] = false;
+    }
+    if (g_aio_nr_pass_touched)
+    {
+        if (!PostMessageW(proxy, kProxySelectNrPassCountMessage,
+                          static_cast<WPARAM>(std::clamp(g_aio_nr_pass_count, 1, 3)), 0))
+            return false;
+        g_aio_nr_pass_touched = false;
+    }
+    Log("[feed32] NR/FG/model/DLSS preset/pass-count change sent live; carrier restart avoided");
+    return true;
+}
 
 static void HostApplySettings()
 {
     LogHostNR("applying DLSS 5 host settings");
+    if (g.d3d9_cpu_bridge)
+    {
+        if (TryApplyLiveHostSettings())
+        {
+            Warn("DLSS 5 live-safe setting applied without restarting the classic D3D9 carrier");
+            return;
+        }
+        Warn("Classic D3D9 safety: this setting requires a game restart; the active carrier was left running");
+        return;
+    }
     CaptureGameFocus();   // spent once the replacement host has connected
 
     // Order matters: the host's ReShade saves its ini ON EXIT and would clobber our
@@ -914,8 +1002,13 @@ static void ReleaseShared()
     SafeRelease(g.d3d9_zero_depth);
     SafeRelease(g.d3d9_output_rtv);
     SafeRelease(g.d3d9_output_stage11);
+    SafeRelease(g.d3d9_cpu_readback);
     SafeRelease(g.d3d9_output_stage);
     SafeRelease(g.d3d9_color_stage);
+    g.d3d9_pending_frame = 0;
+    g.d3d9_pending_deadline = 0;
+    g.d3d9_resume_after = 0;
+    g.d3d9_cpu_bridge = false;
     SafeRelease(g.d3d10_output_stage);
     SafeRelease(g.d3d10_color_stage);
     SafeRelease(g.output_srv);
@@ -928,6 +1021,26 @@ static void ReleaseShared()
         if (g.tex_handle[i] != nullptr) { CloseHandle(g.tex_handle[i]); g.tex_handle[i] = nullptr; }
     }
     g.built = false;
+}
+
+static void PrepareClassicD3D9ForReset(const char *reason)
+{
+    if (!g.is_d3d9) return;
+    HideClassicD3D9Proxy();
+    Log("[feed32] classic D3D9 device lost/reset (%s); releasing all default-pool bridge resources",
+        reason != nullptr ? reason : "unknown");
+
+    // A classic D3D9 Reset returns D3DERR_INVALIDCALL while *any* default-pool
+    // resource from the old device state is alive. End the carrier first so it
+    // releases its cross-process handles, then drop every D3D9 capture surface and
+    // query before allowing the game to call Reset again.
+    HostClose();
+    ReleaseShared();
+    SafeRelease(g.query9);
+    g.d3d9_device_lost = true;
+    g.need_reset = true;
+    g.consecutive_fails = 0;
+    g_retry_at = 0;
 }
 
 static DXGI_FORMAT FromD3D9Format(D3DFORMAT format)
@@ -1005,7 +1118,17 @@ static IDXGIAdapter1 *FindD3D9Adapter(IDirect3DDevice9 *device9)
 
 static bool InitializeD3D9Transport(IDirect3DDevice9 *device9)
 {
-    if (g.dev != nullptr && g.ctx4 != nullptr && g.dev9 == device9) return true;
+    if (g.dev != nullptr && g.ctx4 != nullptr && g.dev9 == device9)
+    {
+        if (g.query9 == nullptr)
+            device9->CreateQuery(D3DQUERYTYPE_EVENT, &g.query9);
+        if (g.query11 == nullptr)
+        {
+            D3D11_QUERY_DESC qd = { D3D11_QUERY_EVENT, 0 };
+            g.dev->CreateQuery(&qd, &g.query11);
+        }
+        return g.query9 != nullptr && g.query11 != nullptr;
+    }
     IDXGIAdapter1 *adapter = FindD3D9Adapter(device9);
     if (adapter == nullptr) { Log("[feed32] D3D9 adapter could not be matched to DXGI"); return false; }
     ID3D11DeviceContext *context = nullptr;
@@ -1057,8 +1180,31 @@ static bool CreateD3D9SharedStage(UINT width, UINT height, DXGI_FORMAT format,
     if (FAILED(hr))
     {
         SafeRelease(*texture9); SafeRelease(*texture11);
-        Log("[feed32] D3D9/D3D11 shared stage failed: %ux%u fmt=%u hr=0x%08X", width, height, format, hr);
-        return false;
+        // A classic IDirect3DDevice9 (rather than IDirect3DDevice9Ex) rejects
+        // shared handles with D3DERR_INVALIDCALL. Keep the existing fast path
+        // for Ex devices, but fall back to an ordinary render target plus a
+        // system-memory readback. The x64 carrier owns the detached processed
+        // output, so this path only has to move the source frame into D3D11;
+        // it does not need an equally expensive CPU copy back into D3D9.
+        D3D11_TEXTURE2D_DESC local_desc = desc;
+        local_desc.MiscFlags = 0;
+        HRESULT fallback_hr = g.dev9->CreateTexture(width, height, 1, D3DUSAGE_RENDERTARGET, format9,
+                                                     D3DPOOL_DEFAULT, texture9, nullptr);
+        if (SUCCEEDED(fallback_hr))
+            fallback_hr = g.dev->CreateTexture2D(&local_desc, nullptr, texture11);
+        if (SUCCEEDED(fallback_hr) && g.d3d9_cpu_readback == nullptr)
+            fallback_hr = g.dev9->CreateOffscreenPlainSurface(width, height, format9, D3DPOOL_SYSTEMMEM,
+                                                               &g.d3d9_cpu_readback, nullptr);
+        if (FAILED(fallback_hr))
+        {
+            SafeRelease(*texture9); SafeRelease(*texture11);
+            Log("[feed32] D3D9/D3D11 shared stage failed: %ux%u fmt=%u shared=0x%08X fallback=0x%08X",
+                width, height, format, hr, fallback_hr);
+            return false;
+        }
+        if (!g.d3d9_cpu_bridge)
+            Log("[feed32] classic D3D9 device rejected shared textures (0x%08X); using CPU capture + detached x64 output", hr);
+        g.d3d9_cpu_bridge = true;
     }
     return true;
 }
@@ -1083,6 +1229,26 @@ static bool WaitForD3D11Copy()
     while ((hr = g.ctx4->GetData(g.query11, nullptr, 0, 0)) == S_FALSE && GetTickCount64() < deadline)
         SwitchToThread();
     return hr == S_OK;
+}
+
+static bool WaitForHostFenceCpu(UINT64 value, DWORD timeout_ms)
+{
+    if (g.fence_out == nullptr) return false;
+    if (g.fence_out->GetCompletedValue() >= value) return true;
+
+    HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (evt == nullptr) return false;
+    const HRESULT hr = g.fence_out->SetEventOnCompletion(value, evt);
+    const DWORD wait = SUCCEEDED(hr) ? WaitForSingleObject(evt, timeout_ms) : WAIT_FAILED;
+    CloseHandle(evt);
+    return wait == WAIT_OBJECT_0;
+}
+
+static void HideClassicD3D9Proxy()
+{
+    const HWND proxy = FindHostProxyWindow();
+    if (proxy != nullptr)
+        PostMessageW(proxy, kProxyVisibilityMessage, 0, 0);
 }
 
 static bool InitializeD3D10Transport(ID3D10Device1 *device10)
@@ -1933,11 +2099,60 @@ static void FeedFrameD3D9(reshade::api::effect_runtime *rt, reshade::api::resour
     if (device9 == nullptr || source9 == nullptr || FAILED(source9->GetDesc(&sd))) return;
 
     g.is_d3d9 = true;
+    if (g.d3d9_device_lost)
+    {
+        const HRESULT cooperative = device9->TestCooperativeLevel();
+        if (cooperative != D3D_OK)
+            return; // the game owns Reset; do not touch its lost device while it recovers
+        g.d3d9_device_lost = false;
+        g.need_reset = true;
+        Log("[feed32] classic D3D9 device recovered; rebuilding the bridge on the new device state");
+    }
     if (ApplyPendingWorkResolution()) g.built = false;
     if ((g.frames_done % 60) == 0 && CfgReload()) g.built = false;
     if (!g_cfg.enabled || g_cfg.mode == 0) return;
     if (!InitializeD3D9Transport(device9))
     { FeedDisable("native D3D9 transport initialization failed"); return; }
+
+    // The classic (non-Ex) D3D9 fallback has a single CPU-uploaded input set.
+    // Never overwrite it while the x64 host still owns the preceding frame. More
+    // importantly, do not queue a GPU wait for that host here: if NGX pauses during
+    // a loading transition, that wait also blocks the game's Present indefinitely.
+    const ULONGLONG now = GetTickCount64();
+    if (g.d3d9_cpu_bridge && g.d3d9_pending_frame != 0)
+    {
+        if (g.fence_out != nullptr &&
+            g.fence_out->GetCompletedValue() >= g.d3d9_pending_frame)
+        {
+            Log("[feed32] classic D3D9 host frame %llu completed after the loading-safety timeout",
+                static_cast<unsigned long long>(g.d3d9_pending_frame));
+            g.d3d9_pending_frame = 0;
+            g.d3d9_pending_deadline = 0;
+            g.need_reset = true;
+            ++g.frames_done;
+            g.consecutive_fails = 0;
+        }
+        else
+        {
+            HideClassicD3D9Proxy();
+            if (g.d3d9_pending_deadline != 0 && now >= g.d3d9_pending_deadline)
+            {
+                // Leave the game's original Present path untouched for the rest of
+                // this run. The user can retry from the add-on page; a wedged host is
+                // never allowed to turn an old game's loading screen into a PC hang.
+                g.d3d9_pending_frame = 0;
+                g.d3d9_pending_deadline = 0;
+                FeedDisable("classic D3D9 host stopped completing frames during a loading transition");
+            }
+            return;
+        }
+    }
+    if (g.d3d9_cpu_bridge && now < g.d3d9_resume_after)
+    {
+        HideClassicD3D9Proxy();
+        return;
+    }
+    if (g.d3d9_cpu_bridge) g.d3d9_resume_after = 0;
 
     const DXGI_FORMAT bb_fmt = FromD3D9Format(sd.Format);
     const UINT work_w = ScaledExtent(sd.Width, g_cfg.work_resolution);
@@ -1959,11 +2174,68 @@ static void FeedFrameD3D9(reshade::api::effect_runtime *rt, reshade::api::resour
     if (ok && g.built && HostAlive())
     {
         IDirect3DSurface9 *stage_in9 = nullptr;
-        if (SUCCEEDED(g.d3d9_color_stage->GetSurfaceLevel(0, &stage_in9)) &&
-            SUCCEEDED(device9->StretchRect(source9, nullptr, stage_in9, nullptr, D3DTEXF_NONE)) &&
-            WaitForD3D9Copy() &&
-            CopyOrResampleInputs(g.ctx4, g.color_stage, g.d3d9_zero_mv, g.d3d9_zero_depth,
-                                 g.d3d9_zero_mv_srv, g.d3d9_zero_depth_srv, sd.Width, sd.Height))
+        bool captured = false;
+        bool loading_safety_pause = false;
+        bool device_lost = false;
+        const char *capture_failure = nullptr;
+        HRESULT capture_hr = S_OK;
+        const ULONGLONG capture_started = GetTickCount64();
+        if (SUCCEEDED(g.d3d9_color_stage->GetSurfaceLevel(0, &stage_in9)) && stage_in9 != nullptr)
+        {
+            if (g.d3d9_cpu_bridge)
+            {
+                // GetRenderTargetData performs the unavoidable GPU->CPU sync on
+                // classic D3D9. Upload to our local D3D11 staging texture; the
+                // normal resample/shared-input path continues from there.
+                D3DLOCKED_RECT locked = {};
+                capture_hr = device9->StretchRect(source9, nullptr, stage_in9, nullptr, D3DTEXF_NONE);
+                if (FAILED(capture_hr)) capture_failure = "StretchRect";
+                if (SUCCEEDED(capture_hr))
+                {
+                    capture_hr = device9->GetRenderTargetData(stage_in9, g.d3d9_cpu_readback);
+                    if (FAILED(capture_hr)) capture_failure = "GetRenderTargetData";
+                }
+                if (SUCCEEDED(capture_hr))
+                {
+                    capture_hr = g.d3d9_cpu_readback->LockRect(&locked, nullptr, D3DLOCK_READONLY);
+                    if (FAILED(capture_hr)) capture_failure = "LockRect";
+                }
+                if (SUCCEEDED(capture_hr))
+                {
+                    g.ctx4->UpdateSubresource(g.color_stage, 0, nullptr, locked.pBits,
+                                              static_cast<UINT>(locked.Pitch), 0);
+                    g.d3d9_cpu_readback->UnlockRect();
+                    captured = CopyOrResampleInputs(g.ctx4, g.color_stage, g.d3d9_zero_mv, g.d3d9_zero_depth,
+                                                    g.d3d9_zero_mv_srv, g.d3d9_zero_depth_srv,
+                                                    sd.Width, sd.Height);
+                    if (!captured) capture_failure = "D3D11 upload/resample";
+                }
+            }
+            else
+            {
+                captured = SUCCEEDED(device9->StretchRect(source9, nullptr, stage_in9, nullptr, D3DTEXF_NONE)) &&
+                           WaitForD3D9Copy() &&
+                           CopyOrResampleInputs(g.ctx4, g.color_stage, g.d3d9_zero_mv, g.d3d9_zero_depth,
+                                                g.d3d9_zero_mv_srv, g.d3d9_zero_depth_srv,
+                                                sd.Width, sd.Height);
+            }
+        }
+        const ULONGLONG capture_ms = GetTickCount64() - capture_started;
+        if (g.d3d9_cpu_bridge && capture_ms > 250)
+        {
+            // GetRenderTargetData is synchronous on classic D3D9. If the GPU was
+            // unavailable for a quarter second, submitting more NR work immediately
+            // tends to starve games whose loader and Present share a thread. Give the
+            // game a short unprocessed recovery window instead.
+            loading_safety_pause = true;
+            captured = false;
+            g.d3d9_resume_after = GetTickCount64() + 1500;
+            g.need_reset = true;
+            HideClassicD3D9Proxy();
+            Log("[feed32] classic D3D9 capture took %llu ms; bypassing the pipeline for 1500 ms",
+                static_cast<unsigned long long>(capture_ms));
+        }
+        if (captured)
         {
             const UINT64 n = ++g.frame_n;
             const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
@@ -1975,28 +2247,66 @@ static void FeedFrameD3D9(reshade::api::effect_runtime *rt, reshade::api::resour
             if (!PipeWrite(&tag, 1) || !PipeWrite(&fm, sizeof(fm))) HostLost("D3D9 frame message failed");
             else
             {
-                g.ctx4->Wait(g.fence_out, n);
-                g.fence_wait_queued = true;
-                BlitOutputToBackbuffer(g.ctx4, g.d3d9_output_rtv);
-                if (WaitForD3D11Copy())
+                if (g.d3d9_cpu_bridge)
                 {
-                    g.fence_wait_queued = false; // the event query retired the wait and copy-back
-                    IDirect3DSurface9 *stage_out9 = nullptr;
-                    if (SUCCEEDED(g.d3d9_output_stage->GetSurfaceLevel(0, &stage_out9)) &&
-                        SUCCEEDED(device9->StretchRect(stage_out9, nullptr, source9, nullptr, D3DTEXF_NONE)) &&
-                        WaitForD3D9Copy())
+                    // The carrier's detached native-resolution window presents
+                    // the processed frame. Wait from the CPU with a hard deadline;
+                    // unlike ID3D11DeviceContext4::Wait this cannot poison the GPU
+                    // queue with an unsatisfiable wait if the host stalls or exits.
+                    if (WaitForHostFenceCpu(n, 250))
                     {
                         const UINT64 done = ++g.frames_done;
                         g.consecutive_fails = 0;
                         if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
-                            Log("[feed32] frame %llu delivered (%ux%u, reset=%d, native D3D9)", done, g.width, g.height, reset);
+                            Log("[feed32] frame %llu delivered (%ux%u, reset=%d, classic D3D9 CPU capture)",
+                                done, g.width, g.height, reset);
                     }
-                    SafeRelease(stage_out9);
+                    else
+                    {
+                        g.d3d9_pending_frame = n;
+                        g.d3d9_pending_deadline = GetTickCount64() + 3000;
+                        g.d3d9_resume_after = GetTickCount64() + 1500;
+                        g.need_reset = true;
+                        HideClassicD3D9Proxy();
+                        Log("[feed32] classic D3D9 host frame %llu exceeded 250 ms; showing the original game while it recovers",
+                            static_cast<unsigned long long>(n));
+                    }
+                }
+                else
+                {
+                    g.ctx4->Wait(g.fence_out, n);
+                    g.fence_wait_queued = true;
+                    BlitOutputToBackbuffer(g.ctx4, g.d3d9_output_rtv);
+                    if (WaitForD3D11Copy())
+                    {
+                        g.fence_wait_queued = false; // the event query retired the wait and copy-back
+                        IDirect3DSurface9 *stage_out9 = nullptr;
+                        if (SUCCEEDED(g.d3d9_output_stage->GetSurfaceLevel(0, &stage_out9)) &&
+                            SUCCEEDED(device9->StretchRect(stage_out9, nullptr, source9, nullptr, D3DTEXF_NONE)) &&
+                            WaitForD3D9Copy())
+                        {
+                            const UINT64 done = ++g.frames_done;
+                            g.consecutive_fails = 0;
+                            if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
+                                Log("[feed32] frame %llu delivered (%ux%u, reset=%d, native D3D9)", done, g.width, g.height, reset);
+                        }
+                        SafeRelease(stage_out9);
+                    }
                 }
             }
         }
-        else FeedFail("native D3D9 frame bridge");
+        else if (!loading_safety_pause)
+        {
+            if (capture_failure != nullptr)
+                Log("[feed32] native D3D9 capture failed at %s: 0x%08X",
+                    capture_failure, static_cast<unsigned int>(capture_hr));
+            device_lost = capture_hr == D3DERR_DEVICELOST || capture_hr == D3DERR_DEVICENOTRESET;
+            if (!device_lost)
+                FeedFail("native D3D9 frame bridge");
+        }
         SafeRelease(stage_in9);
+        if (device_lost)
+            PrepareClassicD3D9ForReset(capture_failure);
     }
     else if (ok && !HostAlive() && g.hproc != nullptr) HostLost("process died");
 
@@ -2645,6 +2955,35 @@ static DWORD WINAPI DeferredFullscreenVirtualizationWorker(void *parameter)
     return 0;
 }
 
+static bool OnCreateSwapchain(reshade::api::device_api api,
+    reshade::api::swapchain_desc &desc, void *window)
+{
+    if (g_cfg.enabled == 0 || api != reshade::api::device_api::d3d9 ||
+        !desc.fullscreen_state)
+        return false;
+
+    // A second, detached native-output HWND cannot coexist reliably with classic
+    // D3D9 exclusive fullscreen. Fable demonstrates the failure mode: merely
+    // exposing that top-level output can lose the D3D9 device during loading. Make
+    // the actual swapchain windowed while retaining its requested backbuffer size;
+    // the worker below removes the frame and covers the monitor, so visually this
+    // is still fullscreen borderless and no focus-loss Reset is required.
+    desc.fullscreen_state = false;
+    desc.fullscreen_refresh_rate = 0.0f;
+    const HWND game_window = static_cast<HWND>(window);
+    if (game_window != nullptr && IsWindow(game_window) &&
+        !g_fullscreen_virtualization_pending.exchange(true))
+    {
+        if (!QueueUserWorkItem(DeferredFullscreenVirtualizationWorker, game_window, WT_EXECUTEDEFAULT))
+        {
+            g_fullscreen_virtualization_pending = false;
+            Log("[feed32] D3D9 borderless worker could not be queued: error=%lu", GetLastError());
+        }
+    }
+    Log("[feed32] classic D3D9 exclusive swapchain rewritten as windowed borderless");
+    return true;
+}
+
 static bool OnSetFullscreenState(reshade::api::swapchain *swapchain, bool fullscreen, void *)
 {
     if (g_cfg.enabled == 0 || !fullscreen || swapchain == nullptr)
@@ -2849,6 +3188,26 @@ static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::ef
 {
     if (rt != g.runtime || g.technique.handle == 0 || technique.handle != g.technique.handle) return;
     FeedFrame(rt, cl, rtv);
+}
+
+static void OnDestroySwapchain(reshade::api::swapchain *swapchain, bool resize)
+{
+    if (swapchain == nullptr || swapchain->get_device() == nullptr ||
+        swapchain->get_device()->get_api() != reshade::api::device_api::d3d9)
+        return;
+    PrepareClassicD3D9ForReset(resize ? "swapchain resize/reset" : "swapchain destruction");
+}
+
+static void OnInitSwapchain(reshade::api::swapchain *swapchain, bool resize)
+{
+    if (!g.is_d3d9 || swapchain == nullptr || swapchain->get_device() == nullptr ||
+        swapchain->get_device()->get_api() != reshade::api::device_api::d3d9)
+        return;
+    g.d3d9_device_lost = false;
+    g.need_reset = true;
+    g.built = false;
+    Log("[feed32] classic D3D9 swapchain %s; bridge rebuild armed",
+        resize ? "reset completed" : "initialized");
 }
 
 static void OnDestroyDevice(reshade::api::device *dev)
@@ -3100,7 +3459,11 @@ static void DrawAioGroup(dlss5_aio_menu::Group group)
     {
         const NRSetting &setting = kNR[index];
         if (setting.group != group) continue;
-        DrawAioSetting(index);
+        const bool setting_changed = DrawAioSetting(index);
+        if (setting_changed && g.d3d9_cpu_bridge && HostAlive() &&
+            (strcmp(setting.key, "Model") == 0 || strcmp(setting.key, "DlssRenderPreset") == 0 ||
+             strcmp(setting.key, "NeuralRendering") == 0 || strcmp(setting.key, "FrameGeneration") == 0))
+            HostApplySettings();
 
         if (strcmp(setting.key, "DlssRenderPreset") == 0)
             ImGui::TextDisabled("Preset L is recommended. Ctrl+Alt+P cycles the modern presets.");
@@ -3109,7 +3472,12 @@ static void DrawAioGroup(dlss5_aio_menu::Group group)
             int pass_index = std::clamp(g_aio_nr_pass_count, 1, 3) - 1;
             if (ImGui::Combo("NR pass count (experimental)", &pass_index,
                 "1x (default)\0" "2x (very expensive)\0" "3x (extreme)\0"))
+            {
                 g_aio_nr_pass_count = pass_index + 1;
+                g_aio_nr_pass_touched = true;
+                if (g.d3d9_cpu_bridge && HostAlive())
+                    HostApplySettings();
+            }
             ImGui::TextDisabled("Session-only. The x64 AIO returns to 1x after relaunch.");
         }
     }
@@ -3145,9 +3513,14 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     {
         g_cfg.show_processed_output = show_processed_output ? 1 : 0;
         CfgSave();
-        HostApplySettings();
-        Log("[feed32] virtual-screen startup output changed to %s; carrier restart requested",
-            show_processed_output ? "processed" : "raw A/B");
+        const HWND proxy = FindHostProxyWindow();
+        if (proxy != nullptr && PostMessageW(proxy, kProxyShowProcessedMessage,
+                                              show_processed_output ? 1 : 0, 0))
+            Log("[feed32] virtual-screen output changed live to %s",
+                show_processed_output ? "processed" : "raw A/B");
+        else
+            Log("[feed32] virtual-screen startup output changed to %s; it will apply when the carrier starts",
+                show_processed_output ? "processed" : "raw A/B");
     }
     ImGui::SameLine();
     HelpMarker("Controls which image the detached native-resolution virtual screen displays. "
@@ -3222,7 +3595,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         CfgReload();
 
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
+        reshade::register_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
+        reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
+        reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
         reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
@@ -3235,7 +3611,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     {
         reshade::unregister_overlay(nullptr, DrawOverlay);
         reshade::unregister_event<reshade::addon_event::create_device>(OnCreateDevice);
+        reshade::unregister_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
         reshade::unregister_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
+        reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
+        reshade::unregister_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
         reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);

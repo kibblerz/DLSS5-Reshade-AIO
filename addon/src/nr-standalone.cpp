@@ -300,6 +300,18 @@ static constexpr UINT kProxyVisibilityMessage = WM_APP + 0x53;
 static constexpr UINT kProxyResizeToMonitorMessage = WM_APP + 0x54;
 static constexpr UINT kProxyRetargetCompositionMessage = WM_APP + 0x55;
 static constexpr UINT kProxyOverlayPreviewMessage = WM_APP + 0x56;
+static constexpr UINT kProxySelectNrModelMessage = WM_APP + 0x57;
+static constexpr UINT kProxySelectDlssPresetMessage = WM_APP + 0x58;
+static constexpr UINT kProxySelectNrPassCountMessage = WM_APP + 0x59;
+static constexpr UINT kProxyShowProcessedMessage = WM_APP + 0x5A;
+static constexpr UINT kProxyEnableNrMessage = WM_APP + 0x5B;
+static constexpr UINT kProxyEnableFgMessage = WM_APP + 0x5C;
+static std::atomic<int> g_external_nr_model_request{0};
+static std::atomic<int> g_external_dlss_preset_request{-1};
+static std::atomic<int> g_external_nr_pass_count_request{0};
+static std::atomic<int> g_external_show_processed_request{-1};
+static std::atomic<int> g_external_nr_enabled_request{-1};
+static std::atomic<int> g_external_fg_enabled_request{-1};
 static constexpr DWORD kInitializationGpuWaitMs = 2000;
 static constexpr DWORD kTransitionGpuWaitMs = 250;
 static constexpr DWORD kProxyWindowStartupWaitMs = 1000;
@@ -1297,6 +1309,25 @@ static void CycleNrModel()
 {
     SelectNrModel(g_nr_model >= 3 ? 1 : g_nr_model + 1,
         "Ctrl+Alt+N hotkey");
+}
+
+static void SelectNrPassCount(unsigned int pass_count, const char *source)
+{
+    pass_count = std::clamp(pass_count, 1u, 3u);
+    if (pass_count == g_nr_pass_count) return;
+    g_nr_pass_count = pass_count;
+    g_nr_second_pass_failed = false;
+    g_nr_third_pass_failed = false;
+    g_nr_second_frames = 0;
+    g_nr_third_frames = 0;
+    g_need_history_reset = true;
+    g_fg_frames = 0;
+    if (g_neural_ready && g_nr_enabled)
+        g_feature_recreate_requested = true;
+    Log("NR pass count changed to %u via %s; feature recreation=%s",
+        g_nr_pass_count, source,
+        g_neural_ready && g_nr_enabled ? "queued" : "not required yet");
+    ShowPipelineNotice("NR PASSES %uX", g_nr_pass_count);
 }
 
 static const char *BenchmarkModeName(dlss5_aio_telemetry::BenchmarkMode mode)
@@ -7758,6 +7789,42 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
         ApplyProxyOverlayPreview(hwnd, wparam != 0);
         return 0;
     }
+    if (message == kProxySelectNrModelMessage)
+    {
+        const int model = static_cast<int>(wparam);
+        if (model >= 1 && model <= 3)
+            g_external_nr_model_request.store(model, std::memory_order_release);
+        return 0;
+    }
+    if (message == kProxySelectDlssPresetMessage)
+    {
+        const int preset = static_cast<int>(wparam);
+        if (preset == 0 || (preset >= 10 && preset <= 13))
+            g_external_dlss_preset_request.store(preset, std::memory_order_release);
+        return 0;
+    }
+    if (message == kProxySelectNrPassCountMessage)
+    {
+        const int pass_count = static_cast<int>(wparam);
+        if (pass_count >= 1 && pass_count <= 3)
+            g_external_nr_pass_count_request.store(pass_count, std::memory_order_release);
+        return 0;
+    }
+    if (message == kProxyShowProcessedMessage)
+    {
+        g_external_show_processed_request.store(wparam != 0 ? 1 : 0, std::memory_order_release);
+        return 0;
+    }
+    if (message == kProxyEnableNrMessage)
+    {
+        g_external_nr_enabled_request.store(wparam != 0 ? 1 : 0, std::memory_order_release);
+        return 0;
+    }
+    if (message == kProxyEnableFgMessage)
+    {
+        g_external_fg_enabled_request.store(wparam != 0 ? 1 : 0, std::memory_order_release);
+        return 0;
+    }
     if (message == kProxyOverlayInputModeMessage)
     {
         if (g_external_game_process_id != 0)
@@ -10633,6 +10700,49 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     g_last_primary_present_tick = present_tick;
     const HWND foreground = GetForegroundWindow();
     const bool primary_foreground = IsGameProcessForeground(foreground);
+    const int external_model = g_external_nr_model_request.exchange(0, std::memory_order_acq_rel);
+    if (external_model >= 1 && external_model <= 3)
+        SelectNrModel(external_model, "32-bit wrapper live control");
+    const int external_preset = g_external_dlss_preset_request.exchange(-1, std::memory_order_acq_rel);
+    if (external_preset == 0 || (external_preset >= 10 && external_preset <= 13))
+        SelectDlssRenderPreset(static_cast<DlssRenderPreset>(external_preset),
+            "32-bit wrapper live control");
+    const int external_pass_count = g_external_nr_pass_count_request.exchange(0, std::memory_order_acq_rel);
+    if (external_pass_count >= 1 && external_pass_count <= 3)
+        SelectNrPassCount(static_cast<unsigned int>(external_pass_count),
+            "32-bit wrapper live control");
+    const int external_show_processed = g_external_show_processed_request.exchange(-1, std::memory_order_acq_rel);
+    if (external_show_processed >= 0)
+    {
+        g_show_neural_output = external_show_processed != 0;
+        g_need_history_reset = true;
+        ResetQueuePressureObservation(true);
+        Log("32-bit wrapper changed presentation A/B live to %s",
+            g_show_neural_output ? "processed native output" : "point-stretched raw game frame");
+    }
+    const int external_nr_enabled = g_external_nr_enabled_request.exchange(-1, std::memory_order_acq_rel);
+    if (external_nr_enabled >= 0 && g_nr_enabled != (external_nr_enabled != 0))
+    {
+        g_nr_enabled = external_nr_enabled != 0;
+        reshade::set_config_value(nullptr, dlss5_aio_menu::kConfigSection, "NeuralRendering",
+            g_nr_enabled ? "1" : "0");
+        g_need_history_reset = true;
+        g_fg_frames = 0;
+        if (g_neural_ready && g_nr_enabled && g_nr_feature == nullptr)
+            g_feature_recreate_requested = true;
+        Log("32-bit wrapper changed Neural Rendering live to %s", g_nr_enabled ? "enabled" : "disabled");
+    }
+    const int external_fg_enabled = g_external_fg_enabled_request.exchange(-1, std::memory_order_acq_rel);
+    if (external_fg_enabled >= 0 && g_framegen_enabled != (external_fg_enabled != 0))
+    {
+        g_framegen_enabled = external_fg_enabled != 0;
+        reshade::set_config_value(nullptr, dlss5_aio_menu::kConfigSection, "FrameGeneration",
+            g_framegen_enabled ? "1" : "0");
+        g_fg_frames = 0;
+        g_need_history_reset = true;
+        if (g_neural_ready) g_feature_recreate_requested = true;
+        Log("32-bit wrapper changed Frame Generation live to %s", g_framegen_enabled ? "enabled" : "disabled");
+    }
     const bool dlss_preset_hotkey_down = primary_foreground &&
         (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 &&
         (GetAsyncKeyState(VK_MENU) & 0x8000) != 0 &&
@@ -11639,20 +11749,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     int nr_pass_index = static_cast<int>(std::clamp(g_nr_pass_count, 1u, 3u)) - 1;
     if (ImGui::Combo("NR pass count (experimental)", &nr_pass_index,
         "1x (default)\0" "2x (very expensive)\0" "3x (extreme)\0"))
-    {
-        g_nr_pass_count = static_cast<unsigned int>(nr_pass_index + 1);
-        g_nr_second_pass_failed = false;
-        g_nr_third_pass_failed = false;
-        g_nr_second_frames = 0;
-        g_nr_third_frames = 0;
-        g_need_history_reset = true;
-        g_fg_frames = 0;
-        if (g_neural_ready && g_nr_enabled)
-            g_feature_recreate_requested = true;
-        Log("NR pass count changed to %u; feature recreation=%s",
-            g_nr_pass_count,
-            g_neural_ready && g_nr_enabled ? "queued" : "not required yet");
-    }
+        SelectNrPassCount(static_cast<unsigned int>(nr_pass_index + 1), "ReShade menu");
     ImGui::TextDisabled("Session-only manual opt-in. Always returns to 1x after relaunch so a bad multi-pass test cannot persist.");
     ImGui::TextDisabled("Each extra pass runs a separate NR feature before DLSS. 2x can roughly double NR cost; 3x can roughly triple it.");
     if (g_nr_pass_count >= 2)
