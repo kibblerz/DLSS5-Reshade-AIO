@@ -17,6 +17,7 @@ if not exist build\x86 mkdir build\x86
 call "%~dp0..\external\DLSS5-Feeder\tools\vcvars.bat" amd64_x86 || exit /b 1
 cl /nologo /LD /EHsc /O2 /MD /W3 /std:c++20 ^
   /I"%~dp0src" ^
+  /I"%~dp0..\addon\include" ^
   /I"%~dp0..\external\DLSS5-Feeder\src" ^
   /I"%~dp0..\external\DLSS5-Feeder\external\reshade\include" ^
   /I"%~dp0..\external\DLSS5-Feeder\external\imgui" ^

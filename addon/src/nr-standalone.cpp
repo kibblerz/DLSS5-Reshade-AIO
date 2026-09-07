@@ -33,6 +33,7 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk.h"
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
+#include "aio-menu-schema.hpp"
 
 #define ADDON_VERSION "2.0.9"
 
@@ -1239,7 +1240,7 @@ static void SelectDlssRenderPreset(DlssRenderPreset preset, const char *source)
     if (preset == g_dlss_render_preset) return;
     g_dlss_render_preset = preset;
     char value[16]; sprintf_s(value, "%d", static_cast<int>(preset));
-    reshade::set_config_value(nullptr, "Standalone.DLSSNR", "DlssRenderPreset",
+    reshade::set_config_value(nullptr, dlss5_aio_menu::kConfigSection, "DlssRenderPreset",
         static_cast<const char *>(value));
     g_need_history_reset = true;
     g_fg_frames = 0;
@@ -1277,7 +1278,7 @@ static void SelectNrModel(int model, const char *source)
     const int previous_model = g_nr_model;
     g_nr_model = model;
     char value[16]; sprintf_s(value, "%d", model);
-    reshade::set_config_value(nullptr, "Standalone.DLSSNR", "Model",
+    reshade::set_config_value(nullptr, dlss5_aio_menu::kConfigSection, "Model",
         static_cast<const char *>(value));
     g_need_history_reset = true;
     g_fg_frames = 0;
@@ -11310,7 +11311,7 @@ static bool OnSetFullscreenState(reshade::api::swapchain *swapchain, bool fullsc
 
 static void DrawOverlay(reshade::api::effect_runtime *)
 {
-    constexpr const char *section = "Standalone.DLSSNR";
+    constexpr const char *section = dlss5_aio_menu::kConfigSection;
     ImGui::TextUnformatted("Standalone DLSS-NR + Super Resolution");
     const char *api_name = g_present_api == reshade::api::device_api::d3d9 ? "D3D9 -> D3D11 -> D3D12" :
         g_present_api == reshade::api::device_api::d3d11 ? "D3D11 -> D3D12" :
@@ -11350,7 +11351,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
             ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.15f, 1.0f),
                 "Source exceeds detected native resolution. Check the DPI native-resolution option under Compatibility / troubleshooting.");
     }
-    if (ImGui::Checkbox("Enable addon", &g_enabled))
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("Enabled", "Enable addon"), &g_enabled))
     {
         reshade::set_config_value(nullptr, section, "Enabled", g_enabled ? "1" : "0");
         g_need_history_reset = true;
@@ -11373,7 +11374,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     {
     ImGui::TextWrapped("Leave automatic presentation enabled. The remaining options are manual fixes; use them only when the matching symptom appears.");
 
-    if (ImGui::Checkbox("Automatic non-invasive presentation", &g_auto_windowed_virtualization))
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("AutoWindowedVirtualization", "Automatic non-invasive presentation"), &g_auto_windowed_virtualization))
     {
         reshade::set_config_value(nullptr, section, "AutoWindowedVirtualization",
             g_auto_windowed_virtualization ? "1" : "0");
@@ -11396,7 +11397,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         !g_auto_windowed_virtualization ? "disabled" :
         (g_auto_detached_presentation_active.load() ? "detached output active" : "standing by"));
 
-    if (ImGui::Checkbox("Force reduced-window virtualization", &g_windowed_virtualization_enabled))
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("WindowedVirtualization", "Force reduced-window virtualization"), &g_windowed_virtualization_enabled))
     {
         if (!g_windowed_virtualization_enabled && g_windowed_input_scaling)
         {
@@ -11420,7 +11421,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     }
     ImGui::TextWrapped("Legacy troubleshooting option. It physically enlarges the game window and can confuse some engines. Leave it disabled unless detached output cannot be used in a particular game.");
 
-    if (ImGui::Checkbox("Virtualize logical client size and coordinates", &g_windowed_logical_size_messages))
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("WindowedLogicalSizeMessages", "Virtualize logical client size and coordinates"), &g_windowed_logical_size_messages))
     {
         reshade::set_config_value(nullptr, section, "WindowedLogicalSizeMessages",
             g_windowed_logical_size_messages ? "1" : "0");
@@ -11429,7 +11430,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     }
     ImGui::TextWrapped("Use with the forced window option if a game jumps back to native rendering, becomes stretched, or breaks after its window is enlarged. It tells the game that its usable area is still the selected lower resolution. Restart after changing it.");
 
-    if (ImGui::Checkbox("Scale window input coordinates to render resolution", &g_windowed_input_scaling))
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("WindowedInputScaling", "Scale window input coordinates to render resolution"), &g_windowed_input_scaling))
     {
         if (g_windowed_input_scaling && !g_windowed_virtualization_enabled)
         {
@@ -11453,7 +11454,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     }
     ImGui::TextWrapped("Use when the picture is correct but mouse clicks land in the wrong place, the cursor is limited to one corner, or menus only respond in part of the screen. It maps the full-screen cursor back to the game's lower-resolution coordinates and automatically enables the required reduced-window virtualization.");
 
-    if (ImGui::Checkbox("Correct DPI-virtualized native resolution", &g_dpi_physical_output_correction))
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("DpiPhysicalOutputCorrection", "Correct DPI-virtualized native resolution"), &g_dpi_physical_output_correction))
     {
         reshade::set_config_value(nullptr, section, "DpiPhysicalOutputCorrection",
             g_dpi_physical_output_correction ? "1" : "0");
@@ -11463,7 +11464,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     }
     ImGui::TextWrapped("Try enabling this if the addon's detected native resolution is wrong, especially when Windows display scaling makes a 4K screen appear as 2560x1440. It uses the monitor's physical resolution and fits that output into the game's logical window. Leave it disabled when native resolution is already correct. Restart after changing it.");
 
-    if (ImGui::Checkbox("Detached native output (Vulkan compatibility)", &g_detached_presentation))
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("DetachedPresentation", "Detached native output (Vulkan compatibility)"), &g_detached_presentation))
     {
         reshade::set_config_value(nullptr, section, "DetachedPresentation",
             g_detached_presentation ? "1" : "0");
@@ -11475,7 +11476,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::Text("Automatic Vulkan output: %s",
         g_auto_detached_presentation_active.load() ? "active for this game" : "standing by");
 
-    if (ImGui::Checkbox("Hide detached Windows cursor", &g_hide_detached_system_cursor))
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("HideDetachedSystemCursor", "Hide detached Windows cursor"), &g_hide_detached_system_cursor))
     {
         reshade::set_config_value(nullptr, section, "HideDetachedSystemCursor",
             g_hide_detached_system_cursor ? "1" : "0");
@@ -11486,7 +11487,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     }
     ImGui::TextWrapped("Normally leave this off: detached output now mirrors whether the game requests a hidden gameplay cursor or a visible menu cursor. Force hiding only if a game never reports its cursor state and still shows a duplicate pointer.");
 
-    if (ImGui::Checkbox("Opaque attached composition", &g_opaque_composition))
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("OpaqueComposition", "Opaque attached composition"), &g_opaque_composition))
     {
         reshade::set_config_value(nullptr, section, "OpaqueComposition",
             g_opaque_composition ? "1" : "0");
@@ -11496,7 +11497,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     }
     ImGui::TextWrapped("Try this when the original and processed pictures appear at the same time, or the image looks transparent and layers bleed together. It affects same-window output only and requires a restart.");
 
-    if (ImGui::Checkbox("Serialized presentation (crash workaround)",
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("SynchronousProxyPresentation", "Serialized presentation (crash workaround)"),
         &g_requested_synchronous_proxy_presentation))
     {
         reshade::set_config_value(nullptr, section, "SynchronousProxyPresentation",
@@ -11514,7 +11515,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
 
     ImGui::TextDisabled("Vulkan: select a real reduced windowed resolution in-game; the native proxy supplies borderless output.");
 
-    if (ImGui::Checkbox("Early proxy initialization (D3D11On12 compatibility)", &g_early_proxy_initialization))
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("EarlyProxyInitialization", "Early proxy initialization (D3D11On12 compatibility)"), &g_early_proxy_initialization))
     {
         reshade::set_config_value(nullptr, section, "EarlyProxyInitialization",
             g_early_proxy_initialization ? "1" : "0");
@@ -11532,8 +11533,8 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::Separator();
 
     int profile = static_cast<int>(g_color_profile);
-    if (ImGui::Combo("Input color profile", &profile,
-        "Auto (swapchain + format)\0sRGB (nonlinear BT.709)\0Linear BT.709 / scRGB\0BT.2100 PQ / HDR10\0BT.2100 HLG\0"))
+    if (ImGui::Combo(dlss5_aio_menu::Label("InputColorProfile", "Input color profile"), &profile,
+        dlss5_aio_menu::kColorItems, static_cast<int>(std::size(dlss5_aio_menu::kColorItems))))
     {
         g_color_profile = static_cast<ColorProfile>(profile);
         char value[16]; sprintf_s(value, "%d", profile);
@@ -11557,7 +11558,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
 
     const SourceResolutionChoice &selected_source = RequestedSourceResolution();
     ImGui::TextWrapped("Use this if the detected game source resolution is incorrect, or to downsample a higher-resolution game frame before Neural Rendering for better performance without lowering the game's own resolution.");
-    if (ImGui::BeginCombo("Pipeline source resolution override", selected_source.label))
+    if (ImGui::BeginCombo(dlss5_aio_menu::Label("SourceResolutionOverride", "Pipeline source resolution override"), selected_source.label))
     {
         for (int index = 0;
             index < static_cast<int>(std::size(kSourceResolutionChoices)); ++index)
@@ -11600,8 +11601,8 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     int preset_index = 0;
     for (int index = 0; index < static_cast<int>(std::size(preset_values)); ++index)
         if (preset_values[index] == g_dlss_render_preset) preset_index = index;
-    if (ImGui::Combo("DLSS render preset", &preset_index,
-        "Default (NVIDIA)\0Preset J\0Preset K\0Preset L (Recommended default)\0Preset M\0"))
+    if (ImGui::Combo(dlss5_aio_menu::Label("DlssRenderPreset", "DLSS render preset"), &preset_index,
+        dlss5_aio_menu::kPresetItems, static_cast<int>(std::size(dlss5_aio_menu::kPresetItems))))
     {
         SelectDlssRenderPreset(preset_values[preset_index], "ReShade menu");
     }
@@ -11613,7 +11614,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::TextDisabled("Ctrl+Alt+P cycles J -> K -> L -> M. Default remains available from this menu.");
     ImGui::TextDisabled("Render presets tune reconstruction behavior; they do not change the game's input resolution.");
     ImGui::TextDisabled("Preset L is the recommended default; testing found noticeably less smearing at both 1080p and 1440p inputs.");
-    if (ImGui::Checkbox("Enable Neural Rendering", &g_nr_enabled))
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("NeuralRendering", "Enable Neural Rendering"), &g_nr_enabled))
     {
         reshade::set_config_value(nullptr, section, "NeuralRendering", g_nr_enabled ? "1" : "0");
         g_need_history_reset = true;
@@ -11661,7 +11662,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
                 g_nr_third_frames.load());
     }
     bool async_compute = g_async_compute_requested;
-    if (ImGui::Checkbox("Asynchronous NGX compute (experimental)", &async_compute))
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("AsyncComputePipeline", "Asynchronous NGX compute (experimental)"), &async_compute))
     {
         g_async_compute_requested = async_compute;
         g_async_compute_restart_required = g_neural_device != nullptr &&
@@ -11698,11 +11699,11 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         char text[32]; sprintf_s(text, "%.4f", value);
         reshade::set_config_value(nullptr, section, key, static_cast<const char *>(text));
     };
-    if (ImGui::SliderFloat("NR intensity", &g_nr_intensity, 0.0f, 2.0f, "%.2f")) save_float("Intensity", g_nr_intensity);
-    if (ImGui::SliderFloat("Local tone strength", &g_nr_local_tone, 0.0f, 2.0f, "%.2f")) save_float("LocalTone", g_nr_local_tone);
-    if (ImGui::SliderFloat("Local structure strength", &g_nr_local_structure, 0.0f, 2.0f, "%.2f")) save_float("LocalStructure", g_nr_local_structure);
-    if (ImGui::SliderFloat("Skin / character structure", &g_nr_skin_structure, -1.0f, 1.0f, "%.2f")) save_float("SkinStructure", g_nr_skin_structure);
-    if (ImGui::Checkbox("Enable VORT motion integration (experimental)", &g_vort_guides_enabled))
+    if (ImGui::SliderFloat(dlss5_aio_menu::Label("Intensity", "NR intensity"), &g_nr_intensity, 0.0f, 2.0f, "%.2f")) save_float("Intensity", g_nr_intensity);
+    if (ImGui::SliderFloat(dlss5_aio_menu::Label("LocalTone", "Local tone strength"), &g_nr_local_tone, 0.0f, 2.0f, "%.2f")) save_float("LocalTone", g_nr_local_tone);
+    if (ImGui::SliderFloat(dlss5_aio_menu::Label("LocalStructure", "Local structure strength"), &g_nr_local_structure, 0.0f, 2.0f, "%.2f")) save_float("LocalStructure", g_nr_local_structure);
+    if (ImGui::SliderFloat(dlss5_aio_menu::Label("SkinStructure", "Skin / character structure"), &g_nr_skin_structure, -1.0f, 1.0f, "%.2f")) save_float("SkinStructure", g_nr_skin_structure);
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("VortGuides", "Enable VORT motion integration (experimental)"), &g_vort_guides_enabled))
     {
         reshade::set_config_value(nullptr, section, "VortGuides",
             g_vort_guides_enabled ? "1" : "0");
@@ -11713,24 +11714,24 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     }
     ImGui::TextDisabled("Off by default. Enabling runs VORT optical flow and guide conversion every frame and may have a large performance cost.");
     ImGui::TextDisabled("Try it only as a temporal-quality experiment; zero-motion fallback remains the normal path.");
-    if (ImGui::Checkbox("VORT NR rejection mask (experimental)", &g_nr_rejection_mask_enabled))
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("NrRejectionMask", "VORT NR rejection mask (experimental)"), &g_nr_rejection_mask_enabled))
     {
         reshade::set_config_value(nullptr, section, "NrRejectionMask",
             g_nr_rejection_mask_enabled ? "1" : "0");
         g_need_history_reset = true;
         Log("VORT NR rejection mask changed to %s", g_nr_rejection_mask_enabled ? "enabled" : "disabled");
     }
-    if (ImGui::SliderFloat("NR rejection strength", &g_nr_rejection_mask_strength, 0.0f, 1.0f, "%.2f"))
+    if (ImGui::SliderFloat(dlss5_aio_menu::Label("NrRejectionStrength", "NR rejection strength"), &g_nr_rejection_mask_strength, 0.0f, 1.0f, "%.2f"))
     {
         save_float("NrRejectionStrength", g_nr_rejection_mask_strength);
         g_need_history_reset = true;
     }
     ImGui::TextDisabled("Only active when VORT motion integration is enabled. Higher values bypass NR at unreliable motion/depth edges.");
-    if (ImGui::Checkbox("Reset temporal history every frame", &g_reset_every_frame))
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("ResetEveryFrame", "Reset temporal history every frame"), &g_reset_every_frame))
         reshade::set_config_value(nullptr, section, "ResetEveryFrame", g_reset_every_frame ? "1" : "0");
     ImGui::SameLine();
     if (ImGui::Button("Reset history now")) g_need_history_reset = true;
-    if (ImGui::Checkbox("Stable DLSS SR (no persistent SR history)", &g_stable_sr_history))
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("StableSrHistory", "Stable DLSS SR (no persistent SR history)"), &g_stable_sr_history))
     {
         reshade::set_config_value(nullptr, section, "StableSrHistory", g_stable_sr_history ? "1" : "0");
         g_need_history_reset = true;
@@ -11738,7 +11739,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
             g_stable_sr_history ? "per-frame reset with zero motion" : "experimental temporal VORT motion");
     }
     ImGui::TextDisabled("Off by default; enable only as a per-frame SR-history diagnostic.");
-    if (ImGui::Checkbox("Experimental DLSS Frame Generation (2x)", &g_framegen_enabled))
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("FrameGeneration", "Experimental DLSS Frame Generation (2x)"), &g_framegen_enabled))
     {
         reshade::set_config_value(nullptr, section, "FrameGeneration", g_framegen_enabled ? "1" : "0");
         g_fg_frames = 0;
@@ -11758,12 +11759,12 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         Log("overlay presentation A/B changed to %s",
             g_show_neural_output ? "processed native output" : "point-stretched raw pre-ReShade game frame");
     }
-    if (ImGui::Checkbox("Composite ReShade menu while open", &g_composite_reshade_output))
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("CompositeReshade", "Composite ReShade menu while open"), &g_composite_reshade_output))
         reshade::set_config_value(nullptr, section, "CompositeReshade", g_composite_reshade_output ? "1" : "0");
-    if (ImGui::Checkbox("Show native output FPS counter", &g_show_proxy_fps))
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("ShowProxyFps", "Show native output FPS counter"), &g_show_proxy_fps))
         reshade::set_config_value(nullptr, section, "ShowProxyFps", g_show_proxy_fps ? "1" : "0");
     bool adaptive_governor = g_adaptive_governor_enabled;
-    if (ImGui::Checkbox("Adaptive GPU pressure governor (prototype)", &adaptive_governor))
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("AdaptivePressureGovernor", "Adaptive GPU pressure governor (prototype)"), &adaptive_governor))
     {
         g_adaptive_governor_enabled = adaptive_governor;
         reshade::set_config_value(nullptr, section, "AdaptivePressureGovernor",
@@ -11785,7 +11786,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     else
         ImGui::TextDisabled("Governor inactive: observing source and completed reconstruction cadence.");
     bool suppress_queue_warning = g_suppress_queue_pressure_warning.load(std::memory_order_acquire);
-    if (ImGui::Checkbox("Hide queue-full performance warning", &suppress_queue_warning))
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("SuppressQueuePressureWarning", "Hide queue-full performance warning"), &suppress_queue_warning))
     {
         g_suppress_queue_pressure_warning.store(suppress_queue_warning, std::memory_order_release);
         reshade::set_config_value(nullptr, section, "SuppressQueuePressureWarning",
@@ -11800,7 +11801,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         ImGui::Text("Queue recommendation: lower framecap to %u FPS and/or lower resolution%s",
             g_queue_pressure_recommended_cap.load(std::memory_order_acquire),
             suppress_queue_warning ? " (warning hidden)" : "");
-    if (ImGui::Checkbox("Collect performance telemetry", &g_performance_telemetry_enabled))
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("PerformanceTelemetry", "Collect performance telemetry"), &g_performance_telemetry_enabled))
     {
         reshade::set_config_value(nullptr, section, "PerformanceTelemetry",
             g_performance_telemetry_enabled ? "1" : "0");
@@ -12026,7 +12027,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             if (g_startup_recovery_path[0] != '\0') DeleteFileA(g_startup_recovery_path);
             return FALSE;
         }
-        constexpr const char *section = "Standalone.DLSSNR";
+        constexpr const char *section = dlss5_aio_menu::kConfigSection;
         char enabled[8] = "1"; size_t enabled_size = sizeof(enabled);
         reshade::get_config_value(nullptr, section, "Enabled", enabled, &enabled_size);
         g_enabled = strcmp(enabled, "0") != 0;

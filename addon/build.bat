@@ -17,6 +17,7 @@ cl /nologo /LD /EHsc /O2 /MD /W4 /std:c++20 ^
   /I"%FEEDER_ROOT%\external\imgui" ^
   /I"%FEEDER_ROOT%\external\vulkan" ^
   /I"%FEEDER_ROOT%\external\minhook\include" ^
+  /I"%~dp0include" ^
   /Fobuild\ /Fdbuild\standalone-dlssnr.pdb src\nr-standalone.cpp ^
   "%FEEDER_ROOT%\external\minhook\src\buffer.c" ^
   "%FEEDER_ROOT%\external\minhook\src\hook.c" ^

@@ -49,8 +49,9 @@
 #include "feed_gl.h"   // raw-OpenGL interop, the same header the 64-bit add-on uses
 #include "feed_vk.h"   // raw-Vulkan interop, likewise -- compiled x86 here
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
+#include "aio-menu-schema.hpp"
 
-#define FEED_VERSION "2.0.9-x86-prototype.8"
+#define FEED_VERSION "2.0.9-x86-prototype.9"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR (32-bit wrapper) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -721,83 +722,34 @@ static bool EnsureHost()
 // gives the 32-bit game's ReShade panel familiar controls for that same addon.
 // Applying restarts the carrier so the x64 addon reloads the changed settings.
 // ---------------------------------------------------------------------------
-enum NRKind { NR_BOOL, NR_COMBO, NR_FLOAT };
-
-struct NRSetting
-{
-    const char        *key;
-    const char        *label;
-    NRKind             kind;
-    float              def, lo, hi;
-    const char        *format;
-    const char *const *items;
-    int                item_count;
-    const char        *tooltip;
-};
-
-static const char *const kColorItems[] = {
-    "Auto (swapchain + format)", "sRGB (nonlinear BT.709)", "Linear BT.709 / scRGB",
-    "BT.2100 PQ / HDR10", "BT.2100 HLG" };
-static const char *const kModelItems[] = { "Model 1", "Model 2", "Model 3" };
-static const char *const kPresetItems[] = {
-    "Default (NVIDIA)", "Preset J", "Preset K", "Preset L (Recommended default)", "Preset M" };
-static const char *const kSourceItems[] = {
-    "Disabled (use game backbuffer)", "16:9 - 960 x 540", "16:9 - 1280 x 720",
-    "16:9 - 1600 x 900", "16:9 - 1920 x 1080", "16:9 - 2560 x 1440",
-    "16:9 - 3200 x 1800", "16:10 - 1280 x 800", "16:10 - 1440 x 900",
-    "16:10 - 1680 x 1050", "16:10 - 1920 x 1200", "16:10 - 2560 x 1600",
-    "21:9 - 1280 x 540", "21:9 - 1720 x 720", "21:9 - 1920 x 800",
-    "21:9 - 2560 x 1080", "21:9 - 3440 x 1440", "32:9 - 1920 x 540",
-    "32:9 - 2560 x 720", "32:9 - 3840 x 1080", "32:9 - 5120 x 1440",
-    "4:3 - 960 x 720", "4:3 - 1280 x 960", "4:3 - 1440 x 1080",
-    "4:3 - 1600 x 1200", "5:4 - 1280 x 1024" };
-
-enum { NR_COUNT = 20, NR_TRANSFER_FIRST = NR_COUNT, NR_GUIDE_FIRST = NR_COUNT };
-
-static const NRSetting kNR[NR_COUNT] = {
-    { "Enabled", "Enable addon", NR_BOOL, 1, 0, 1, nullptr, nullptr, 0, nullptr },
-    { "InputColorProfile", "Input color profile", NR_COMBO, 0, 0, 4, nullptr, kColorItems, 5, nullptr },
-    { "SourceResolutionOverride", "Pipeline source resolution override", NR_COMBO, 0, 0, 25, nullptr, kSourceItems, 26,
-      "Downsample before NR without changing the game's own render resolution." },
-    { "DlssRenderPreset", "DLSS render preset", NR_COMBO, 3, 0, 4, nullptr, kPresetItems, 5,
-      "Preset L is the recommended default and showed the least smearing in testing." },
-    { "NeuralRendering", "Enable Neural Rendering", NR_BOOL, 1, 0, 1, nullptr, nullptr, 0, nullptr },
-    { "Model", "DLSS-NR model", NR_COMBO, 0, 0, 2, nullptr, kModelItems, 3, nullptr },
-    { "Intensity", "NR intensity", NR_FLOAT, 1, 0, 2, "%.2f", nullptr, 0, nullptr },
-    { "LocalTone", "Local tone strength", NR_FLOAT, 1, 0, 2, "%.2f", nullptr, 0, nullptr },
-    { "LocalStructure", "Local structure strength", NR_FLOAT, 1, 0, 2, "%.2f", nullptr, 0, nullptr },
-    { "SkinStructure", "Skin / character structure", NR_FLOAT, -1, -1, 1, "%.2f", nullptr, 0, nullptr },
-    { "FrameGeneration", "Experimental DLSS Frame Generation (2x)", NR_BOOL, 1, 0, 1, nullptr, nullptr, 0, nullptr },
-    { "AsyncComputePipeline", "Asynchronous NGX compute", NR_BOOL, 1, 0, 1, nullptr, nullptr, 0, nullptr },
-    { "StableSrHistory", "Stable DLSS SR", NR_BOOL, 0, 0, 1, nullptr, nullptr, 0, nullptr },
-    { "CompositeReshade", "Composite ReShade menu while open", NR_BOOL, 1, 0, 1, nullptr, nullptr, 0, nullptr },
-    { "ShowProxyFps", "Show native output FPS counter", NR_BOOL, 1, 0, 1, nullptr, nullptr, 0, nullptr },
-    { "AdaptivePressureGovernor", "Adaptive GPU pressure governor", NR_BOOL, 1, 0, 1, nullptr, nullptr, 0, nullptr },
-    { "PerformanceTelemetry", "Collect performance telemetry", NR_BOOL, 1, 0, 1, nullptr, nullptr, 0, nullptr },
-    { "SynchronousProxyPresentation", "Serialized presentation (crash workaround)", NR_BOOL, 0, 0, 1, nullptr, nullptr, 0, nullptr },
-    { "DpiPhysicalOutputCorrection", "Correct DPI-virtualized native resolution", NR_BOOL, 0, 0, 1, nullptr, nullptr, 0, nullptr },
-    { "OpaqueComposition", "Opaque attached composition", NR_BOOL, 0, 0, 1, nullptr, nullptr, 0, nullptr },
-};
+using dlss5_aio_menu::NRSetting;
+using dlss5_aio_menu::NR_BOOL;
+using dlss5_aio_menu::NR_COMBO;
+using dlss5_aio_menu::NR_FLOAT;
+static constexpr int NR_COUNT = static_cast<int>(dlss5_aio_menu::kSettingCount);
+static constexpr int NR_TRANSFER_FIRST = NR_COUNT;
+static constexpr int NR_GUIDE_FIRST = NR_COUNT;
+static constexpr const auto &kNR = dlss5_aio_menu::kSettings;
 
 static float DecodeAioValue(int index, float value)
 {
-    if (index == 3)
+    if (strcmp(kNR[index].key, "DlssRenderPreset") == 0)
     {
         const int raw = static_cast<int>(value);
         return raw == 10 ? 1.0f : raw == 11 ? 2.0f : raw == 12 ? 3.0f : raw == 13 ? 4.0f : 0.0f;
     }
-    if (index == 5) return std::clamp(value - 1.0f, 0.0f, 2.0f);
+    if (strcmp(kNR[index].key, "Model") == 0) return std::clamp(value - 1.0f, 0.0f, 2.0f);
     return value;
 }
 
 static float EncodeAioValue(int index, float value)
 {
-    if (index == 3)
+    if (strcmp(kNR[index].key, "DlssRenderPreset") == 0)
     {
         static const int values[] = {0, 10, 11, 12, 13};
         return static_cast<float>(values[std::clamp(static_cast<int>(value), 0, 4)]);
     }
-    if (index == 5) return value + 1.0f;
+    if (strcmp(kNR[index].key, "Model") == 0) return value + 1.0f;
     return value;
 }
 
@@ -824,7 +776,7 @@ static void ReadHostNR()
     {
         // A sentinel default separates "absent" from "present and equal to our default":
         // we must not write back a guessed default over a key the add-on owns.
-        GetPrivateProfileStringA("Standalone.DLSSNR", kNR[i].key, "\x01", buf, sizeof(buf), p);
+        GetPrivateProfileStringA(dlss5_aio_menu::kConfigSection, kNR[i].key, "\x01", buf, sizeof(buf), p);
         g_nr_present[i] = (buf[0] != '\x01');
         g_nr[i]         = g_nr_present[i] ? DecodeAioValue(i, static_cast<float>(atof(buf))) : kNR[i].def;
         g_nr_touched[i] = false;
@@ -844,7 +796,7 @@ static void WriteHostNR()
         const float encoded = EncodeAioValue(i, g_nr[i]);
         if (kNR[i].kind == NR_FLOAT) sprintf_s(buf, "%g", encoded);
         else                         sprintf_s(buf, "%d", static_cast<int>(encoded));
-        WritePrivateProfileStringA("Standalone.DLSSNR", kNR[i].key, buf, p);
+        WritePrivateProfileStringA(dlss5_aio_menu::kConfigSection, kNR[i].key, buf, p);
         g_nr_present[i] = true;
         g_nr_touched[i] = false;
     }
@@ -2615,6 +2567,27 @@ static bool DrawAioSetting(int index)
     return changed;
 }
 
+static void DrawAioGroup(dlss5_aio_menu::Group group)
+{
+    for (int index = 0; index < NR_COUNT; ++index)
+    {
+        const NRSetting &setting = kNR[index];
+        if (setting.group != group) continue;
+        DrawAioSetting(index);
+
+        if (strcmp(setting.key, "DlssRenderPreset") == 0)
+            ImGui::TextDisabled("Preset L is recommended. Ctrl+Alt+P cycles the modern presets.");
+        else if (strcmp(setting.key, "Model") == 0)
+        {
+            int pass_index = std::clamp(g_aio_nr_pass_count, 1, 3) - 1;
+            if (ImGui::Combo("NR pass count (experimental)", &pass_index,
+                "1x (default)\0" "2x (very expensive)\0" "3x (extreme)\0"))
+                g_aio_nr_pass_count = pass_index + 1;
+            ImGui::TextDisabled("Session-only. The x64 AIO returns to 1x after relaunch.");
+        }
+    }
+}
+
 static void DrawOverlay(reshade::api::effect_runtime *)
 {
     if (!g_host_nr_loaded)
@@ -2652,42 +2625,17 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     HelpMarker("Controls which image the detached native-resolution virtual screen displays. "
                "F10 still switches processed/raw output live after the virtual screen is active.");
 
-    ImGui::Separator();
-    DrawAioSetting(0);
-    DrawAioSetting(1);
-    DrawAioSetting(2);
-    DrawAioSetting(3);
-    ImGui::TextDisabled("Preset L is recommended. Ctrl+Alt+P cycles the modern presets.");
+    ImGui::SeparatorText("General");
+    DrawAioGroup(dlss5_aio_menu::Group::General);
 
-    ImGui::Separator();
-    DrawAioSetting(4);
-    DrawAioSetting(5);
-    int pass_index = std::clamp(g_aio_nr_pass_count, 1, 3) - 1;
-    if (ImGui::Combo("NR pass count (experimental)", &pass_index,
-        "1x (default)\0" "2x (very expensive)\0" "3x (extreme)\0"))
-        g_aio_nr_pass_count = pass_index + 1;
-    ImGui::TextDisabled("Session-only. The x64 AIO returns to 1x after relaunch.");
-    DrawAioSetting(6);
-    DrawAioSetting(7);
-    DrawAioSetting(8);
-    DrawAioSetting(9);
-    DrawAioSetting(10);
-    DrawAioSetting(11);
-    DrawAioSetting(12);
-    DrawAioSetting(13);
-    DrawAioSetting(14);
-    DrawAioSetting(15);
-    DrawAioSetting(16);
+    ImGui::SeparatorText("Neural rendering / reconstruction");
+    DrawAioGroup(dlss5_aio_menu::Group::Neural);
+
+    ImGui::SeparatorText("Output / performance");
+    DrawAioGroup(dlss5_aio_menu::Group::Output);
 
     if (ImGui::CollapsingHeader("Compatibility / troubleshooting"))
-    {
-        DrawAioSetting(17);
-        ImGui::TextWrapped("Enable serialized presentation only if the processed output crashes, freezes, or stays black.");
-        DrawAioSetting(18);
-        ImGui::TextWrapped("Try DPI correction when the native monitor resolution shown by the output is wrong.");
-        DrawAioSetting(19);
-        ImGui::TextWrapped("Try opaque composition when the original and processed images appear layered together.");
-    }
+        DrawAioGroup(dlss5_aio_menu::Group::Compatibility);
 
     ImGui::Separator();
     if (ImGui::Button("Apply settings and restart 64-bit AIO"))

@@ -19,3 +19,9 @@ The wrapper writes the real addon's `[Standalone.DLSSNR]` configuration in
 `host64/ReShade.ini`; **Apply settings and restart 64-bit AIO** cycles only the
 carrier process. NR pass count is forwarded as a session-only launch setting and
 therefore retains the same crash-safe reset-to-1x behavior as the x64 addon.
+
+Both builds compile `addon/include/aio-menu-schema.hpp`, the single definition
+of persistent menu keys, labels, choices, defaults, ranges, groups, and concise
+help text. The x86 panel renders that schema generically and writes the same keys
+consumed directly by the x64 addon, so persistent options are no longer
+maintained in a separate 32-bit menu table.
