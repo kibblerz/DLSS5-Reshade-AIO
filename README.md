@@ -35,10 +35,13 @@ This project's original code and documentation are licensed under the [Apache Li
 3. Select the game resolution:
    - **Same as the monitor:** the addon automatically uses **DLAA** at a 1:1 render scale.
    - **Lower than the monitor:** the addon uses **DLSS Super Resolution** to reconstruct the image to the monitor's native size.
-4. If a lower game resolution still reports **DLAA**, the game is still presenting a native-size backbuffer. Try windowed mode first, then borderless or fullscreen; restart after changing modes if necessary. Use whichever mode makes the overlay report **DLSS SR**.
-5. Neural Rendering and Frame Generation are enabled by default and can be toggled independently in ReShade. Disabling both leaves an SR/DLAA-only pipeline.
-6. **NR pass count** offers optional 2x and 3x high-cost quality experiments. It always returns to 1x when the game starts and is never saved, so a crash during a multi-pass test cannot leave the next launch stuck in that mode.
-7. The source and native resolutions are shown at the top of the addon menu. Confirm they match the intended pipeline. The addon reports **DLAA** when source and native match, and **DLSS** when the source is smaller.
+4. Choose a performance strategy:
+   - **Lower the in-game resolution** for the largest overall performance gain. This reduces both the game's rendering cost and NR cost, but gives NR/DLSS a slightly lower-quality source.
+   - **Keep the game at a higher resolution and select Pipeline source resolution override** to downsample only the captured frame before NR. This reduces NR cost and often produces cleaner detail than rendering the game directly at that lower resolution, but the game still pays its higher-resolution rendering cost.
+5. If a lower game resolution still reports **DLAA**, the game is still presenting a native-size backbuffer. Try windowed mode first, then borderless or fullscreen; restart after changing modes if necessary. Alternatively, select a lower pipeline source override to activate DLSS without changing the game resolution.
+6. Neural Rendering and Frame Generation are enabled by default and can be toggled independently in ReShade. Disabling both leaves an SR/DLAA-only pipeline.
+7. **NR pass count** offers optional 2x and 3x high-cost quality experiments. It always returns to 1x when the game starts and is never saved, so a crash during a multi-pass test cannot leave the next launch stuck in that mode.
+8. The source and native resolutions are shown at the top of the addon menu. Confirm they match the intended pipeline. The addon reports **DLAA** when source and native match, and **DLSS** when the source is smaller.
 
 Reduced-resolution DLSS SR can provide major performance improvements. Native-resolution DLAA instead prioritizes image quality.
 
@@ -49,7 +52,7 @@ Reduced-resolution DLSS SR can provide major performance improvements. Native-re
 
 The **Adaptive GPU pressure governor** starts enabled when no prior preference exists. After a stable startup grace period, sustained source-versus-processed queue pressure activates an automatic real-frame limit based on measured reconstruction capacity. The controller relaxes that limit in small steps when capacity recovers. Uncheck **Adaptive GPU pressure governor (experimental)** to disable it for that game; the opt-out is saved for future launches.
 
-- Press **F10** to compare the processed image with the original game output.
+- Press **F10** to compare the processed image with a basic presentation of the pipeline source. With a source override enabled, this comparison uses the downsampled source stretched to native output.
 - Press **Ctrl+Alt+P** to cycle through the modern DLSS render presets **J → K → L → M**. NVIDIA Default remains selectable in ReShade. A three-second corner notice shows the selected preset and the mode it was designed to target; the ReShade status separately reports the pipeline's actual active DLAA/DLSS mode.
 - Press **Ctrl+Alt+N** to cycle through Neural Rendering models **1 → 2 → 3**. A three-second corner notice confirms the selected model.
 - While ReShade is open in a reduced window, version 2.0.1 moves the processed/F10 output into a small mouse-transparent preview beside it. This lets the real ReShade window receive normal clicks. Close ReShade to restore the fullscreen compositor.
@@ -76,6 +79,8 @@ To experiment with motion guidance, install VORT Motion and `DLSS5_AIO_Feed.fx` 
 
 The source-resolution selector is separate from the game's resolution. Leave it **Disabled** for the normal path. Select a lower resolution with the same aspect ratio when the game reports the wrong source size or when you want the addon to downsample the captured frame before NR. This can reduce NR cost without changing the game's configured resolution, window size, or the final native output.
 
+This is a targeted NR/pipeline optimization rather than a replacement for lowering the game resolution. Rendering the game at 4K and selecting a 1080p pipeline source still incurs the game's 4K geometry, lighting, shadow, and post-processing cost. The quality can nevertheless be better than native 1080p input because the linear downsample begins with the extra detail and edge coverage from the higher-resolution frame.
+
 The addon rejects a selection that is larger than the captured game frame or does not match its aspect ratio. While source downsampling is active, VORT guides are bypassed because guide resampling has not yet been validated.
 
 ### Experimental multiple NR passes
@@ -92,6 +97,7 @@ Open **ReShade > Add-ons > Standalone DLSS-NR + SR**, then expand **Compatibilit
 | --- | --- |
 | **The `LOWER FPS CAP ...` warning appears, performance is unexpectedly low, or motion stutters** | Set an in-game or external FPS cap **at or below the displayed recommendation**. The addon rounds its rolling low estimate down to leave processing headroom. You can also lower the game resolution. The warning clears after the queue stays healthy; use **Hide queue-full performance warning** only if you intentionally want to suppress it. |
 | **The source resolution shown at the top of the addon is wrong, or you want to reduce NR cost without lowering the game's resolution** | Select a matching lower size under **Pipeline source resolution override**. Leave it Disabled when the detected source is already correct. |
+| **Source downsampling improves quality but performance does not increase as much as lowering the in-game resolution** | This is expected: the override reduces NR/DLSS input cost, but the game still renders its original higher-resolution frame. Lower the in-game resolution when maximum performance matters more than source quality. |
 | **The detected native resolution is wrong—for example, a 4K monitor appears as 2560x1440 because of Windows scaling** | Enable **Correct DPI-virtualized native resolution** under Compatibility / troubleshooting and restart. This option is disabled by default because games that already report native resolution correctly do not need it. |
 | **The image is small, stuck in a corner, or only occupies part of the screen** | Enable **Force reduced-window virtualization**. This is the first option to try for a wrongly sized image. Restart if the image does not settle immediately. |
 | **The picture is correct, but mouse clicks land in the wrong place or only part of the screen is clickable** | Enable **Scale window input coordinates to render resolution**. It automatically enables **Force reduced-window virtualization**, which it requires. |
