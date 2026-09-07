@@ -5,8 +5,8 @@
 // A 32-bit game cannot load NGX or the DLSS 5 add-on (x64-only), so this add-on
 // does none of that. Four GPU textures are shared ACROSS PROCESSES, the frame plus
 // the companion effect's depth/motion-vector textures are copied into them, a
-// shared fence is signalled, and dlss5-feed-host64.exe -- spawned from the host64\
-// subfolder. That carrier loads the unchanged standalone-dlssnr.addon64, so there
+// shared fence is signalled, and host64\\AIO DLSS5 32-bit Wrapper.exe is spawned.
+// That carrier loads the unchanged standalone-dlssnr.addon64, so there
 // is one implementation of NR, DLSS/DLAA, frame generation, pacing, and output.
 //
 // Which side CREATES those textures is the driver's call, not ours, and it differs:
@@ -50,7 +50,7 @@
 #include "feed_vk.h"   // raw-Vulkan interop, likewise -- compiled x86 here
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
 
-#define FEED_VERSION "2.0.9-x86-prototype.7"
+#define FEED_VERSION "2.0.9-x86-prototype.8"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR (32-bit wrapper) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -636,14 +636,26 @@ static bool EnsureHost()
     GetModuleFileNameA(g_self, dir, MAX_PATH);
     if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
 
-    char exe[MAX_PATH], cmd[MAX_PATH + 96], wd[MAX_PATH];
-    sprintf_s(exe, "%shost64\\dlss5-feed-host64.exe", dir);
+    char exe[MAX_PATH], legacy_exe[MAX_PATH], cmd[MAX_PATH + 96], wd[MAX_PATH];
+    sprintf_s(exe, "%shost64\\AIO DLSS5 32-bit Wrapper.exe", dir);
+    sprintf_s(legacy_exe, "%shost64\\dlss5-feed-host64.exe", dir);
     sprintf_s(wd, "%shost64", dir);
     if (GetFileAttributesA(exe) == INVALID_FILE_ATTRIBUTES)
     {
-        Warn("host64\\dlss5-feed-host64.exe not found next to the add-on");
-        FeedDisable("the 64-bit host is not installed");
-        return false;
+        // One-prototype compatibility fallback. New packages put the clearly
+        // named launcher beside addon32; the architecture-conflicting x64 DLLs
+        // remain under host64.
+        if (GetFileAttributesA(legacy_exe) != INVALID_FILE_ATTRIBUTES)
+        {
+            strcpy_s(exe, legacy_exe);
+            Log("[feed32] using legacy host64\\dlss5-feed-host64.exe location");
+        }
+        else
+        {
+            Warn("host64\\AIO DLSS5 32-bit Wrapper.exe not found");
+            FeedDisable("the 64-bit wrapper executable is not installed");
+            return false;
+        }
     }
     const HWND game_window = g.runtime != nullptr ? static_cast<HWND>(g.runtime->get_hwnd()) : nullptr;
     sprintf_s(cmd, "\"%s\" %lu --hwnd %llu%s", exe, GetCurrentProcessId(),
@@ -665,6 +677,8 @@ static bool EnsureHost()
         FeedDisable("could not start the 64-bit host");
         return false;
     }
+    SetEnvironmentVariableA("DLSS5_AIO_NR_PASSES", nullptr);
+    SetEnvironmentVariableA("DLSS5_AIO_SHOW_PROCESSED", nullptr);
     CloseHandle(pi.hThread);
     g.hproc = pi.hProcess;
     Log("[feed32] host spawned (pid %lu)", pi.dwProcessId);
@@ -691,9 +705,9 @@ static bool EnsureHost()
         // The message structs after the hello changed size between versions, so a
         // mismatched pair would not just misbehave, it would desync the pipe. Both
         // sides refuse rather than guess.
-        Log("[feed32] the host in host64\\ speaks protocol v%u, this add-on v%u", ack.version, FEED_IPC_VERSION);
+        Log("[feed32] the x64 wrapper speaks protocol v%u, this add-on v%u", ack.version, FEED_IPC_VERSION);
         HostClose();
-        FeedDisable("the host64\\ folder is from a different release -- reinstall both halves together");
+        FeedDisable("the 32-bit wrapper files are from different releases -- reinstall the package together");
         return false;
     }
     Log("[feed32] host connected (protocol v%u, %s client)", ack.version, kind_name);
@@ -772,9 +786,6 @@ static float DecodeAioValue(int index, float value)
         const int raw = static_cast<int>(value);
         return raw == 10 ? 1.0f : raw == 11 ? 2.0f : raw == 12 ? 3.0f : raw == 13 ? 4.0f : 0.0f;
     }
-    SetEnvironmentVariableA("DLSS5_AIO_NR_PASSES", nullptr);
-    SetEnvironmentVariableA("DLSS5_AIO_SHOW_PROCESSED", nullptr);
-    SetEnvironmentVariableA("DLSS5_AIO_NR_PASSES", nullptr);
     if (index == 5) return std::clamp(value - 1.0f, 0.0f, 2.0f);
     return value;
 }

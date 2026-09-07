@@ -19,7 +19,7 @@ $hostShaders = Join-Path $hostDirectory 'reshade-shaders\Shaders'
 New-Item -ItemType Directory -Force -Path $game, $hostDirectory, $gameShaders, $hostShaders | Out-Null
 
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'build\x86\standalone-dlssnr.addon32') -Destination (Join-Path $game 'standalone-dlssnr.addon32') -Force
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'build\host64\dlss5-feed-host64.exe') -Destination (Join-Path $hostDirectory 'dlss5-feed-host64.exe') -Force
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'build\host64\AIO DLSS5 32-bit Wrapper.exe') -Destination (Join-Path $hostDirectory 'AIO DLSS5 32-bit Wrapper.exe') -Force
 Copy-Item -LiteralPath (Join-Path $root 'addon\build\standalone-dlssnr.addon64') -Destination (Join-Path $hostDirectory 'standalone-dlssnr.addon64') -Force
 Copy-Item -LiteralPath (Join-Path $root 'addon\build\nvngx.dll') -Destination (Join-Path $hostDirectory 'nvngx.dll') -Force
 Copy-Item -LiteralPath $ReShade64 -Destination (Join-Path $hostDirectory 'dxgi.dll') -Force

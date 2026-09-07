@@ -8,7 +8,7 @@
 // normal standalone-dlssnr.addon64. The existing AIO implementation therefore owns
 // NR, DLSS/DLAA, frame generation, pacing, and native-output presentation unchanged.
 //
-// Usage: dlss5-feed-host64.exe <game pid> [--hide]
+// Usage: AIO DLSS5 32-bit Wrapper.exe <game pid> [--hwnd N] [--hide]
 // Logs: dlss5-feed-host.log and ReShade.log next to this executable.
 
 #define WIN32_LEAN_AND_MEAN
@@ -581,8 +581,10 @@ static void PumpPresent()
 
 static bool InitDisguise()
 {
-    // ReShade first: the app-directory dxgi.dll IS ReShade x64. Loading it before
-    // d3d12.dll means every later D3D12/DXGI entry point goes through its hooks --
+    // ReShade first: the app-directory dxgi.dll IS ReShade x64. This entire
+    // process lives under host64 so it cannot collide with the game's x86
+    // dxgi.dll. Loading it before d3d12.dll means every later D3D12/DXGI
+    // entry point goes through its hooks --
     // the same order a real game gets, and what lets the DLSS 5 add-on see us.
     HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
     HMODULE d3d12 = LoadLibraryW(L"d3d12.dll");
@@ -1221,7 +1223,7 @@ int main(int argc, char **argv)
         strcpy_s(s + 1, MAX_PATH - (s + 1 - g_log_path), "dlss5-feed-host.log");
     { FILE *f = nullptr; if (fopen_s(&f, g_log_path, "w") == 0 && f) fclose(f); }
 
-    Log("DLSS5 AIO 32-bit carrier host (built %s %s)", __DATE__, __TIME__);
+    Log("AIO DLSS5 32-bit Wrapper (x64 processing carrier, built %s %s)", __DATE__, __TIME__);
 
     bool  test = false, hide = false;
     DWORD pid = 0;
@@ -1236,7 +1238,7 @@ int main(int argc, char **argv)
     }
     if (!test && pid == 0)
     {
-        Log("usage: dlss5-feed-host64 --test | dlss5-feed-host64 <game pid> [--hide]");
+        Log("usage: AIO DLSS5 32-bit Wrapper.exe <game pid> [--hwnd N] [--hide]");
         return 1;
     }
     g_show_window = false;

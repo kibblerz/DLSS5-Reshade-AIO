@@ -5,7 +5,7 @@ of compiling a second NVIDIA pipeline for x86:
 
 1. `standalone-dlssnr.addon32` captures a 32-bit game's final frame into a shared GPU texture
    and presents an AIO-branded proxy of the normal settings panel.
-2. `dlss5-feed-host64.exe` opens that texture and presents it through a hidden x64 D3D12 carrier.
+2. `host64/AIO DLSS5 32-bit Wrapper.exe` opens that texture and presents it through an x64 D3D12 carrier.
 3. The normal `standalone-dlssnr.addon64` intercepts the carrier Present and runs the same
    NR, DLSS/DLAA, frame-generation, pacing, and native-output implementation used by x64 games.
 
