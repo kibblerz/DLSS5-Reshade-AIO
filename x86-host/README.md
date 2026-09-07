@@ -9,10 +9,11 @@ of compiling a second NVIDIA pipeline for x86:
 3. The normal `standalone-dlssnr.addon64` intercepts the carrier Present and runs the same
    NR, DLSS/DLAA, frame-generation, pacing, and native-output implementation used by x64 games.
 
-Native x86 D3D9 and D3D11 are supported by the transport. D3D9 crosses into
-the existing D3D11 carrier path through shared surfaces created on the game's
-adapter, so no dgVoodoo wrapper is required. Vulkan and OpenGL remain
-transport-capable and experimental.
+Native x86 D3D9 and D3D11 are supported by the transport. ReShade 6 renders
+native D3D9 effects through an internal D3D10.1 presentation runtime; the
+wrapper bridges that completed frame into its existing D3D11 carrier path.
+A direct D3D9 shared-surface fallback is retained for other runtime layouts.
+No dgVoodoo wrapper is required. Vulkan and OpenGL remain experimental.
 
 Release ZIPs preserve this layout automatically. Extract the 32-bit ZIP beside
 the 32-bit game executable, then put the separately obtained 64-bit ReShade

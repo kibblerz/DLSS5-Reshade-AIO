@@ -24,9 +24,12 @@ caller bridge and must remain there too.
 Use the AIO page in the game's normal ReShade Add-ons tab. Applying settings
 restarts only the 64-bit AIO carrier.
 
-The x86 path is currently validated with D3D11 output. Native 32-bit D3D9 games
-need a D3D9-to-D3D11 wrapper such as dgVoodoo2, which is not included. OpenGL
-and Vulkan x86 transport remain experimental.
+Native 32-bit D3D9 and D3D11 are supported. For a D3D9 game, the 32-bit
+ReShade proxy beside the game must be named d3d9.dll. Do not also leave a
+second ReShade proxy named dxgi.dll beside that D3D9 game: the AIO bridge
+needs Windows' real DXGI library and a duplicate local proxy can prevent the
+addon from loading. DLSS5_Feed_D3D9.fx is included and enabled automatically.
+No dgVoodoo wrapper is required. OpenGL and Vulkan x86 remain experimental.
 
 Full setup and troubleshooting:
 https://github.com/kibblerz/DLSS5-Reshade-AIO

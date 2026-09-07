@@ -62,7 +62,7 @@ host64\
 
 NVIDIA runtime DLLs and ReShade itself are governed by their own licenses and therefore are not redistributed in these ZIPs. See [`runtime/README.md`](runtime/README.md).
 
-The x86 package supports native 32-bit D3D9 and D3D11 output. Native D3D9 is bridged on the game's GPU through shared D3D9/D3D11 surfaces and then reuses the same x64 AIO carrier and processing pipeline; dgVoodoo is not required. The x86 OpenGL and Vulkan transports remain experimental.
+The x86 package supports native 32-bit D3D9 and D3D11 output. ReShade 6 presents native D3D9 effects through an internal D3D10.1 runtime, which the addon bridges into its existing D3D11/x64 carrier path; a direct D3D9 shared-surface fallback is also available. Both routes reuse the same maintained x64 AIO processing pipeline, and dgVoodoo is not required. The x86 OpenGL and Vulkan transports remain experimental.
 
 ## First-launch setup
 
@@ -147,6 +147,7 @@ Open **ReShade > Add-ons > Standalone DLSS-NR + SR**, then expand **Compatibilit
 | **The processed preview does not appear while ReShade is open** | Use windowed mode at a resolution below the monitor's native resolution. Fullscreen and borderless windows may leave no separate desktop area for the preview. Closing ReShade should still restore the native-size processed output. |
 | **The addon is missing from ReShade** | Confirm ReShade was installed with addon support and that you extracted the ZIP matching the game's architecture. For 64-bit games, `standalone-dlssnr.addon64` belongs beside the game executable. For 32-bit games, `standalone-dlssnr.addon32` belongs beside the game executable and the x64 processing files remain under `host64`. |
 | **A 32-bit game says the host process is not running** | Keep `AIO DLSS5 32-bit Wrapper.exe`, `standalone-dlssnr.addon64`, the included `nvngx.dll`, 64-bit ReShade `dxgi.dll`, and all NVIDIA runtime DLLs together inside `host64`. Do not place the x64 files beside the 32-bit game executable. Check `dlss5-aio-x86.log` in the game folder and the logs under `host64`. |
+| **A native 32-bit D3D9 game reports addon load error 1359** | Keep the game's 32-bit ReShade proxy named `d3d9.dll`. Remove or rename any duplicate ReShade proxy named `dxgi.dll` beside that D3D9 executable; the bridge must resolve Windows' real DXGI library. This does not apply to `host64\dxgi.dll`, which is required. |
 | **The log says `required private runtime dependency missing`** | Install `nvngx.dll` beside the addon. Also supply `nvngx_dlssnr.dll` and `nvngx_dlss.dll`; `nvngx_dlssg.dll` is required for Frame Generation. |
 | **The overlay reports fallback or zero-motion guides** | This is the normal default. VORT motion integration is optional and disabled by default because it may significantly reduce performance. To test it, install `DLSS5_AIO_Feed.fx` and VORT Motion under the configured ReShade shader path, then enable **Enable VORT motion integration (experimental)**. |
 | **Vulkan waits for a shared frame** | Confirm ReShade's Vulkan layer is active. If no other ReShade effect is loaded, install `StandaloneBoundary.fx` so the required effects boundary runs. |
@@ -182,6 +183,13 @@ The new **Compatibility / troubleshooting** panel provides opt-in fixes for game
 Resolution transitions are serialized outside the game's DXGI callback, failed sessions can recover into serialized mode by holding **F8** during launch, and startup contract changes hold the last completed native frame instead of repeatedly exposing the low-resolution game surface.
 
 Because presentation behavior varies substantially between engines, 2.0 may work better or worse than 1.x in a particular game. Keep [v1.7.24](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/tag/v1.7.24) available as the stable 1.x fallback and report regressions with the game name, graphics API, display mode, and persistent addon log.
+
+### Version 2.1.1
+
+- Adds native 32-bit D3D9 support without dgVoodoo by bridging ReShade's D3D10.1 effects runtime into the existing x64 AIO carrier.
+- Includes a lightweight D3D9 capture trigger that avoids legacy shader-compiler limits and is enabled automatically by the x86 addon.
+- Keeps the processed x86 output on its detached full-screen proxy after the ReShade menu closes instead of allowing the Vulkan startup refresh to migrate it onto the hidden carrier window.
+- Documents the duplicate-root-`dxgi.dll` loader conflict that produces addon error 1359 in native D3D9 games.
 
 ### Version 2.1.0
 

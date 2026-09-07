@@ -47,6 +47,7 @@ Copy-RequiredFile (Join-Path $PSScriptRoot 'README-64-BIT.txt') (Join-Path $stag
 Copy-RequiredFile (Join-Path $x86Build 'x86\standalone-dlssnr.addon32') (Join-Path $stage32 'standalone-dlssnr.addon32')
 Copy-RequiredFile (Join-Path $x86Template 'game\dlss5-feed.cfg') (Join-Path $stage32 'dlss5-aio-x86.cfg')
 Copy-RequiredFile (Join-Path $feeder 'shaders\DLSS5_Feed.fx') (Join-Path $stage32 'reshade-shaders\Shaders\DLSS5_Feed.fx')
+Copy-RequiredFile (Join-Path $repo 'x86-host\shaders\DLSS5_Feed_D3D9.fx') (Join-Path $stage32 'reshade-shaders\Shaders\DLSS5_Feed_D3D9.fx')
 Copy-RequiredFile (Join-Path $PSScriptRoot 'README-32-BIT.txt') (Join-Path $stage32 'README_FIRST.txt')
 
 # 32-bit host side: the normal x64 AIO implementation remains isolated here.
