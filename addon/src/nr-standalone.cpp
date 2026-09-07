@@ -12056,6 +12056,14 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         // Multi-pass NR is deliberately session-only. Never inherit a risky
         // 2x/3x selection after a crash or normal restart.
         g_nr_pass_count = 1;
+        if (g_external_game_process_id != 0)
+        {
+            wchar_t external_pass_count[8] = {};
+            if (GetEnvironmentVariableW(L"DLSS5_AIO_NR_PASSES", external_pass_count,
+                static_cast<DWORD>(std::size(external_pass_count))) != 0)
+                g_nr_pass_count = static_cast<unsigned int>(
+                    std::clamp(_wtoi(external_pass_count), 1, 3));
+        }
         g_nr_second_pass_failed = false;
         g_nr_third_pass_failed = false;
         read_setting("AsyncComputePipeline", "1", value, sizeof(value)); g_async_compute_requested = strcmp(value, "0") != 0;

@@ -5,6 +5,8 @@ param(
     [string] $ReShade64,
     [Parameter(Mandatory = $true)]
     [string] $RuntimeSource,
+    [Parameter(Mandatory = $true)]
+    [string] $ReShadeShaderSource,
     [string] $VortSource
 )
 
@@ -16,7 +18,7 @@ $gameShaders = Join-Path $game 'reshade-shaders\Shaders'
 $hostShaders = Join-Path $hostDirectory 'reshade-shaders\Shaders'
 New-Item -ItemType Directory -Force -Path $game, $hostDirectory, $gameShaders, $hostShaders | Out-Null
 
-Copy-Item -LiteralPath (Join-Path $root 'external\DLSS5-Feeder\build\dlss5-feed.addon32') -Destination (Join-Path $game 'standalone-dlssnr.addon32') -Force
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'build\x86\standalone-dlssnr.addon32') -Destination (Join-Path $game 'standalone-dlssnr.addon32') -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'build\host64\dlss5-feed-host64.exe') -Destination (Join-Path $hostDirectory 'dlss5-feed-host64.exe') -Force
 Copy-Item -LiteralPath (Join-Path $root 'addon\build\standalone-dlssnr.addon64') -Destination (Join-Path $hostDirectory 'standalone-dlssnr.addon64') -Force
 Copy-Item -LiteralPath (Join-Path $root 'addon\build\nvngx.dll') -Destination (Join-Path $hostDirectory 'nvngx.dll') -Force
@@ -27,8 +29,12 @@ foreach ($runtime in 'nvngx_dlssnr.dll', 'nvngx_dlss.dll', 'nvngx_dlssg.dll') {
 }
 Copy-Item -LiteralPath (Join-Path $root 'addon\shaders\DLSS5_AIO_Feed.fx') -Destination (Join-Path $hostShaders 'DLSS5_AIO_Feed.fx') -Force
 Copy-Item -LiteralPath (Join-Path $root 'external\DLSS5-Feeder\shaders\DLSS5_Feed.fx') -Destination (Join-Path $gameShaders 'DLSS5_Feed.fx') -Force
+foreach ($include in 'ReShade.fxh', 'ReShadeUI.fxh') {
+    Copy-Item -LiteralPath (Join-Path $ReShadeShaderSource $include) -Destination (Join-Path $gameShaders $include) -Force
+    Copy-Item -LiteralPath (Join-Path $ReShadeShaderSource $include) -Destination (Join-Path $hostShaders $include) -Force
+}
 
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'stage-template\game\dlss5-feed.cfg') -Destination (Join-Path $game 'dlss5-feed.cfg') -Force
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'stage-template\game\dlss5-feed.cfg') -Destination (Join-Path $game 'dlss5-aio-x86.cfg') -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'stage-template\host64\ReShade.ini') -Destination (Join-Path $hostDirectory 'ReShade.ini') -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'stage-template\host64\ReShadePreset.ini') -Destination (Join-Path $hostDirectory 'ReShadePreset.ini') -Force
 
