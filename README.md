@@ -62,7 +62,7 @@ host64\
 
 NVIDIA runtime DLLs and ReShade itself are governed by their own licenses and therefore are not redistributed in these ZIPs. See [`runtime/README.md`](runtime/README.md).
 
-The x86 transport is currently validated with 32-bit D3D11 output. A native 32-bit D3D9 game needs a D3D9-to-D3D11 wrapper such as dgVoodoo2 before the AIO capture layer; that wrapper is not bundled here. The x86 OpenGL and Vulkan transports remain experimental.
+The x86 package supports native 32-bit D3D9 and D3D11 output. Native D3D9 is bridged on the game's GPU through shared D3D9/D3D11 surfaces and then reuses the same x64 AIO carrier and processing pipeline; dgVoodoo is not required. The x86 OpenGL and Vulkan transports remain experimental.
 
 ## First-launch setup
 

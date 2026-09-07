@@ -11,6 +11,8 @@
 //
 // Which side CREATES those textures is the driver's call, not ours, and it differs:
 //
+//  * D3D9: bridged on the game's adapter through legacy shared D3D9/D3D11
+//    surfaces, then enters the same D3D11 transport as every other x86 frame.
 //  * D3D11: created here, opened by the host -- the phase-0-proven direction.
 //  * OpenGL: created by the HOST and imported here, because GL memory objects are
 //    import-only (there is no export in GL_EXT_external_objects_win32). The GL half
@@ -28,6 +30,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <d3d9.h>
 #include <d3d11_4.h>
 #include <dxgi1_2.h>
 #include <d3dcompiler.h>
@@ -341,7 +344,24 @@ struct Feed32
     HANDLE           fence_in_handle, fence_out_handle;   // GL client: kept for the GL import
     bool             fence_wait_queued;  // a GPU-side Wait(fence_out, frame_n) is outstanding
     ID3D11DeviceContext4 *ctx4;
-    ID3D11Device    *dev;         // not owned
+    ID3D11Device    *dev;         // borrowed for D3D11, owned for the native D3D9 bridge
+    bool             owns_d3d11_device;
+
+    // Native x86 D3D9 uses two legacy shared surfaces to enter/leave the same
+    // D3D11 cross-process transport used above. Guides are deliberately neutral
+    // until a real D3D9 motion/depth provider is available.
+    bool                    is_d3d9;
+    IDirect3DDevice9       *dev9;                 // not owned
+    IDirect3DQuery9        *query9;
+    ID3D11Query            *query11;
+    IDirect3DTexture9      *d3d9_color_stage;
+    IDirect3DTexture9      *d3d9_output_stage;
+    ID3D11Texture2D        *d3d9_output_stage11;
+    ID3D11RenderTargetView *d3d9_output_rtv;
+    ID3D11Texture2D        *d3d9_zero_mv;
+    ID3D11Texture2D        *d3d9_zero_depth;
+    ID3D11ShaderResourceView *d3d9_zero_mv_srv;
+    ID3D11ShaderResourceView *d3d9_zero_depth_srv;
 
     // OpenGL client: the host creates the shared textures and duplicates the handles
     // in; we import them raw (feed_gl.h) and never touch D3D11 at all. tex_handle[]
@@ -400,6 +420,8 @@ static DXGI_FORMAT TypedColorFormat(DXGI_FORMAT f)
         return DXGI_FORMAT_R8G8B8A8_UNORM;
     case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
         return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS: case DXGI_FORMAT_B8G8R8X8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8X8_UNORM;
     case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM:
         return DXGI_FORMAT_R10G10B10A2_UNORM;
     case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R16G16B16A16_FLOAT:
@@ -876,6 +898,14 @@ static void ReleaseShared()
             if (any) Log("[feed32] the GL context is not current here; the imported textures are left to the driver");
         }
     }
+    SafeRelease(g.d3d9_zero_mv_srv);
+    SafeRelease(g.d3d9_zero_depth_srv);
+    SafeRelease(g.d3d9_zero_mv);
+    SafeRelease(g.d3d9_zero_depth);
+    SafeRelease(g.d3d9_output_rtv);
+    SafeRelease(g.d3d9_output_stage11);
+    SafeRelease(g.d3d9_output_stage);
+    SafeRelease(g.d3d9_color_stage);
     SafeRelease(g.output_srv);
     SafeRelease(g.color_stage_srv);
     SafeRelease(g.color_stage);
@@ -886,6 +916,161 @@ static void ReleaseShared()
         if (g.tex_handle[i] != nullptr) { CloseHandle(g.tex_handle[i]); g.tex_handle[i] = nullptr; }
     }
     g.built = false;
+}
+
+static DXGI_FORMAT FromD3D9Format(D3DFORMAT format)
+{
+    switch (format)
+    {
+    case D3DFMT_A8R8G8B8:       return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case D3DFMT_X8R8G8B8:       return DXGI_FORMAT_B8G8R8X8_UNORM;
+    case D3DFMT_A8B8G8R8:       return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case D3DFMT_A2B10G10R10:    return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case D3DFMT_A16B16G16R16F:  return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    default:                     return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+static D3DFORMAT ToD3D9Format(DXGI_FORMAT format)
+{
+    switch (format)
+    {
+    case DXGI_FORMAT_B8G8R8A8_UNORM:      return D3DFMT_A8R8G8B8;
+    case DXGI_FORMAT_B8G8R8X8_UNORM:      return D3DFMT_X8R8G8B8;
+    case DXGI_FORMAT_R8G8B8A8_UNORM:      return D3DFMT_A8B8G8R8;
+    case DXGI_FORMAT_R10G10B10A2_UNORM:   return D3DFMT_A2B10G10R10;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:  return D3DFMT_A16B16G16R16F;
+    default:                               return D3DFMT_UNKNOWN;
+    }
+}
+
+static IDXGIAdapter1 *FindD3D9Adapter(IDirect3DDevice9 *device9)
+{
+    if (device9 == nullptr) return nullptr;
+    D3DDEVICE_CREATION_PARAMETERS creation = {};
+    if (FAILED(device9->GetCreationParameters(&creation))) return nullptr;
+    IDirect3D9 *d3d9 = nullptr;
+    if (FAILED(device9->GetDirect3D(&d3d9)) || d3d9 == nullptr) return nullptr;
+
+    LUID wanted = {};
+    bool have_luid = false;
+    IDirect3D9Ex *d3d9ex = nullptr;
+    if (SUCCEEDED(d3d9->QueryInterface(__uuidof(IDirect3D9Ex), reinterpret_cast<void **>(&d3d9ex))) &&
+        d3d9ex != nullptr && SUCCEEDED(d3d9ex->GetAdapterLUID(creation.AdapterOrdinal, &wanted)))
+        have_luid = true;
+    SafeRelease(d3d9ex);
+    const HMONITOR wanted_monitor = d3d9->GetAdapterMonitor(creation.AdapterOrdinal);
+
+    IDXGIFactory1 *factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void **>(&factory))))
+    { d3d9->Release(); return nullptr; }
+    IDXGIAdapter1 *match = nullptr;
+    for (UINT index = 0; ; ++index)
+    {
+        IDXGIAdapter1 *adapter = nullptr;
+        if (factory->EnumAdapters1(index, &adapter) == DXGI_ERROR_NOT_FOUND) break;
+        DXGI_ADAPTER_DESC1 ad = {};
+        adapter->GetDesc1(&ad);
+        if (have_luid && ad.AdapterLuid.HighPart == wanted.HighPart && ad.AdapterLuid.LowPart == wanted.LowPart)
+        { match = adapter; break; }
+        bool monitor_match = false;
+        for (UINT oi = 0; wanted_monitor != nullptr; ++oi)
+        {
+            IDXGIOutput *output = nullptr;
+            if (adapter->EnumOutputs(oi, &output) == DXGI_ERROR_NOT_FOUND) break;
+            DXGI_OUTPUT_DESC od = {};
+            if (SUCCEEDED(output->GetDesc(&od)) && od.Monitor == wanted_monitor) monitor_match = true;
+            output->Release();
+            if (monitor_match) break;
+        }
+        if (monitor_match) { match = adapter; break; }
+        adapter->Release();
+    }
+    factory->Release();
+    d3d9->Release();
+    return match;
+}
+
+static bool InitializeD3D9Transport(IDirect3DDevice9 *device9)
+{
+    if (g.dev != nullptr && g.ctx4 != nullptr && g.dev9 == device9) return true;
+    IDXGIAdapter1 *adapter = FindD3D9Adapter(device9);
+    if (adapter == nullptr) { Log("[feed32] D3D9 adapter could not be matched to DXGI"); return false; }
+    ID3D11DeviceContext *context = nullptr;
+    D3D_FEATURE_LEVEL requested = D3D_FEATURE_LEVEL_11_0;
+    const HRESULT hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT, &requested, 1, D3D11_SDK_VERSION,
+        &g.dev, nullptr, &context);
+    adapter->Release();
+    if (FAILED(hr) || g.dev == nullptr || context == nullptr)
+    { SafeRelease(context); SafeRelease(g.dev); Log("[feed32] D3D9 bridge D3D11CreateDevice failed 0x%08X", hr); return false; }
+    g.owns_d3d11_device = true;
+    g.dev9 = device9;
+    if (FAILED(context->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void **>(&g.ctx4))))
+    { SafeRelease(context); SafeRelease(g.dev); g.dev9 = nullptr; return false; }
+    context->Release();
+    device9->CreateQuery(D3DQUERYTYPE_EVENT, &g.query9);
+    D3D11_QUERY_DESC qd = { D3D11_QUERY_EVENT, 0 };
+    g.dev->CreateQuery(&qd, &g.query11);
+    Log("[feed32] native D3D9 -> D3D11 transport initialized on the game adapter");
+    return g.query9 != nullptr && g.query11 != nullptr;
+}
+
+static bool CreateD3D9SharedStage(UINT width, UINT height, DXGI_FORMAT format,
+                                  IDirect3DTexture9 **texture9, ID3D11Texture2D **texture11)
+{
+    const D3DFORMAT format9 = ToD3D9Format(format);
+    if (format9 == D3DFMT_UNKNOWN || g.dev9 == nullptr || g.dev == nullptr) return false;
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = width; desc.Height = height; desc.MipLevels = 1; desc.ArraySize = 1;
+    desc.Format = format; desc.SampleDesc.Count = 1; desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+    HRESULT hr = g.dev->CreateTexture2D(&desc, nullptr, texture11);
+    HANDLE shared = nullptr;
+    IDXGIResource *dxgi = nullptr;
+    if (SUCCEEDED(hr)) hr = (*texture11)->QueryInterface(__uuidof(IDXGIResource), reinterpret_cast<void **>(&dxgi));
+    if (SUCCEEDED(hr)) hr = dxgi->GetSharedHandle(&shared);
+    SafeRelease(dxgi);
+    if (SUCCEEDED(hr))
+        hr = g.dev9->CreateTexture(width, height, 1, D3DUSAGE_RENDERTARGET, format9,
+                                   D3DPOOL_DEFAULT, texture9, &shared);
+    if (FAILED(hr))
+    {
+        SafeRelease(*texture9); SafeRelease(*texture11); shared = nullptr;
+        hr = g.dev9->CreateTexture(width, height, 1, D3DUSAGE_RENDERTARGET, format9,
+                                   D3DPOOL_DEFAULT, texture9, &shared);
+        if (SUCCEEDED(hr)) hr = g.dev->OpenSharedResource(shared, __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(texture11));
+    }
+    if (FAILED(hr))
+    {
+        SafeRelease(*texture9); SafeRelease(*texture11);
+        Log("[feed32] D3D9/D3D11 shared stage failed: %ux%u fmt=%u hr=0x%08X", width, height, format, hr);
+        return false;
+    }
+    return true;
+}
+
+static bool WaitForD3D9Copy()
+{
+    if (g.query9 == nullptr || FAILED(g.query9->Issue(D3DISSUE_END))) return false;
+    const ULONGLONG deadline = GetTickCount64() + 2000;
+    HRESULT hr = S_FALSE;
+    while ((hr = g.query9->GetData(nullptr, 0, D3DGETDATA_FLUSH)) == S_FALSE && GetTickCount64() < deadline)
+        SwitchToThread();
+    return hr == S_OK;
+}
+
+static bool WaitForD3D11Copy()
+{
+    if (g.query11 == nullptr || g.ctx4 == nullptr) return false;
+    g.ctx4->End(g.query11);
+    g.ctx4->Flush();
+    const ULONGLONG deadline = GetTickCount64() + 2000;
+    HRESULT hr = S_FALSE;
+    while ((hr = g.ctx4->GetData(g.query11, nullptr, 0, 0)) == S_FALSE && GetTickCount64() < deadline)
+        SwitchToThread();
+    return hr == S_OK;
 }
 
 static bool MakeShared(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav, bool render_target)
@@ -1020,7 +1205,7 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
     // needs an RTV per input and an SRV-able source. ReShade's backbuffer has neither
     // D3D11_BIND_SHADER_RESOURCE nor a resource behind `DLSS5_ColorInput : COLOR`, so
     // stage a native-size copy we own and downsample from that.
-    if (backbuffer_w != w || backbuffer_h != h)
+    if (backbuffer_w != w || backbuffer_h != h || g.is_d3d9)
     {
         const int input_slots[] = { FEED_COLOR, FEED_MV, FEED_DEPTH };
         for (const int slot : input_slots)
@@ -1033,17 +1218,28 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
             { Log("[feed32] input RTV %d failed", slot); ReleaseShared(); return false; }
         }
 
-        D3D11_TEXTURE2D_DESC sd = {};
-        sd.Width            = backbuffer_w;
-        sd.Height           = backbuffer_h;
-        sd.MipLevels        = 1;
-        sd.ArraySize        = 1;
-        sd.Format           = bb_fmt;          // exact backbuffer format, so CopyResource accepts it
-        sd.SampleDesc.Count = 1;
-        sd.Usage            = D3D11_USAGE_DEFAULT;
-        sd.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(g.dev->CreateTexture2D(&sd, nullptr, &g.color_stage)))
-        { Log("[feed32] work-resolution staging texture failed (%ux%u fmt=%u)", backbuffer_w, backbuffer_h, bb_fmt); ReleaseShared(); return false; }
+        if (g.is_d3d9)
+        {
+            if (!CreateD3D9SharedStage(backbuffer_w, backbuffer_h, g.color_fmt,
+                                       &g.d3d9_color_stage, &g.color_stage) ||
+                !CreateD3D9SharedStage(backbuffer_w, backbuffer_h, g.color_fmt,
+                                       &g.d3d9_output_stage, &g.d3d9_output_stage11))
+            { ReleaseShared(); return false; }
+        }
+        else
+        {
+            D3D11_TEXTURE2D_DESC sd = {};
+            sd.Width            = backbuffer_w;
+            sd.Height           = backbuffer_h;
+            sd.MipLevels        = 1;
+            sd.ArraySize        = 1;
+            sd.Format           = bb_fmt;
+            sd.SampleDesc.Count = 1;
+            sd.Usage            = D3D11_USAGE_DEFAULT;
+            sd.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
+            if (FAILED(g.dev->CreateTexture2D(&sd, nullptr, &g.color_stage)))
+            { Log("[feed32] work-resolution staging texture failed (%ux%u fmt=%u)", backbuffer_w, backbuffer_h, bb_fmt); ReleaseShared(); return false; }
+        }
 
         D3D11_SHADER_RESOURCE_VIEW_DESC ss = {};
         ss.Format              = g.color_fmt;  // typed view, in case the backbuffer is TYPELESS
@@ -1053,6 +1249,33 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
         { Log("[feed32] work-resolution staging SRV failed"); ReleaseShared(); return false; }
 
         Log("[feed32] work-resolution source: %ux%u staging copy -> %ux%u", backbuffer_w, backbuffer_h, w, h);
+    }
+
+    if (g.is_d3d9)
+    {
+        D3D11_RENDER_TARGET_VIEW_DESC rv = {};
+        rv.Format = g.color_fmt; rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        if (FAILED(g.dev->CreateRenderTargetView(g.d3d9_output_stage11, &rv, &g.d3d9_output_rtv)))
+        { Log("[feed32] D3D9 output RTV failed"); ReleaseShared(); return false; }
+
+        auto make_neutral = [](DXGI_FORMAT fmt, ID3D11Texture2D **tex, ID3D11ShaderResourceView **srv, const FLOAT clear[4]) -> bool {
+            D3D11_TEXTURE2D_DESC td = {};
+            td.Width = g.backbuffer_width; td.Height = g.backbuffer_height; td.MipLevels = 1; td.ArraySize = 1;
+            td.Format = fmt; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+            if (FAILED(g.dev->CreateTexture2D(&td, nullptr, tex)) ||
+                FAILED(g.dev->CreateShaderResourceView(*tex, nullptr, srv))) return false;
+            ID3D11RenderTargetView *neutral_rtv = nullptr;
+            if (FAILED(g.dev->CreateRenderTargetView(*tex, nullptr, &neutral_rtv))) return false;
+            g.ctx4->ClearRenderTargetView(neutral_rtv, clear);
+            neutral_rtv->Release();
+            return true;
+        };
+        const FLOAT zero_mv[4] = {0, 0, 0, 0};
+        const FLOAT far_depth[4] = {1, 1, 1, 1};
+        if (!make_neutral(DXGI_FORMAT_R16G16_FLOAT, &g.d3d9_zero_mv, &g.d3d9_zero_mv_srv, zero_mv) ||
+            !make_neutral(DXGI_FORMAT_R32_FLOAT, &g.d3d9_zero_depth, &g.d3d9_zero_depth_srv, far_depth))
+        { Log("[feed32] D3D9 neutral guide creation failed"); ReleaseShared(); return false; }
     }
 
     if (!EnsureHost()) return false;
@@ -1415,7 +1638,7 @@ static bool CopyOrResampleInputs(ID3D11DeviceContext *ctx,
 
     if (g.color_stage == nullptr || g.color_stage_srv == nullptr || g.resample_ps == nullptr) return false;
     if (mv_srv == nullptr || depth_srv == nullptr) return false;
-    ctx->CopyResource(g.color_stage, color);
+    if (g.color_stage != color) ctx->CopyResource(g.color_stage, color);
 
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     if (FAILED(ctx->Map(g.resample_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
@@ -1602,6 +1825,89 @@ static ID3D11Texture2D *AsTexture2D(ID3D11Resource *res, D3D11_TEXTURE2D_DESC *d
         return nullptr;
     tex->GetDesc(desc);
     return tex;
+}
+
+static void FeedFrameD3D9(reshade::api::effect_runtime *rt, reshade::api::resource_view rtv)
+{
+    LARGE_INTEGER t0 = {}, t1 = {};
+    QueryPerformanceCounter(&t0);
+    auto *dev_api = rt->get_device();
+    auto *device9 = reinterpret_cast<IDirect3DDevice9 *>(dev_api->get_native());
+    auto resource = dev_api->get_resource_from_view(rtv);
+    auto *source9 = reinterpret_cast<IDirect3DSurface9 *>(resource.handle);
+    D3DSURFACE_DESC sd = {};
+    if (device9 == nullptr || source9 == nullptr || FAILED(source9->GetDesc(&sd))) return;
+
+    g.is_d3d9 = true;
+    if (ApplyPendingWorkResolution()) g.built = false;
+    if ((g.frames_done % 60) == 0 && CfgReload()) g.built = false;
+    if (!g_cfg.enabled || g_cfg.mode == 0) return;
+    if (!InitializeD3D9Transport(device9))
+    { FeedDisable("native D3D9 transport initialization failed"); return; }
+
+    const DXGI_FORMAT bb_fmt = FromD3D9Format(sd.Format);
+    const UINT work_w = ScaledExtent(sd.Width, g_cfg.work_resolution);
+    const UINT work_h = ScaledExtent(sd.Height, g_cfg.work_resolution);
+    bool ok = bb_fmt != DXGI_FORMAT_UNKNOWN;
+    if (ok && (!g.built || work_w != g.width || work_h != g.height ||
+               sd.Width != g.backbuffer_width || sd.Height != g.backbuffer_height || bb_fmt != g.bb_fmt))
+    {
+        if (GetTickCount64() < g_retry_at) ok = false;
+        else
+        {
+            Log("[feed32] building native D3D9 bridge: %ux%u work (%d%%) -> %ux%u fmt9=%u/dxgi=%u",
+                work_w, work_h, g_cfg.work_resolution, sd.Width, sd.Height, sd.Format, bb_fmt);
+            ok = BuildShared(work_w, work_h, sd.Width, sd.Height, bb_fmt);
+            if (!ok && !g.disabled) FeedFail("native D3D9 shared build");
+        }
+    }
+
+    if (ok && g.built && HostAlive())
+    {
+        IDirect3DSurface9 *stage_in9 = nullptr;
+        if (SUCCEEDED(g.d3d9_color_stage->GetSurfaceLevel(0, &stage_in9)) &&
+            SUCCEEDED(device9->StretchRect(source9, nullptr, stage_in9, nullptr, D3DTEXF_NONE)) &&
+            WaitForD3D9Copy() &&
+            CopyOrResampleInputs(g.ctx4, g.color_stage, g.d3d9_zero_mv, g.d3d9_zero_depth,
+                                 g.d3d9_zero_mv_srv, g.d3d9_zero_depth_srv, sd.Width, sd.Height))
+        {
+            const UINT64 n = ++g.frame_n;
+            const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
+            g.need_reset = false;
+            g.ctx4->Signal(g.fence_in, n);
+            g.ctx4->Flush();
+            BYTE tag = 'F';
+            FeedFrameMsg fm = { n, static_cast<uint32_t>(reset) };
+            if (!PipeWrite(&tag, 1) || !PipeWrite(&fm, sizeof(fm))) HostLost("D3D9 frame message failed");
+            else
+            {
+                g.ctx4->Wait(g.fence_out, n);
+                g.fence_wait_queued = true;
+                BlitOutputToBackbuffer(g.ctx4, g.d3d9_output_rtv);
+                if (WaitForD3D11Copy())
+                {
+                    g.fence_wait_queued = false; // the event query retired the wait and copy-back
+                    IDirect3DSurface9 *stage_out9 = nullptr;
+                    if (SUCCEEDED(g.d3d9_output_stage->GetSurfaceLevel(0, &stage_out9)) &&
+                        SUCCEEDED(device9->StretchRect(stage_out9, nullptr, source9, nullptr, D3DTEXF_NONE)) &&
+                        WaitForD3D9Copy())
+                    {
+                        const UINT64 done = ++g.frames_done;
+                        g.consecutive_fails = 0;
+                        if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
+                            Log("[feed32] frame %llu delivered (%ux%u, reset=%d, native D3D9)", done, g.width, g.height, reset);
+                    }
+                    SafeRelease(stage_out9);
+                }
+            }
+        }
+        else FeedFail("native D3D9 frame bridge");
+        SafeRelease(stage_in9);
+    }
+    else if (ok && !HostAlive() && g.hproc != nullptr) HostLost("process died");
+
+    QueryPerformanceCounter(&t1);
+    TimingTick(t0.QuadPart, t1.QuadPart);
 }
 
 // The OpenGL sibling of FeedFrame below: same protocol, same host, raw GL instead of
@@ -1973,8 +2279,10 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
     { g.is_gl = true; FeedFrameGl(rt, rtv); return; }
     if (dev_api->get_api() == reshade::api::device_api::vulkan)
     { g.is_vulkan = true; FeedFrameVk(rt, cl, rtv); return; }
+    if (dev_api->get_api() == reshade::api::device_api::d3d9)
+    { FeedFrameD3D9(rt, rtv); return; }
     if (dev_api->get_api() != reshade::api::device_api::d3d11)
-    { FeedDisable("only Direct3D 11, OpenGL and Vulkan games are supported by the 32-bit add-on"); return; }
+    { FeedDisable("only Direct3D 9/11, OpenGL and Vulkan games are supported by the 32-bit add-on"); return; }
 
     auto *ctx = reinterpret_cast<ID3D11DeviceContext *>(cl->get_native());
     if (ctx == nullptr || ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) return;
@@ -2025,6 +2333,8 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
 
     if (ok && g.dev == nullptr)
     {
+        g.is_d3d9 = false;
+        g.owns_d3d11_device = false;
         ctx->GetDevice(&g.dev);
         if (g.dev != nullptr) g.dev->Release();   // not owned; the game outlives us
         if (FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void **>(&g.ctx4))))
@@ -2337,7 +2647,8 @@ static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::ef
 
 static void OnDestroyDevice(reshade::api::device *dev)
 {
-    const bool ours = (g.dev != nullptr && reinterpret_cast<ID3D11Device *>(dev->get_native()) == g.dev) ||
+    const bool ours = (g.is_d3d9 && reinterpret_cast<IDirect3DDevice9 *>(dev->get_native()) == g.dev9) ||
+                      (g.dev != nullptr && !g.is_d3d9 && reinterpret_cast<ID3D11Device *>(dev->get_native()) == g.dev) ||
                       (g.is_gl && dev->get_api() == reshade::api::device_api::opengl) ||
                       (g.is_vulkan && dev == g.rs_dev);
     if (!ours) return;
@@ -2358,10 +2669,15 @@ static void OnDestroyDevice(reshade::api::device *dev)
     g.gl = {};
     g.gl_ctx = nullptr;
     SafeRelease(g.ctx4);
+    SafeRelease(g.query9);
+    SafeRelease(g.query11);
     SafeRelease(g.blit_vs);
     SafeRelease(g.blit_ps);
     SafeRelease(g.blit_sampler);
-    g.dev = nullptr;
+    if (g.owns_d3d11_device) SafeRelease(g.dev); else g.dev = nullptr;
+    g.dev9 = nullptr;
+    g.owns_d3d11_device = false;
+    g.is_d3d9 = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -2393,7 +2709,7 @@ static void DrawLegacyOverlay(reshade::api::effect_runtime *)
     ImGui::Separator();
     ImGui::TextUnformatted("Status");
     ImGui::Text("Feed: %s", g.disabled ? "disabled (see dlss5-feed.log)" : g.built ? "built" : "not built");
-    ImGui::Text("Render API: %s", g.is_vulkan ? "Vulkan" : g.is_gl ? "OpenGL" : "Direct3D 11");
+    ImGui::Text("Render API: %s", g.is_vulkan ? "Vulkan" : g.is_gl ? "OpenGL" : g.is_d3d9 ? "Direct3D 9" : "Direct3D 11");
     ImGui::Text("Host process: %s", HostAlive() ? "running" : "not running");
     if (g.frames_done > 0) ImGui::Text("Frames delivered: %llu", static_cast<unsigned long long>(g.frames_done));
     ImGui::TextWrapped("Motion vectors: %s", g_mv_status);
@@ -2600,7 +2916,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::TextDisabled("32-bit wrapper - processing is performed by the normal x64 AIO addon");
     ImGui::Separator();
     ImGui::Text("Graphics transport: %s -> shared GPU frame -> D3D12 x64",
-        g.is_vulkan ? "Vulkan x86" : g.is_gl ? "OpenGL x86" : "D3D11 x86");
+        g.is_vulkan ? "Vulkan x86" : g.is_gl ? "OpenGL x86" : g.is_d3d9 ? "D3D9 x86" : "D3D11 x86");
     if (g.backbuffer_width != 0)
         ImGui::Text("Detected source resolution: %ux%u", g.backbuffer_width, g.backbuffer_height);
     else
