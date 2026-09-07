@@ -1,11 +1,11 @@
 # DLSS5 ReShade AIO
 
-Bring Neural Rendering, DLAA/DLSS Super Resolution, and Frame Generation to supported 64-bit Windows games even when the game does not include those features. This is experimental software and currently supports D3D9, D3D11, D3D12, and Vulkan through ReShade.
+Bring Neural Rendering, DLAA/DLSS Super Resolution, and Frame Generation to supported 32-bit and 64-bit Windows games even when the game does not include those features. The normal addon supports 64-bit D3D9, D3D11, D3D12, and Vulkan games through ReShade. The 32-bit package uses a small x86 capture addon and a bundled x64 carrier so the same 64-bit AIO processing pipeline can handle the game frame.
 
 This project's original code and documentation are licensed under the [Apache License 2.0](LICENSE). Forks and redistributed derivatives must preserve the license and the attribution in [`NOTICE`](NOTICE), retain applicable notices, and mark modified files. Third-party components and NVIDIA runtime files remain under their own terms; see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 > [!NOTE]
-> **v2.0.9 adds an optional pipeline source-resolution override.** Use it when the detected game source resolution is wrong, or to downsample a higher-resolution game frame before Neural Rendering for better performance without lowering the game's own resolution. The override is disabled by default and does not change the game window or final native output size.
+> **Choose one ZIP from the latest release: 64-bit for a 64-bit game or 32-bit for a 32-bit game.** Extract the contents of that ZIP into the folder containing the game's real executable and ReShade DLL. Do not combine the two packages.
 
 > [!IMPORTANT]
 > **Version 2.0 uses a new presentation and window-compatibility system.** It fixes input and reduced-window behavior in many games, but game compatibility can differ from the 1.x series. If a game has problems in 2.0 that it did not have before, install the [latest 1.x release (v1.7.24)](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/tag/v1.7.24). Do not mix the 1.x and 2.0 addon binaries.
@@ -13,20 +13,56 @@ This project's original code and documentation are licensed under the [Apache Li
 > [!TIP]
 > **Windowed mode is recommended for setup and normal use.** It reliably exposes a lower-resolution backbuffer for DLSS SR, and version 2.0.1 can place the processed output in a small preview beside the real ReShade window while you change settings. Closing ReShade restores the native-size processed output.
 
-## Quick install
+## Quick install — choose one package
 
-> [!IMPORTANT]
-> Install both required binaries: `standalone-dlssnr.addon64` **and** `nvngx.dll`. The addon will not initialize with only the `.addon64` file. Releases starting with v1.7.16 also include the companion `DLSS5_AIO_Feed.fx` shader.
+The ReShade installer identifies whether a selected game executable is 32-bit or 64-bit. Install the matching ReShade build **with addon support**, then download the matching AIO ZIP from the [latest release](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/latest).
 
-1. Install a 64-bit ReShade build with addon support into the folder containing the game's real executable. Launchers often use a different folder, so target the executable that renders the game.
-2. Open the [latest release](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/latest) and download:
-   - `standalone-dlssnr.addon64`
-   - `nvngx.dll` (the required caller bridge)
-   - `DLSS5_AIO_Feed.fx` (the companion guide shader)
-3. Put both binary files beside the game's ReShade DLL and executable. RHI users may instead put them in `%LOCALAPPDATA%\RHI\Custom\Addons`.
-4. Put `DLSS5_AIO_Feed.fx` in the game's ReShade shader directory, normally `reshade-shaders\Shaders`. It is uniquely named for this addon and will not replace the upstream DLSS5-Feeder project's `DLSS5_Feed.fx`.
-5. Supply `nvngx_dlssnr.dll`, `nvngx_dlss.dll`, and optionally `nvngx_dlssg.dll` from sources whose licenses permit your use. These NVIDIA runtimes cannot be distributed in this repository. The simplest arrangement is to place them beside the addon; see [`runtime/README.md`](runtime/README.md).
-6. Start the game and open ReShade. Confirm that **Standalone DLSS-NR + SR** appears under the Add-ons tab.
+| Your game | Download | Extract to |
+| --- | --- | --- |
+| **64-bit** | `DLSS5-ReShade-AIO-vX.Y.Z-64-bit.zip` | The folder containing the real game executable and its 64-bit ReShade DLL |
+| **32-bit** | `DLSS5-ReShade-AIO-vX.Y.Z-32-bit.zip` | The folder containing the real game executable and its 32-bit ReShade DLL |
+
+### 64-bit games
+
+1. Install **64-bit ReShade with addon support** beside the game's real executable.
+2. Extract the entire **64-bit AIO ZIP** into that same folder. Keep the included `reshade-shaders` folders intact.
+3. Obtain `nvngx_dlssnr.dll`, `nvngx_dlss.dll`, and, for Frame Generation, `nvngx_dlssg.dll` from sources whose terms permit your use. Put all three **directly beside the game executable**, `standalone-dlssnr.addon64`, and `nvngx.dll`.
+4. Start the game and confirm **Standalone DLSS-NR + SR** appears in ReShade's Add-ons tab.
+
+The ZIP's `nvngx.dll` is this project's small caller bridge. It is required and is not the same file as the separately obtained NVIDIA runtime DLLs. RHI users may continue placing the 64-bit addon files in `%LOCALAPPDATA%\RHI\Custom\Addons`.
+
+### 32-bit games
+
+The 32-bit game captures frames, while the x64 carrier inside `host64` runs the normal AIO NR/DLSS/FG pipeline. The folder separation is mandatory because a 32-bit game cannot load the 64-bit ReShade or NVIDIA DLLs.
+
+1. Install **32-bit ReShade with addon support** beside the game's real executable. Select the standard ReShade shader package so `ReShade.fxh` is installed for the included capture effect.
+2. Extract the entire **32-bit AIO ZIP** into that same game folder. Do not move files out of the included `host64` folder.
+3. Run the ReShade installer a second time, browse to `host64\AIO DLSS5 32-bit Wrapper.exe`, choose **DirectX 10/11/12**, and install **64-bit ReShade with addon support**. Confirm the resulting proxy is `game folder\host64\dxgi.dll`.
+4. Obtain the NVIDIA runtimes separately and put `nvngx_dlssnr.dll`, `nvngx_dlss.dll`, and `nvngx_dlssg.dll` in `game folder\host64`—**not** directly beside the 32-bit game executable.
+5. Start the game normally. `standalone-dlssnr.addon32` launches `host64\AIO DLSS5 32-bit Wrapper.exe` automatically. Use the AIO page in the game's normal ReShade Add-ons tab; **Apply settings and restart 64-bit AIO** restarts only the carrier.
+
+The extracted layout should look like this:
+
+```text
+game.exe                         (32-bit game)
+dxgi.dll / d3d9.dll             (32-bit ReShade, name depends on the game API)
+standalone-dlssnr.addon32
+dlss5-aio-x86.cfg
+reshade-shaders\Shaders\DLSS5_Feed.fx
+host64\
+  AIO DLSS5 32-bit Wrapper.exe
+  dxgi.dll                      (64-bit ReShade — supplied separately)
+  standalone-dlssnr.addon64
+  nvngx.dll                     (AIO bridge, included)
+  nvngx_dlssnr.dll              (NVIDIA runtime — supplied separately)
+  nvngx_dlss.dll                (NVIDIA runtime — supplied separately)
+  nvngx_dlssg.dll               (NVIDIA runtime — supplied separately)
+  reshade-shaders\Shaders\DLSS5_AIO_Feed.fx
+```
+
+NVIDIA runtime DLLs and ReShade itself are governed by their own licenses and therefore are not redistributed in these ZIPs. See [`runtime/README.md`](runtime/README.md).
+
+The x86 transport is currently validated with 32-bit D3D11 output. A native 32-bit D3D9 game needs a D3D9-to-D3D11 wrapper such as dgVoodoo2 before the AIO capture layer; that wrapper is not bundled here. The x86 OpenGL and Vulkan transports remain experimental.
 
 ## First-launch setup
 
@@ -109,7 +145,8 @@ Open **ReShade > Add-ons > Standalone DLSS-NR + SR**, then expand **Compatibilit
 | **A lower game resolution still reports DLAA instead of DLSS SR** | Switch to windowed mode first. DLSS SR activates only when the game creates a genuinely lower-resolution backbuffer. If needed, test borderless/fullscreen and restart after changing mode. |
 | **The image becomes smeared, stretched, or wrongly sized after changing resolution** | Restart the game and set the desired resolution/display mode before loading gameplay. Live resolution changes remain game-dependent. |
 | **The processed preview does not appear while ReShade is open** | Use windowed mode at a resolution below the monitor's native resolution. Fullscreen and borderless windows may leave no separate desktop area for the preview. Closing ReShade should still restore the native-size processed output. |
-| **The addon is missing from ReShade** | Confirm the game is 64-bit, ReShade was installed with addon support, and `standalone-dlssnr.addon64` is beside the real game executable and ReShade DLL. |
+| **The addon is missing from ReShade** | Confirm ReShade was installed with addon support and that you extracted the ZIP matching the game's architecture. For 64-bit games, `standalone-dlssnr.addon64` belongs beside the game executable. For 32-bit games, `standalone-dlssnr.addon32` belongs beside the game executable and the x64 processing files remain under `host64`. |
+| **A 32-bit game says the host process is not running** | Keep `AIO DLSS5 32-bit Wrapper.exe`, `standalone-dlssnr.addon64`, the included `nvngx.dll`, 64-bit ReShade `dxgi.dll`, and all NVIDIA runtime DLLs together inside `host64`. Do not place the x64 files beside the 32-bit game executable. Check `dlss5-aio-x86.log` in the game folder and the logs under `host64`. |
 | **The log says `required private runtime dependency missing`** | Install `nvngx.dll` beside the addon. Also supply `nvngx_dlssnr.dll` and `nvngx_dlss.dll`; `nvngx_dlssg.dll` is required for Frame Generation. |
 | **The overlay reports fallback or zero-motion guides** | This is the normal default. VORT motion integration is optional and disabled by default because it may significantly reduce performance. To test it, install `DLSS5_AIO_Feed.fx` and VORT Motion under the configured ReShade shader path, then enable **Enable VORT motion integration (experimental)**. |
 | **Vulkan waits for a shared frame** | Confirm ReShade's Vulkan layer is active. If no other ReShade effect is loaded, install `StandaloneBoundary.fx` so the required effects boundary runs. |
@@ -136,7 +173,7 @@ The persistent log records `early_proxy=enabled` at startup when the saved setti
 - Additional game-specific and Vulkan issues are expected.
 - The experimental VORT NR rejection mask currently behaves more like a hard gate than a gradual blend at nonzero strength. Leave it disabled unless testing this feature; strength zero is an exact bypass that restores NVIDIA automatic masking.
 
-## What changed in 2.0
+## What changed in 2.x
 
 Version 2.0 replaces the older always-detached presentation behavior with a compatibility-aware compositor. It attaches the finished native-resolution image directly to the game window when that is safe and automatically uses a detached native-size output for genuinely reduced windows and Vulkan cases. The game window is left untouched by default.
 
@@ -145,6 +182,13 @@ The new **Compatibility / troubleshooting** panel provides opt-in fixes for game
 Resolution transitions are serialized outside the game's DXGI callback, failed sessions can recover into serialized mode by holding **F8** during launch, and startup contract changes hold the last completed native frame instead of repeatedly exposing the low-resolution game surface.
 
 Because presentation behavior varies substantially between engines, 2.0 may work better or worse than 1.x in a particular game. Keep [v1.7.24](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/tag/v1.7.24) available as the stable 1.x fallback and report regressions with the game name, graphics API, display mode, and persistent addon log.
+
+### Version 2.1.0
+
+- Adds the x86 capture and x64 carrier path for 32-bit games. The x86 addon forwards frames and settings into the same maintained NR/DLSS/FG implementation used by 64-bit games.
+- Replaces loose release assets with clearly named 32-bit and 64-bit ZIP packages whose internal paths are ready to extract into a game directory.
+- Centralizes persistent ReShade menu definitions so the x86 settings proxy and x64 processing addon use the same keys, choices, defaults, ranges, groups, and help text.
+- Keeps 64-bit ReShade and the NVIDIA runtime DLLs isolated under `host64` for 32-bit games, preventing architecture conflicts with the game's x86 ReShade installation.
 
 ### Version 2.0.9
 
@@ -195,10 +239,11 @@ The filename, technique, and exported guide resources use the `DLSS5_AIO_*` name
 
 ## Technical details
 
-This project contains two independently useful pieces:
+This project contains four independently useful pieces:
 
 - `lab/`: a deterministic D3D12 test program that reverse-engineers and validates the private DLSS-NR feature-18 contract without launching a game.
-- `addon/`: a standalone ReShade addon for D3D9, D3D11, D3D12, and 64-bit Windows Vulkan games. It does not hook or depend on the ShortFuse addon.
+- `addon/`: the normal x64 processing addon for D3D9, D3D11, D3D12, and 64-bit Windows Vulkan games. It does not hook or depend on the ShortFuse addon.
+- `x86-host/`: a thin 32-bit capture/settings addon plus an x64 carrier. It forwards a 32-bit game's frames into the same `addon/` processing implementation rather than maintaining a second NR/DLSS/FG pipeline.
 - `tools/`: the dependency-free performance recorder and analyzer for PresentMon CSVs, existing addon logs, and synchronized shared-memory telemetry.
 
 ## Performance analyzer
@@ -266,7 +311,7 @@ Run `addon\build.bat`. The available runtime set is emitted under `addon\build`:
 - `nvngx_dlssg.dll`
 - `DLSS5_AIO_Feed.fx`
 
-Every GitHub release from v1.7.16 onward must attach `standalone-dlssnr.addon64`, `nvngx.dll`, and `DLSS5_AIO_Feed.fx`. The NVIDIA runtime DLLs remain user-supplied and must not be attached to public releases.
+Every GitHub release from v2.1.0 onward must attach exactly two end-user archives: `DLSS5-ReShade-AIO-vX.Y.Z-64-bit.zip` and `DLSS5-ReShade-AIO-vX.Y.Z-32-bit.zip`. Build both with `release\package-release.ps1 -Version vX.Y.Z`. The ZIPs contain the project-owned binaries, shaders, ready-made directory layout, notices, and architecture-specific instructions. ReShade and the NVIDIA runtime DLLs remain user-supplied and must not be attached to public releases.
 
 Windowed mode is recommended at the desired render resolution, particularly while configuring the addon: it tends to expose the intended lower-resolution swapchain and gives the ReShade menu and processed preview separate screen space. Fullscreen and borderless remain supported where the game creates the expected backbuffer. A native-resolution game swapchain selects DLAA automatically; a lower-resolution swapchain selects DLSS Super Resolution. The addon keeps the desktop at native resolution, rejects auxiliary/helper swapchains, and presents the processed native output in its proxy window.
 

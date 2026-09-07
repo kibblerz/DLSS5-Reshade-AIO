@@ -1,0 +1,10 @@
+THIS IS THE host64 FOLDER FOR A 32-BIT GAME.
+
+Keep all included files here. Add these separately obtained 64-bit files here:
+
+  dxgi.dll             64-bit ReShade with addon support
+  nvngx_dlssnr.dll     NVIDIA Neural Rendering runtime
+  nvngx_dlss.dll       NVIDIA DLSS Super Resolution runtime
+  nvngx_dlssg.dll      NVIDIA Frame Generation runtime
+
+Do not move these x64 files beside the 32-bit game executable.

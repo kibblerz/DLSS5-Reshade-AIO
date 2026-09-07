@@ -1,6 +1,6 @@
-# Experimental 32-bit host
+# 32-bit AIO host
 
-This prototype reuses the released 64-bit Standalone DLSS-NR + SR addon instead
+The 32-bit package reuses the released 64-bit Standalone DLSS-NR + SR addon instead
 of compiling a second NVIDIA pipeline for x86:
 
 1. `standalone-dlssnr.addon32` captures a 32-bit game's final frame into a shared GPU texture
@@ -13,7 +13,11 @@ The first target is D3D9 through dgVoodoo2's D3D11 wrapper. Native x86 D3D11 is
 already supported by the transport. Vulkan and OpenGL remain transport-capable,
 but are outside the Arkham City validation pass.
 
-This is an experimental deployment, not a release artifact.
+Release ZIPs preserve this layout automatically. Extract the 32-bit ZIP beside
+the 32-bit game executable, then put the separately obtained 64-bit ReShade
+`dxgi.dll` and NVIDIA `nvngx_dlssnr.dll`, `nvngx_dlss.dll`, and
+`nvngx_dlssg.dll` files inside `host64`. Never put those x64 DLLs directly beside
+the x86 game executable.
 
 The wrapper writes the real addon's `[Standalone.DLSSNR]` configuration in
 `host64/ReShade.ini`; **Apply settings and restart 64-bit AIO** cycles only the

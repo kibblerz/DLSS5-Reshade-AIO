@@ -19,6 +19,9 @@ x86-host/build/
 x86-host/*.obj
 x86-host/*.exp
 x86-host/*.lib
+release/dist/
+release/stage-*/
+release/verify-*/
 
 # Closed-source NVIDIA runtimes are supplied locally, never committed.
 runtime/*.dll
