@@ -50,7 +50,7 @@
 #include "feed_vk.h"   // raw-Vulkan interop, likewise -- compiled x86 here
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
 
-#define FEED_VERSION "2.0.9-x86-prototype.3"
+#define FEED_VERSION "2.0.9-x86-prototype.4"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR (32-bit wrapper) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -118,7 +118,9 @@ struct Cfg
     float mv_scale_x, mv_scale_y;
 };
 
-static Cfg g_cfg = { 1, 1, -1, -1, -1, 0, 3, 0, 100, 1.0f, 1.0f };
+// The AIO wrapper must start in the full processing path. Mode 1 exists only
+// as a transport diagnostic and intentionally returns the unprocessed frame.
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 100, 1.0f, 1.0f };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
