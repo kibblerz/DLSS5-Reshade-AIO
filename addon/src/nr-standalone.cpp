@@ -41,6 +41,10 @@ extern "C" __declspec(dllexport) const char *DESCRIPTION =
     "Standalone D3D9/D3D11/D3D12/Vulkan DLSS Neural Rendering, Super Resolution, and Frame Generation.";
 
 static HMODULE g_self;
+// Set by the 64-bit carrier used for 32-bit games. The ReShade runtime lives
+// in the carrier process, but foreground/input ownership must remain with the
+// real game process.
+static DWORD g_external_game_process_id;
 static wchar_t g_addon_directory[MAX_PATH];
 static char g_log_path[MAX_PATH];
 static char g_startup_recovery_path[MAX_PATH];
@@ -6445,6 +6449,8 @@ static bool MapGameScreenPointToProxy(POINT game_screen, POINT &proxy_screen)
 
 static void UpdateProxyCursorClip(bool active)
 {
+    if (g_external_game_process_id != 0)
+        active = false;
     if (active && g_proxy_window != nullptr && IsWindow(g_proxy_window))
     {
         RECT client = {};
@@ -7647,13 +7653,17 @@ static void ApplyProxyOverlayPreview(HWND hwnd, bool enable)
 
 static bool IsGameProcessForeground(HWND foreground)
 {
-    if (foreground == nullptr || g_game_window == nullptr)
+    if (foreground == nullptr)
+        return false;
+    DWORD foreground_process = 0;
+    GetWindowThreadProcessId(foreground, &foreground_process);
+    if (g_external_game_process_id != 0)
+        return foreground_process == g_external_game_process_id;
+    if (g_game_window == nullptr)
         return false;
     if (foreground == g_game_window || GetAncestor(foreground, GA_ROOT) == g_game_window)
         return true;
-    DWORD foreground_process = 0;
     DWORD game_process = 0;
-    GetWindowThreadProcessId(foreground, &foreground_process);
     GetWindowThreadProcessId(g_game_window, &game_process);
     return foreground_process != 0 && foreground_process == game_process;
 }
@@ -7743,6 +7753,8 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
     }
     if (message == kProxyOverlayInputModeMessage)
     {
+        if (g_external_game_process_id != 0)
+            return 0;
         const bool overlay_input = wparam != 0;
         LONG_PTR ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         const LONG_PTR desired_style = overlay_input ?
@@ -7776,6 +7788,7 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
     }
     if (message == WM_NCHITTEST)
     {
+        if (g_external_game_process_id != 0) return HTTRANSPARENT;
         if (g_proxy_overlay_preview.load()) return HTTRANSPARENT;
         return HTCLIENT;
     }
@@ -8722,7 +8735,9 @@ static DWORD WINAPI ProxyWindowThread(void *)
     if (GetMonitorInfoW(monitor, &info))
     {
         const DWORD window_style = WS_POPUP | (g_proxy_window_start_hidden ? 0 : WS_VISIBLE);
-        g_proxy_window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        const DWORD proxy_ex_style = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
+            (g_external_game_process_id != 0 ? WS_EX_TRANSPARENT : 0);
+        g_proxy_window = CreateWindowExW(proxy_ex_style,
             wc.lpszClassName, L"Standalone DLSS-NR Native Output", window_style,
             info.rcMonitor.left, info.rcMonitor.top,
             info.rcMonitor.right - info.rcMonitor.left,
@@ -11968,6 +11983,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         GetModuleFileNameW(module, g_addon_directory, MAX_PATH);
         wchar_t *slash = wcsrchr(g_addon_directory, L'\\');
         if (slash) slash[1] = L'\0';
+        wchar_t external_pid[32] = {};
+        if (GetEnvironmentVariableW(L"DLSS5_AIO_EXTERNAL_GAME_PID", external_pid,
+            static_cast<DWORD>(std::size(external_pid))) != 0)
+        {
+            const unsigned long parsed = wcstoul(external_pid, nullptr, 10);
+            g_external_game_process_id = static_cast<DWORD>(parsed);
+        }
         char local[MAX_PATH] = {};
         if (GetEnvironmentVariableA("LOCALAPPDATA", local, MAX_PATH) != 0)
         {

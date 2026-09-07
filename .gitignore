@@ -15,6 +15,8 @@ lab/*.png
 lab/optional-*.txt
 lab/matrix-results.txt
 lab/log-*.txt
+x86-host/build/
+x86-host/*.obj
 
 # Closed-source NVIDIA runtimes are supplied locally, never committed.
 runtime/*.dll
