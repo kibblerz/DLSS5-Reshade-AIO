@@ -35,6 +35,7 @@
 
 static char g_log_path[MAX_PATH];
 static bool g_show_window = false;
+static HWND g_game_window_hint = nullptr;
 static DWORD g_game_pid;
 static bool g_renodx_lazy = false;   // DLSS 5 add-on is v45+ (per-present rescan, lazy adoption)
 static bool g_renodx_v46  = false;   // DLSS 5 add-on is v4.6+ (global hotkeys, upscaling latch)
@@ -284,6 +285,13 @@ static BOOL CALLBACK FindGameWindowProc(HWND window, LPARAM parameter)
 
 static HWND FindGameWindow()
 {
+    if (g_game_window_hint != nullptr && IsWindow(g_game_window_hint))
+    {
+        DWORD process = 0;
+        GetWindowThreadProcessId(g_game_window_hint, &process);
+        if (process == g_game_pid)
+            return g_game_window_hint;
+    }
     HWND result = nullptr;
     EnumWindows(FindGameWindowProc, reinterpret_cast<LPARAM>(&result));
     return result;
@@ -593,13 +601,25 @@ static bool InitDisguise()
     RegisterClassW(&wc);
     RECT carrier_rect = {0, 0, 960, 540};
     if (HWND game_window = FindGameWindow())
-        GetWindowRect(game_window, &carrier_rect);
+    {
+        const HMONITOR monitor = MonitorFromWindow(game_window, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO monitor_info = {sizeof(monitor_info)};
+        if (GetMonitorInfoW(monitor, &monitor_info))
+            carrier_rect = monitor_info.rcMonitor;
+        else
+            GetWindowRect(game_window, &carrier_rect);
+    }
     h.hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, wc.lpszClassName,
                              L"DLSS5 AIO 32-bit Carrier",
                              WS_POPUP, carrier_rect.left, carrier_rect.top, 960, 540,
                              nullptr, nullptr, wc.hInstance, nullptr);
     if (h.hwnd == nullptr) { Log("[host] window creation failed"); return false; }
-    if (g_show_window) ShowWindow(h.hwnd, SW_SHOWNOACTIVATE);   // never steal the game's focus
+    // A fully hidden HWND produces an occluded swapchain in some DXGI versions;
+    // after its first Present ReShade then stops driving the AIO contract. Keep
+    // this no-activate tool window visible at the bottom of Z order. Arkham/the
+    // real game remains above it, while the AIO's own detached compositor is
+    // the only native-size surface the player sees.
+    ShowWindow(h.hwnd, SW_SHOWNOACTIVATE);
 
     HRESULT hr = create_device(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
                                reinterpret_cast<void **>(&h.dev));
@@ -633,9 +653,9 @@ static bool InitDisguise()
     if (FAILED(hr)) { Log("[host] CreateSwapChainForHwnd failed 0x%08X", hr); return false; }
     // Park it at the bottom of the Z-order without activating, so a respawn never surfaces
     // over the game. The user can still raise it from the taskbar to reach the add-on panel.
-    if (g_show_window)
-        SetWindowPos(h.hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    Log("[host] carrier up: hidden D3D12 swapchain; waiting for the first game frame");
+    SetWindowPos(h.hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    Log("[host] carrier up: non-activating bottom-z D3D12 swapchain on the game monitor; waiting for the first game frame");
 
     // Ring + internal fence for our own submissions.
     for (int i = 0; i < Host::kFrames; ++i)
@@ -701,10 +721,11 @@ static bool ResizeCarrier(UINT width, UINT height, DXGI_FORMAT color_format)
     RECT game_rect = {};
     if (game_window != nullptr && GetWindowRect(game_window, &game_rect))
         SetWindowPos(h.hwnd, HWND_BOTTOM, game_rect.left, game_rect.top,
-            static_cast<int>(width), static_cast<int>(height), SWP_NOACTIVATE | SWP_NOSENDCHANGING);
+            static_cast<int>(width), static_cast<int>(height),
+            SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_SHOWWINDOW);
     else
         SetWindowPos(h.hwnd, HWND_BOTTOM, 0, 0, static_cast<int>(width), static_cast<int>(height),
-            SWP_NOACTIVATE | SWP_NOSENDCHANGING);
+            SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_SHOWWINDOW);
     Log("[carrier] swapchain configured: %ux%u %s", width, height, FeedFmtName(format));
     return true;
 }
@@ -1208,6 +1229,9 @@ int main(int argc, char **argv)
     {
         if      (strcmp(argv[i], "--test") == 0) test = true;
         else if (strcmp(argv[i], "--hide") == 0) hide = true;
+        else if (strcmp(argv[i], "--hwnd") == 0 && i + 1 < argc)
+            g_game_window_hint = reinterpret_cast<HWND>(
+                static_cast<uintptr_t>(_strtoui64(argv[++i], nullptr, 0)));
         else pid = static_cast<DWORD>(strtoul(argv[i], nullptr, 10));
     }
     if (!test && pid == 0)
@@ -1217,6 +1241,7 @@ int main(int argc, char **argv)
     }
     g_show_window = false;
     g_game_pid = pid;
+    Log("[host] external game pid=%lu hwnd=%p", static_cast<unsigned long>(pid), g_game_window_hint);
     wchar_t external_pid[32] = {};
     _snwprintf_s(external_pid, _countof(external_pid), _TRUNCATE, L"%lu",
         static_cast<unsigned long>(pid));

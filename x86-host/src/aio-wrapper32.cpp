@@ -50,7 +50,7 @@
 #include "feed_vk.h"   // raw-Vulkan interop, likewise -- compiled x86 here
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
 
-#define FEED_VERSION "2.0.9-x86-prototype.4"
+#define FEED_VERSION "2.0.9-x86-prototype.5"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR (32-bit wrapper) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -114,13 +114,14 @@ struct Cfg
     int   reset_every;
     int   log_frames;
     int   host_window;     // 1 = show the host's window (it carries the DLSS 5 tuning panel: press Home there)
+    int   show_processed_output; // initial virtual-screen A/B state; F10 still toggles it live
     int   work_resolution; // 50..100 percent of each backbuffer axis; the game stays native-sized
     float mv_scale_x, mv_scale_y;
 };
 
 // The AIO wrapper must start in the full processing path. Mode 1 exists only
 // as a transport diagnostic and intentionally returns the unprocessed frame.
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 100, 1.0f, 1.0f };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 1, 100, 1.0f, 1.0f };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -149,9 +150,10 @@ static void CfgWriteDefault()
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
-               "host_window=%d\nwork_resolution=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+               "host_window=%d\nshow_processed_output=%d\nwork_resolution=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
-            g_cfg.log_frames, g_cfg.host_window, g_cfg.work_resolution, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.log_frames, g_cfg.host_window, g_cfg.show_processed_output, g_cfg.work_resolution,
+            g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     fclose(f);
 }
 
@@ -165,9 +167,10 @@ static void CfgSave()
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
-               "host_window=%d\nwork_resolution=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+               "host_window=%d\nshow_processed_output=%d\nwork_resolution=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
-            g_cfg.log_frames, g_cfg.host_window, g_cfg.work_resolution, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.log_frames, g_cfg.host_window, g_cfg.show_processed_output, g_cfg.work_resolution,
+            g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     fclose(f);
 }
 
@@ -208,6 +211,7 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "reset_every")    == 0) next.reset_every    = iv;
         else if (_stricmp(key, "log_frames")     == 0) next.log_frames     = iv;
         else if (_stricmp(key, "host_window")    == 0) next.host_window    = iv;
+        else if (_stricmp(key, "show_processed_output") == 0) next.show_processed_output = iv;
         else if (_stricmp(key, "work_resolution")== 0) next.work_resolution = iv;
         else if (_stricmp(key, "mv_scale_x")     == 0) next.mv_scale_x     = val;
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
@@ -632,7 +636,7 @@ static bool EnsureHost()
     GetModuleFileNameA(g_self, dir, MAX_PATH);
     if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
 
-    char exe[MAX_PATH], cmd[MAX_PATH + 32], wd[MAX_PATH];
+    char exe[MAX_PATH], cmd[MAX_PATH + 96], wd[MAX_PATH];
     sprintf_s(exe, "%shost64\\dlss5-feed-host64.exe", dir);
     sprintf_s(wd, "%shost64", dir);
     if (GetFileAttributesA(exe) == INVALID_FILE_ATTRIBUTES)
@@ -641,7 +645,10 @@ static bool EnsureHost()
         FeedDisable("the 64-bit host is not installed");
         return false;
     }
-    sprintf_s(cmd, "\"%s\" %lu%s", exe, GetCurrentProcessId(), g_cfg.host_window ? "" : " --hide");
+    const HWND game_window = g.runtime != nullptr ? static_cast<HWND>(g.runtime->get_hwnd()) : nullptr;
+    sprintf_s(cmd, "\"%s\" %lu --hwnd %llu%s", exe, GetCurrentProcessId(),
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(game_window)),
+        g_cfg.host_window ? "" : " --hide");
 
     STARTUPINFOA si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};
@@ -649,9 +656,11 @@ static bool EnsureHost()
     char pass_count[8] = {};
     sprintf_s(pass_count, "%d", std::clamp(g_aio_nr_pass_count, 1, 3));
     SetEnvironmentVariableA("DLSS5_AIO_NR_PASSES", pass_count);
+    SetEnvironmentVariableA("DLSS5_AIO_SHOW_PROCESSED", g_cfg.show_processed_output ? "1" : "0");
     if (!CreateProcessA(nullptr, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, wd, &si, &pi))
     {
         SetEnvironmentVariableA("DLSS5_AIO_NR_PASSES", nullptr);
+        SetEnvironmentVariableA("DLSS5_AIO_SHOW_PROCESSED", nullptr);
         Log("[feed32] CreateProcess failed %lu", GetLastError());
         FeedDisable("could not start the 64-bit host");
         return false;
@@ -763,6 +772,8 @@ static float DecodeAioValue(int index, float value)
         const int raw = static_cast<int>(value);
         return raw == 10 ? 1.0f : raw == 11 ? 2.0f : raw == 12 ? 3.0f : raw == 13 ? 4.0f : 0.0f;
     }
+    SetEnvironmentVariableA("DLSS5_AIO_NR_PASSES", nullptr);
+    SetEnvironmentVariableA("DLSS5_AIO_SHOW_PROCESSED", nullptr);
     SetEnvironmentVariableA("DLSS5_AIO_NR_PASSES", nullptr);
     if (index == 5) return std::clamp(value - 1.0f, 0.0f, 2.0f);
     return value;
@@ -2282,6 +2293,7 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
 static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
 {
     g.runtime = rt;
+    Log("[feed32] game presentation window resolved: hwnd=%p", rt->get_hwnd());
     ResolveHandles(rt);
     static int inits = 0;
     if (++inits <= 8) Log("[feed32] effect runtime %p initialised", (void *)rt);
@@ -2564,6 +2576,21 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g.built ? "active" : "initializing");
     if (g.frames_done != 0)
         ImGui::Text("Frames transferred: %llu", static_cast<unsigned long long>(g.frames_done));
+
+    bool show_processed_output = g_cfg.show_processed_output != 0;
+    if (ImGui::Checkbox("Show processed virtual-screen output", &show_processed_output))
+    {
+        g_cfg.show_processed_output = show_processed_output ? 1 : 0;
+        CfgSave();
+        CaptureGameFocus();
+        HostClose();
+        RestoreGameFocus();
+        Log("[feed32] virtual-screen startup output changed to %s; carrier restart requested",
+            show_processed_output ? "processed" : "raw A/B");
+    }
+    ImGui::SameLine();
+    HelpMarker("Controls which image the detached native-resolution virtual screen displays. "
+               "F10 still switches processed/raw output live after the virtual screen is active.");
 
     ImGui::Separator();
     DrawAioSetting(0);

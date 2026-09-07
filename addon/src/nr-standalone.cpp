@@ -11990,6 +11990,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             const unsigned long parsed = wcstoul(external_pid, nullptr, 10);
             g_external_game_process_id = static_cast<DWORD>(parsed);
         }
+        if (g_external_game_process_id != 0)
+        {
+            wchar_t external_show_processed[8] = {};
+            if (GetEnvironmentVariableW(L"DLSS5_AIO_SHOW_PROCESSED", external_show_processed,
+                static_cast<DWORD>(std::size(external_show_processed))) != 0)
+                g_show_neural_output = _wtoi(external_show_processed) != 0;
+        }
         char local[MAX_PATH] = {};
         if (GetEnvironmentVariableA("LOCALAPPDATA", local, MAX_PATH) != 0)
         {
