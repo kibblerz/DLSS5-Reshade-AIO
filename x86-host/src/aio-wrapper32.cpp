@@ -31,6 +31,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <d3d9.h>
+#include <d3d10_1.h>
 #include <d3d11_4.h>
 #include <dxgi1_2.h>
 #include <d3dcompiler.h>
@@ -363,6 +364,14 @@ struct Feed32
     ID3D11Texture2D        *d3d9_zero_depth;
     ID3D11ShaderResourceView *d3d9_zero_mv_srv;
     ID3D11ShaderResourceView *d3d9_zero_depth_srv;
+
+    // ReShade 6 renders effects for native D3D9 games through an internal
+    // D3D10.1 swapchain. This bridge is therefore the normal D3D9 route there.
+    bool                    is_d3d10;
+    ID3D10Device1          *dev10;                // not owned
+    ID3D10Query            *query10;
+    ID3D10Texture2D        *d3d10_color_stage;
+    ID3D10Texture2D        *d3d10_output_stage;
 
     // OpenGL client: the host creates the shared textures and duplicates the handles
     // in; we import them raw (feed_gl.h) and never touch D3D11 at all. tex_handle[]
@@ -907,6 +916,8 @@ static void ReleaseShared()
     SafeRelease(g.d3d9_output_stage11);
     SafeRelease(g.d3d9_output_stage);
     SafeRelease(g.d3d9_color_stage);
+    SafeRelease(g.d3d10_output_stage);
+    SafeRelease(g.d3d10_color_stage);
     SafeRelease(g.output_srv);
     SafeRelease(g.color_stage_srv);
     SafeRelease(g.color_stage);
@@ -1074,6 +1085,79 @@ static bool WaitForD3D11Copy()
     return hr == S_OK;
 }
 
+static bool InitializeD3D10Transport(ID3D10Device1 *device10)
+{
+    if (g.dev != nullptr && g.ctx4 != nullptr && g.dev10 == device10) return true;
+    IDXGIDevice *dxgi_device = nullptr;
+    IDXGIAdapter *adapter0 = nullptr;
+    IDXGIAdapter1 *adapter = nullptr;
+    HRESULT hr = device10->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&dxgi_device));
+    if (SUCCEEDED(hr)) hr = dxgi_device->GetAdapter(&adapter0);
+    if (SUCCEEDED(hr)) hr = adapter0->QueryInterface(__uuidof(IDXGIAdapter1), reinterpret_cast<void **>(&adapter));
+    SafeRelease(adapter0);
+    SafeRelease(dxgi_device);
+    if (FAILED(hr) || adapter == nullptr)
+    { SafeRelease(adapter); Log("[feed32] D3D10 bridge could not obtain the ReShade adapter: 0x%08X", hr); return false; }
+
+    ID3D11DeviceContext *context = nullptr;
+    D3D_FEATURE_LEVEL requested = D3D_FEATURE_LEVEL_11_0;
+    hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT, &requested, 1, D3D11_SDK_VERSION,
+        &g.dev, nullptr, &context);
+    adapter->Release();
+    if (FAILED(hr) || g.dev == nullptr || context == nullptr)
+    { SafeRelease(context); SafeRelease(g.dev); Log("[feed32] D3D10 bridge D3D11CreateDevice failed 0x%08X", hr); return false; }
+    g.owns_d3d11_device = true;
+    g.dev10 = device10;
+    if (FAILED(context->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void **>(&g.ctx4))))
+    { SafeRelease(context); SafeRelease(g.dev); g.dev10 = nullptr; return false; }
+    context->Release();
+    D3D10_QUERY_DESC qd10 = { D3D10_QUERY_EVENT, 0 };
+    device10->CreateQuery(&qd10, &g.query10);
+    D3D11_QUERY_DESC qd11 = { D3D11_QUERY_EVENT, 0 };
+    g.dev->CreateQuery(&qd11, &g.query11);
+    Log("[feed32] ReShade D3D10.1 -> D3D11 transport initialized (native D3D9 presentation route)");
+    return g.query10 != nullptr && g.query11 != nullptr;
+}
+
+static bool CreateD3D10SharedStage(UINT width, UINT height, DXGI_FORMAT format,
+                                   ID3D10Texture2D **texture10, ID3D11Texture2D **texture11)
+{
+    if (g.dev10 == nullptr || g.dev == nullptr) return false;
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = width; desc.Height = height; desc.MipLevels = 1; desc.ArraySize = 1;
+    desc.Format = format; desc.SampleDesc.Count = 1; desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+    HRESULT hr = g.dev->CreateTexture2D(&desc, nullptr, texture11);
+    HANDLE shared = nullptr;
+    IDXGIResource *dxgi = nullptr;
+    if (SUCCEEDED(hr)) hr = (*texture11)->QueryInterface(__uuidof(IDXGIResource), reinterpret_cast<void **>(&dxgi));
+    if (SUCCEEDED(hr)) hr = dxgi->GetSharedHandle(&shared);
+    SafeRelease(dxgi);
+    if (SUCCEEDED(hr)) hr = g.dev10->OpenSharedResource(shared, __uuidof(ID3D10Texture2D), reinterpret_cast<void **>(texture10));
+    if (FAILED(hr))
+    {
+        SafeRelease(*texture10);
+        SafeRelease(*texture11);
+        Log("[feed32] D3D10/D3D11 shared stage failed: %ux%u fmt=%u hr=0x%08X", width, height, format, hr);
+        return false;
+    }
+    return true;
+}
+
+static bool WaitForD3D10Copy()
+{
+    if (g.query10 == nullptr || g.dev10 == nullptr) return false;
+    g.query10->End();
+    g.dev10->Flush();
+    const ULONGLONG deadline = GetTickCount64() + 2000;
+    HRESULT hr = S_FALSE;
+    while ((hr = g.query10->GetData(nullptr, 0, 0)) == S_FALSE && GetTickCount64() < deadline)
+        SwitchToThread();
+    return hr == S_OK;
+}
+
 static bool MakeShared(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav, bool render_target)
 {
     D3D11_TEXTURE2D_DESC td = {};
@@ -1206,7 +1290,8 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
     // needs an RTV per input and an SRV-able source. ReShade's backbuffer has neither
     // D3D11_BIND_SHADER_RESOURCE nor a resource behind `DLSS5_ColorInput : COLOR`, so
     // stage a native-size copy we own and downsample from that.
-    if (backbuffer_w != w || backbuffer_h != h || g.is_d3d9)
+    const bool legacy_surface_bridge = g.is_d3d9 || g.is_d3d10;
+    if (backbuffer_w != w || backbuffer_h != h || legacy_surface_bridge)
     {
         const int input_slots[] = { FEED_COLOR, FEED_MV, FEED_DEPTH };
         for (const int slot : input_slots)
@@ -1225,6 +1310,14 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
                                        &g.d3d9_color_stage, &g.color_stage) ||
                 !CreateD3D9SharedStage(backbuffer_w, backbuffer_h, g.color_fmt,
                                        &g.d3d9_output_stage, &g.d3d9_output_stage11))
+            { ReleaseShared(); return false; }
+        }
+        else if (g.is_d3d10)
+        {
+            if (!CreateD3D10SharedStage(backbuffer_w, backbuffer_h, g.color_fmt,
+                                        &g.d3d10_color_stage, &g.color_stage) ||
+                !CreateD3D10SharedStage(backbuffer_w, backbuffer_h, g.color_fmt,
+                                        &g.d3d10_output_stage, &g.d3d9_output_stage11))
             { ReleaseShared(); return false; }
         }
         else
@@ -1252,12 +1345,12 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
         Log("[feed32] work-resolution source: %ux%u staging copy -> %ux%u", backbuffer_w, backbuffer_h, w, h);
     }
 
-    if (g.is_d3d9)
+    if (legacy_surface_bridge)
     {
         D3D11_RENDER_TARGET_VIEW_DESC rv = {};
         rv.Format = g.color_fmt; rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
         if (FAILED(g.dev->CreateRenderTargetView(g.d3d9_output_stage11, &rv, &g.d3d9_output_rtv)))
-        { Log("[feed32] D3D9 output RTV failed"); ReleaseShared(); return false; }
+        { Log("[feed32] legacy output RTV failed"); ReleaseShared(); return false; }
 
         auto make_neutral = [](DXGI_FORMAT fmt, ID3D11Texture2D **tex, ID3D11ShaderResourceView **srv, const FLOAT clear[4]) -> bool {
             D3D11_TEXTURE2D_DESC td = {};
@@ -1276,7 +1369,7 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
         const FLOAT far_depth[4] = {1, 1, 1, 1};
         if (!make_neutral(DXGI_FORMAT_R16G16_FLOAT, &g.d3d9_zero_mv, &g.d3d9_zero_mv_srv, zero_mv) ||
             !make_neutral(DXGI_FORMAT_R32_FLOAT, &g.d3d9_zero_depth, &g.d3d9_zero_depth_srv, far_depth))
-        { Log("[feed32] D3D9 neutral guide creation failed"); ReleaseShared(); return false; }
+        { Log("[feed32] legacy neutral guide creation failed"); ReleaseShared(); return false; }
     }
 
     if (!EnsureHost()) return false;
@@ -2267,6 +2360,93 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
     TimingTick(t0.QuadPart, t1.QuadPart);
 }
 
+static void FeedFrameD3D10(reshade::api::effect_runtime *rt, reshade::api::resource_view rtv)
+{
+    LARGE_INTEGER t0 = {}, t1 = {};
+    QueryPerformanceCounter(&t0);
+    auto *dev_api = rt->get_device();
+    auto *device10 = reinterpret_cast<ID3D10Device1 *>(dev_api->get_native());
+    auto resource = dev_api->get_resource_from_view(rtv);
+    auto *source_resource = reinterpret_cast<ID3D10Resource *>(resource.handle);
+    ID3D10Texture2D *source10 = nullptr;
+    if (device10 == nullptr || source_resource == nullptr ||
+        FAILED(source_resource->QueryInterface(__uuidof(ID3D10Texture2D), reinterpret_cast<void **>(&source10))) ||
+        source10 == nullptr) return;
+    D3D10_TEXTURE2D_DESC sd = {};
+    source10->GetDesc(&sd);
+
+    g.is_d3d10 = true;
+    g.is_d3d9 = false;
+    if (ApplyPendingWorkResolution()) g.built = false;
+    if ((g.frames_done % 60) == 0 && CfgReload()) g.built = false;
+    if (!g_cfg.enabled || g_cfg.mode == 0) { source10->Release(); return; }
+    if (!InitializeD3D10Transport(device10))
+    {
+        source10->Release();
+        FeedDisable("ReShade D3D10.1 transport initialization failed");
+        return;
+    }
+
+    const UINT work_w = ScaledExtent(sd.Width, g_cfg.work_resolution);
+    const UINT work_h = ScaledExtent(sd.Height, g_cfg.work_resolution);
+    bool ok = TypedColorFormat(sd.Format) != DXGI_FORMAT_UNKNOWN && sd.SampleDesc.Count == 1;
+    if (ok && (!g.built || work_w != g.width || work_h != g.height ||
+               sd.Width != g.backbuffer_width || sd.Height != g.backbuffer_height || sd.Format != g.bb_fmt))
+    {
+        if (GetTickCount64() < g_retry_at) ok = false;
+        else
+        {
+            Log("[feed32] building ReShade D3D10.1 bridge for native D3D9: %ux%u work (%d%%) -> %ux%u fmt=%u",
+                work_w, work_h, g_cfg.work_resolution, sd.Width, sd.Height, sd.Format);
+            ok = BuildShared(work_w, work_h, sd.Width, sd.Height, sd.Format);
+            if (!ok && !g.disabled) FeedFail("D3D10.1 shared build");
+        }
+    }
+
+    if (ok && g.built && HostAlive())
+    {
+        device10->CopyResource(g.d3d10_color_stage, source10);
+        if (WaitForD3D10Copy() &&
+            CopyOrResampleInputs(g.ctx4, g.color_stage, g.d3d9_zero_mv, g.d3d9_zero_depth,
+                                 g.d3d9_zero_mv_srv, g.d3d9_zero_depth_srv, sd.Width, sd.Height))
+        {
+            const UINT64 n = ++g.frame_n;
+            const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
+            g.need_reset = false;
+            g.ctx4->Signal(g.fence_in, n);
+            g.ctx4->Flush();
+            BYTE tag = 'F';
+            FeedFrameMsg fm = { n, static_cast<uint32_t>(reset) };
+            if (!PipeWrite(&tag, 1) || !PipeWrite(&fm, sizeof(fm))) HostLost("D3D10 frame message failed");
+            else
+            {
+                g.ctx4->Wait(g.fence_out, n);
+                g.fence_wait_queued = true;
+                BlitOutputToBackbuffer(g.ctx4, g.d3d9_output_rtv);
+                if (WaitForD3D11Copy())
+                {
+                    g.fence_wait_queued = false;
+                    device10->CopyResource(source10, g.d3d10_output_stage);
+                    if (WaitForD3D10Copy())
+                    {
+                        const UINT64 done = ++g.frames_done;
+                        g.consecutive_fails = 0;
+                        if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
+                            Log("[feed32] frame %llu delivered (%ux%u, reset=%d, D3D9 via ReShade D3D10.1)",
+                                done, g.width, g.height, reset);
+                    }
+                }
+            }
+        }
+        else FeedFail("D3D10.1 frame bridge");
+    }
+    else if (ok && !HostAlive() && g.hproc != nullptr) HostLost("process died");
+
+    source10->Release();
+    QueryPerformanceCounter(&t1);
+    TimingTick(t0.QuadPart, t1.QuadPart);
+}
+
 static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
 {
 
@@ -2282,6 +2462,8 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
     { g.is_vulkan = true; FeedFrameVk(rt, cl, rtv); return; }
     if (dev_api->get_api() == reshade::api::device_api::d3d9)
     { FeedFrameD3D9(rt, rtv); return; }
+    if (dev_api->get_api() == reshade::api::device_api::d3d10)
+    { FeedFrameD3D10(rt, rtv); return; }
     if (dev_api->get_api() != reshade::api::device_api::d3d11)
     { FeedDisable("only Direct3D 9/11, OpenGL and Vulkan games are supported by the 32-bit add-on"); return; }
 
@@ -2488,7 +2670,11 @@ static bool OnSetFullscreenState(reshade::api::swapchain *swapchain, bool fullsc
 
 static void ResolveHandles(reshade::api::effect_runtime *rt)
 {
-    const bool native_d3d9 = rt->get_device()->get_api() == reshade::api::device_api::d3d9;
+    // ReShade 6 exposes native D3D9 effect rendering through its D3D10.1
+    // presentation runtime, so both API identities use the lightweight trigger.
+    const auto runtime_api = rt->get_device()->get_api();
+    const bool native_d3d9 = runtime_api == reshade::api::device_api::d3d9 ||
+                             runtime_api == reshade::api::device_api::d3d10;
     const char *effect_file = native_d3d9 ? kD3D9EffectFile : kEffectFile;
     g.technique = rt->find_technique(effect_file, kTechnique);
     g.mv_var    = rt->find_texture_variable(effect_file, "DLSS5_MV");
@@ -2668,6 +2854,7 @@ static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::ef
 static void OnDestroyDevice(reshade::api::device *dev)
 {
     const bool ours = (g.is_d3d9 && reinterpret_cast<IDirect3DDevice9 *>(dev->get_native()) == g.dev9) ||
+                      (g.is_d3d10 && reinterpret_cast<ID3D10Device1 *>(dev->get_native()) == g.dev10) ||
                       (g.dev != nullptr && !g.is_d3d9 && reinterpret_cast<ID3D11Device *>(dev->get_native()) == g.dev) ||
                       (g.is_gl && dev->get_api() == reshade::api::device_api::opengl) ||
                       (g.is_vulkan && dev == g.rs_dev);
@@ -2690,14 +2877,17 @@ static void OnDestroyDevice(reshade::api::device *dev)
     g.gl_ctx = nullptr;
     SafeRelease(g.ctx4);
     SafeRelease(g.query9);
+    SafeRelease(g.query10);
     SafeRelease(g.query11);
     SafeRelease(g.blit_vs);
     SafeRelease(g.blit_ps);
     SafeRelease(g.blit_sampler);
     if (g.owns_d3d11_device) SafeRelease(g.dev); else g.dev = nullptr;
     g.dev9 = nullptr;
+    g.dev10 = nullptr;
     g.owns_d3d11_device = false;
     g.is_d3d9 = false;
+    g.is_d3d10 = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -2729,7 +2919,8 @@ static void DrawLegacyOverlay(reshade::api::effect_runtime *)
     ImGui::Separator();
     ImGui::TextUnformatted("Status");
     ImGui::Text("Feed: %s", g.disabled ? "disabled (see dlss5-feed.log)" : g.built ? "built" : "not built");
-    ImGui::Text("Render API: %s", g.is_vulkan ? "Vulkan" : g.is_gl ? "OpenGL" : g.is_d3d9 ? "Direct3D 9" : "Direct3D 11");
+    ImGui::Text("Render API: %s", g.is_vulkan ? "Vulkan" : g.is_gl ? "OpenGL" :
+        g.is_d3d10 ? "Direct3D 9 via ReShade D3D10.1" : g.is_d3d9 ? "Direct3D 9" : "Direct3D 11");
     ImGui::Text("Host process: %s", HostAlive() ? "running" : "not running");
     if (g.frames_done > 0) ImGui::Text("Frames delivered: %llu", static_cast<unsigned long long>(g.frames_done));
     ImGui::TextWrapped("Motion vectors: %s", g_mv_status);
@@ -2936,7 +3127,8 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::TextDisabled("32-bit wrapper - processing is performed by the normal x64 AIO addon");
     ImGui::Separator();
     ImGui::Text("Graphics transport: %s -> shared GPU frame -> D3D12 x64",
-        g.is_vulkan ? "Vulkan x86" : g.is_gl ? "OpenGL x86" : g.is_d3d9 ? "D3D9 x86" : "D3D11 x86");
+        g.is_vulkan ? "Vulkan x86" : g.is_gl ? "OpenGL x86" :
+        g.is_d3d10 ? "D3D9/ReShade-D3D10.1 x86" : g.is_d3d9 ? "D3D9 x86" : "D3D11 x86");
     if (g.backbuffer_width != 0)
         ImGui::Text("Detected source resolution: %ux%u", g.backbuffer_width, g.backbuffer_height);
     else

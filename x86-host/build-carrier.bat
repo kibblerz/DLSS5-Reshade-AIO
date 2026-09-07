@@ -30,6 +30,6 @@ cl /nologo /LD /EHsc /O2 /MD /W3 /std:c++20 ^
   "%~dp0..\external\DLSS5-Feeder\external\minhook\src\trampoline.c" ^
   "%~dp0..\external\DLSS5-Feeder\external\minhook\src\hde\hde32.c" ^
   /link /OUT:"%~dp0build\x86\standalone-dlssnr.addon32" ^
-  d3d9.lib d3d11.lib dxgi.lib kernel32.lib user32.lib advapi32.lib
+  d3d9.lib d3d10_1.lib d3d11.lib dxgi.lib kernel32.lib user32.lib advapi32.lib
 if errorlevel 1 exit /b 1
 echo AIO x86 wrapper built.
