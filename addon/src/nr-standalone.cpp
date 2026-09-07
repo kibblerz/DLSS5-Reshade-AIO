@@ -7702,7 +7702,13 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
             SetCursor(DetachedProxyCursor(
                 g_reshade_overlay_open.load() || g_proxy_overlay_open.load()));
             g_proxy_watchdog_hidden = false;
-            if (DetachedPresentationEnabled() && !g_same_window_compositor &&
+            // The delayed attach/detach refresh exists for Vulkan startup
+            // windows. An x86 carrier already owns a stable detached proxy and
+            // its "game" HWND is the hidden bottom-z carrier window; briefly
+            // attaching there can leave the processed output permanently
+            // hidden if the second migration cannot commit.
+            if (g_external_game_process_id == 0 &&
+                DetachedPresentationEnabled() && !g_same_window_compositor &&
                 !g_detached_binding_refreshed && !g_detached_binding_refresh_queued)
             {
                 g_detached_binding_refresh_queued = true;
