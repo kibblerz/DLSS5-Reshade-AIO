@@ -38,6 +38,7 @@
 #include <cstdlib>
 #include <string>
 #include <algorithm>
+#include <atomic>
 
 #define ImTextureID ImU64   // required by reshade_overlay.hpp before including imgui.h
 #include <imgui.h>
@@ -49,7 +50,7 @@
 #include "feed_vk.h"   // raw-Vulkan interop, likewise -- compiled x86 here
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
 
-#define FEED_VERSION "2.0.9-x86-prototype.2"
+#define FEED_VERSION "2.0.9-x86-prototype.3"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR (32-bit wrapper) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -2128,6 +2129,76 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
 // ReShade events
 // ---------------------------------------------------------------------------
 
+// The x64 AIO presents its processed result through a non-activating output
+// window. DXGI exclusive fullscreen cannot coexist with that second top-level
+// presentation surface: older games repeatedly try to reclaim exclusive
+// ownership and Windows minimizes them on every focus transition. The normal
+// x64 add-on virtualizes this inside the game process, but on the x86 carrier
+// route that add-on lives in the helper process and cannot see the game's HWND.
+// Do the one x86-specific part here: acknowledge the exclusive request without
+// forwarding it to DXGI, then turn the real game HWND into monitor-sized
+// borderless on a worker (never mutate a window from inside the DXGI callback).
+static std::atomic<bool> g_fullscreen_virtualization_pending{false};
+
+static DWORD WINAPI DeferredFullscreenVirtualizationWorker(void *parameter)
+{
+    const HWND game_window = static_cast<HWND>(parameter);
+    if (game_window == nullptr || !IsWindow(game_window))
+    {
+        g_fullscreen_virtualization_pending = false;
+        return 0;
+    }
+
+    const HMONITOR monitor = MonitorFromWindow(game_window, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO monitor_info = {sizeof(monitor_info)};
+    if (!GetMonitorInfoW(monitor, &monitor_info))
+    {
+        Log("[feed32] exclusive-fullscreen virtualization could not query the monitor: error=%lu", GetLastError());
+        g_fullscreen_virtualization_pending = false;
+        return 0;
+    }
+
+    LONG_PTR style = GetWindowLongPtrW(game_window, GWL_STYLE);
+    style &= ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU);
+    style |= WS_POPUP | WS_VISIBLE;
+    SetWindowLongPtrW(game_window, GWL_STYLE, style);
+
+    const RECT &bounds = monitor_info.rcMonitor;
+    if (!SetWindowPos(game_window, HWND_TOP,
+        bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top,
+        SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW))
+        Log("[feed32] exclusive-fullscreen borderless placement failed: error=%lu", GetLastError());
+    else
+        Log("[feed32] exclusive fullscreen virtualized to non-activating borderless: %ldx%ld",
+            bounds.right - bounds.left, bounds.bottom - bounds.top);
+
+    g_fullscreen_virtualization_pending = false;
+    return 0;
+}
+
+static bool OnSetFullscreenState(reshade::api::swapchain *swapchain, bool fullscreen, void *)
+{
+    if (g_cfg.enabled == 0 || !fullscreen || swapchain == nullptr)
+        return false;
+
+    const HWND game_window = static_cast<HWND>(swapchain->get_hwnd());
+    if (game_window == nullptr || !IsWindow(game_window))
+        return false;
+
+    if (!g_fullscreen_virtualization_pending.exchange(true))
+    {
+        if (!QueueUserWorkItem(DeferredFullscreenVirtualizationWorker, game_window, WT_EXECUTEDEFAULT))
+        {
+            g_fullscreen_virtualization_pending = false;
+            Log("[feed32] exclusive-fullscreen virtualization worker could not be queued: error=%lu", GetLastError());
+            return false;
+        }
+        Log("[feed32] blocked incompatible DXGI exclusive-fullscreen request; borderless transition queued");
+    }
+
+    return true;
+}
+
 static void ResolveHandles(reshade::api::effect_runtime *rt)
 {
     g.technique = rt->find_technique(kEffectFile, kTechnique);
@@ -2586,6 +2657,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         CfgReload();
 
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
+        reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
         reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
@@ -2597,6 +2669,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     {
         reshade::unregister_overlay(nullptr, DrawOverlay);
         reshade::unregister_event<reshade::addon_event::create_device>(OnCreateDevice);
+        reshade::unregister_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
         reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
