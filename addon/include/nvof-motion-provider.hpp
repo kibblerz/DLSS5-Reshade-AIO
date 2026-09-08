@@ -52,6 +52,9 @@ public:
     bool RecordConversion(ID3D12GraphicsCommandList *commands,
         const Submission &submission, float consistency_threshold_pixels,
         float cost_threshold);
+    bool RecordVisualization(ID3D12GraphicsCommandList *commands,
+        const Submission &submission, ID3D12Resource *output,
+        unsigned int mode, float magnitude_scale);
     void MarkNeuralUse(const Submission &submission, std::uint64_t neural_fence_value);
     void MarkConsumerUse(const Submission &submission, ID3D12Fence *fence,
         std::uint64_t fence_value);
@@ -110,6 +113,9 @@ private:
     Microsoft::WRL::ComPtr<ID3D12RootSignature> conversion_root_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> conversion_pipeline_;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> conversion_descriptors_;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> visualization_root_;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> visualization_pipeline_;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> visualization_descriptors_;
     std::array<Slot, kSlotCount> slots_ = {};
     LogCallback log_ = nullptr;
     std::string status_ = "disabled";
@@ -118,6 +124,7 @@ private:
     unsigned int grid_size_ = 1;
     unsigned int prep_descriptor_stride_ = 0;
     unsigned int conversion_descriptor_stride_ = 0;
+    unsigned int visualization_descriptor_stride_ = 0;
     DXGI_FORMAT source_format_ = DXGI_FORMAT_UNKNOWN;
     DXGI_FORMAT input_format_ = DXGI_FORMAT_UNKNOWN;
     DXGI_FORMAT flow_format_ = DXGI_FORMAT_UNKNOWN;

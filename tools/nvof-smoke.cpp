@@ -32,6 +32,25 @@ static bool MakeSource(ID3D12Device *device, ComPtr<ID3D12Resource> &source)
         nullptr, IID_PPV_ARGS(&source)));
 }
 
+static bool MakeOutput(ID3D12Device *device, ComPtr<ID3D12Resource> &output)
+{
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC texture = {};
+    texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texture.Width = 1920;
+    texture.Height = 1080;
+    texture.DepthOrArraySize = 1;
+    texture.MipLevels = 1;
+    texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texture.SampleDesc.Count = 1;
+    texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    return SUCCEEDED(device->CreateCommittedResource(&heap,
+        D3D12_HEAP_FLAG_NONE, &texture,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+        IID_PPV_ARGS(&output)));
+}
+
 int main()
 {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -69,11 +88,12 @@ int main()
         neural_fence.Get(), 1280, 720, DXGI_FORMAT_R8G8B8A8_UNORM,
         PrintStatus);
     bool full_path = initialized;
-    ComPtr<ID3D12Resource> source_a, source_b;
+    ComPtr<ID3D12Resource> source_a, source_b, visualization;
     NvofMotionProvider::Submission first, second;
     if (full_path)
         full_path = MakeSource(device.Get(), source_a) &&
-            MakeSource(device.Get(), source_b);
+            MakeSource(device.Get(), source_b) &&
+            MakeOutput(device.Get(), visualization);
     if (full_path)
     {
         std::puts("Submitting history frame...");
@@ -102,6 +122,8 @@ int main()
                 D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator.Get(), nullptr,
                 IID_PPV_ARGS(&list))) &&
             provider.RecordConversion(list.Get(), second, 3.0f, 0.35f) &&
+            provider.RecordVisualization(list.Get(), second,
+                visualization.Get(), 1, 16.0f) &&
             SUCCEEDED(list->Close()) &&
             SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
                 IID_PPV_ARGS(&done)));
