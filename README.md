@@ -186,6 +186,13 @@ Resolution transitions are serialized outside the game's DXGI callback, failed s
 
 Because presentation behavior varies substantially between engines, 2.0 may work better or worse than 1.x in a particular game. Keep [v1.7.24](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/tag/v1.7.24) available as the stable 1.x fallback and report regressions with the game name, graphics API, display mode, and persistent addon log.
 
+### Version 2.1.3
+
+- Downsamples native 32-bit D3D9 captures on the game GPU before the classic CPU readback, reducing readback, upload, and x64 transport cost when a lower pipeline source resolution is selected.
+- Adds equivalent pre-transport source downsampling to ReShade's D3D10.1-backed legacy path, including a shader-readable fallback for render-target-only sources.
+- Uses the existing `host64` **Pipeline source resolution override** as the authoritative work resolution, so the same setting controls both capture cost and the maintained x64 NR/DLSS/FG pipeline.
+- Leaves the normal 64-bit processing and presentation behavior unchanged apart from the displayed version number.
+
 ### Version 2.1.2
 
 - Broadens native 32-bit D3D9 capture to effect targets exposed as D3D9 surfaces, D3D9 textures, or ReShade's internal D3D10.1 resources.
