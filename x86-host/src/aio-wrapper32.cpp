@@ -2113,11 +2113,25 @@ static void FeedFrameD3D9(reshade::api::effect_runtime *rt, reshade::api::resour
     LARGE_INTEGER t0 = {}, t1 = {};
     QueryPerformanceCounter(&t0);
     auto *dev_api = rt->get_device();
-    auto *device9 = reinterpret_cast<IDirect3DDevice9 *>(dev_api->get_native());
     auto resource = dev_api->get_resource_from_view(rtv);
     auto *source9 = reinterpret_cast<IDirect3DSurface9 *>(resource.handle);
+    if (source9 == nullptr) return;
+
+    // ReShade's D3D9 effect runtime may be backed by its internal D3D10.1
+    // renderer. In that configuration get_native() is not guaranteed to be the
+    // IDirect3DDevice9 that owns this effect render target (Fallout New Vegas
+    // returns a non-COM value there). The surface itself is authoritative and
+    // always returns the actual owning D3D9 device.
+    struct ScopedD3D9Device
+    {
+        IDirect3DDevice9 *value = nullptr;
+        ~ScopedD3D9Device() { if (value != nullptr) value->Release(); }
+    } device_ref;
+    if (FAILED(source9->GetDevice(&device_ref.value)) || device_ref.value == nullptr) return;
+    IDirect3DDevice9 *const device9 = device_ref.value;
+
     D3DSURFACE_DESC sd = {};
-    if (device9 == nullptr || source9 == nullptr || FAILED(source9->GetDesc(&sd))) return;
+    if (FAILED(source9->GetDesc(&sd))) return;
 
     g.is_d3d9 = true;
     if (g.d3d9_device_lost)
