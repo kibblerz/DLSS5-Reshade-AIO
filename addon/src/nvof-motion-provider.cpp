@@ -15,8 +15,8 @@ using Microsoft::WRL::ComPtr;
 namespace
 {
 constexpr unsigned int kPrepDescriptorsPerSlot = 2;
-constexpr unsigned int kConversionDescriptorsPerSlot = 6;
-constexpr unsigned int kVisualizationDescriptorsPerSlot = 3;
+constexpr unsigned int kConversionDescriptorsPerSlot = 8;
+constexpr unsigned int kVisualizationDescriptorsPerSlot = 4;
 
 D3D12_RESOURCE_BARRIER Transition(ID3D12Resource *resource,
     D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
@@ -212,10 +212,10 @@ bool NvofMotionProvider::CreatePipelineState()
 
     D3D12_DESCRIPTOR_RANGE conversion_ranges[2] = {};
     conversion_ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    conversion_ranges[0].NumDescriptors = 4;
+    conversion_ranges[0].NumDescriptors = 5;
     conversion_ranges[0].BaseShaderRegister = 0;
     conversion_ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    conversion_ranges[1].NumDescriptors = 2;
+    conversion_ranges[1].NumDescriptors = 3;
     conversion_ranges[1].BaseShaderRegister = 0;
     D3D12_ROOT_PARAMETER conversion_params[3] = {};
     for (unsigned int index = 0; index < 2; ++index)
@@ -228,7 +228,7 @@ bool NvofMotionProvider::CreatePipelineState()
     }
     conversion_params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     conversion_params[2].Constants.ShaderRegister = 0;
-    conversion_params[2].Constants.Num32BitValues = 8;
+    conversion_params[2].Constants.Num32BitValues = 12;
     D3D12_ROOT_SIGNATURE_DESC conversion_desc = {};
     conversion_desc.NumParameters = 3;
     conversion_desc.pParameters = conversion_params;
@@ -245,10 +245,13 @@ bool NvofMotionProvider::CreatePipelineState()
         "Texture2D<int2> Backward:register(t1);"
         "Texture2D<uint> ForwardCost:register(t2);"
         "Texture2D<uint> BackwardCost:register(t3);"
+        "Texture2D<float> SceneDepth:register(t4);"
         "RWTexture2D<float2> Motion:register(u0);"
         "RWTexture2D<float> HistoryMask:register(u1);"
+        "RWTexture2D<float> GeometryDepth:register(u2);"
         "cbuffer C:register(b0){uint Width;uint Height;uint Grid;float Consistency;"
-        "float CostThreshold;float CostScale;uint Reset;uint Reserved;}"
+        "float CostThreshold;float CostScale;uint Reset;uint UseDepth;"
+        "uint DepthWidth;uint DepthHeight;uint DepthReversed;float DepthSensitivity;}"
         "[numthreads(8,8,1)] void CS(uint3 id:SV_DispatchThreadID){"
         "if(id.x>=Width||id.y>=Height)return;uint2 cell=id.xy/Grid;"
         "float2 f=float2(Forward.Load(int3(cell,0)))/32.0;"
@@ -262,8 +265,24 @@ bool NvofMotionProvider::CreatePipelineState()
         "float cb=BackwardCost.Load(int3(priorCell,0))*CostScale;"
         "float badFlow=smoothstep(Consistency,Consistency*2.0,consistency);"
         "float badCost=smoothstep(CostThreshold,1.0,max(cf,cb));"
+        "float depthReject=0.0;float sceneDepth=DepthReversed!=0?0.0:1.0;"
+        "if(UseDepth!=0){float2 scale=float2(DepthWidth,DepthHeight)/float2(Width,Height);"
+        "uint2 dp=min(uint2((float2(id.xy)+0.5)*scale),uint2(DepthWidth-1,DepthHeight-1));"
+        "sceneDepth=SceneDepth.Load(int3(dp,0));"
+        "uint2 dx0=uint2(dp.x>0?dp.x-1:dp.x,dp.y);uint2 dx1=uint2(min(dp.x+1,DepthWidth-1),dp.y);"
+        "uint2 dy0=uint2(dp.x,dp.y>0?dp.y-1:dp.y);uint2 dy1=uint2(dp.x,min(dp.y+1,DepthHeight-1));"
+        "float localDelta=max(max(abs(sceneDepth-SceneDepth.Load(int3(dx0,0))),abs(sceneDepth-SceneDepth.Load(int3(dx1,0)))),"
+        "max(abs(sceneDepth-SceneDepth.Load(int3(dy0,0))),abs(sceneDepth-SceneDepth.Load(int3(dy1,0)))));"
+        "float2 endpoint=clamp(previous,float2(0,0),float2(Width-1,Height-1));"
+        "uint2 ep=min(uint2((endpoint+0.5)*scale),uint2(DepthWidth-1,DepthHeight-1));"
+        "float endpointDelta=abs(sceneDepth-SceneDepth.Load(int3(ep,0)));"
+        "float clearDepth=DepthReversed!=0?0.0:1.0;"
+        "float valid=abs(sceneDepth-clearDepth)>1e-7?1.0:0.0;"
+        "depthReject=valid*saturate(max(smoothstep(DepthSensitivity*0.25,DepthSensitivity,localDelta),"
+        "smoothstep(DepthSensitivity*0.5,DepthSensitivity*2.0,endpointDelta)));}"
         "Motion[id.xy]=Reset!=0?float2(0,0):f;"
-        "HistoryMask[id.xy]=Reset!=0||outside?1.0:saturate(max(badFlow,badCost));}";
+        "GeometryDepth[id.xy]=sceneDepth;"
+        "HistoryMask[id.xy]=Reset!=0||outside?1.0:saturate(max(max(badFlow,badCost),depthReject));}";
     ComPtr<ID3DBlob> conversion_cs;
     if (SUCCEEDED(hr))
         hr = CompileShader(conversion_shader, "nvof-conversion", "CS",
@@ -279,7 +298,7 @@ bool NvofMotionProvider::CreatePipelineState()
 
     D3D12_DESCRIPTOR_RANGE visualization_ranges[2] = {};
     visualization_ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    visualization_ranges[0].NumDescriptors = 2;
+    visualization_ranges[0].NumDescriptors = 3;
     visualization_ranges[0].BaseShaderRegister = 0;
     visualization_ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
     visualization_ranges[1].NumDescriptors = 1;
@@ -313,6 +332,7 @@ bool NvofMotionProvider::CreatePipelineState()
     static const char visualization_shader[] =
         "Texture2D<float2> Motion:register(t0);"
         "Texture2D<float> Rejection:register(t1);"
+        "Texture2D<float> GeometryDepth:register(t2);"
         "RWTexture2D<float4> Output:register(u0);"
         "cbuffer C:register(b0){uint SourceWidth;uint SourceHeight;"
         "uint OutputWidth;uint OutputHeight;uint Mode;float MagnitudeScale;"
@@ -328,7 +348,12 @@ bool NvofMotionProvider::CreatePipelineState()
         "color=lerp(float3(0.01,0.01,0.01),hue,magnitude);"
         "color+=saturate(length(mv)/(MagnitudeScale*8))*0.2;}else{"
         "color=lerp(float3(0.02,0.65,0.02),float3(1,0.02,0.02),rejection);"
-        "color+=smoothstep(0.45,0.55,rejection)*float3(0.2,0.1,0);}"
+        "color+=smoothstep(0.45,0.55,rejection)*float3(0.2,0.1,0);"
+        "if(Mode==3){uint2 qx=uint2(min(p.x+1,SourceWidth-1),p.y);"
+        "uint2 qy=uint2(p.x,min(p.y+1,SourceHeight-1));"
+        "float d=GeometryDepth.Load(int3(p,0));float ex=abs(d-GeometryDepth.Load(int3(qx,0)));"
+        "float ey=abs(d-GeometryDepth.Load(int3(qy,0)));float edge=max(ex,ey);"
+        "color=lerp(float3(d,d,d)*0.15,float3(0,0.8,1),saturate(edge*80));}}"
         "Output[id.xy]=float4(color,1);}";
     ComPtr<ID3DBlob> visualization_cs;
     if (SUCCEEDED(hr))
@@ -457,7 +482,10 @@ bool NvofMotionProvider::CreateSessionResources()
                 D3D12_RESOURCE_STATE_COMMON, slot.motion) ||
             !CreateTexture(device_.Get(), width_, height_, DXGI_FORMAT_R8_UNORM,
                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_COMMON, slot.history_mask))
+                D3D12_RESOURCE_STATE_COMMON, slot.history_mask) ||
+            !CreateTexture(device_.Get(), width_, height_, DXGI_FORMAT_R32_FLOAT,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COMMON, slot.geometry_depth))
         {
             SetStatus("Optical Flow texture allocation failed");
             return false;
@@ -497,17 +525,27 @@ bool NvofMotionProvider::CreateSessionResources()
         device_->CreateShaderResourceView(slot.backward_cost.Get(), &cost_srv,
             CpuDescriptor(conversion_descriptors_.Get(),
                 conversion_descriptor_stride_, base + 3));
+        D3D12_SHADER_RESOURCE_VIEW_DESC depth_srv = flow_srv;
+        depth_srv.Format = DXGI_FORMAT_R32_FLOAT;
+        device_->CreateShaderResourceView(nullptr, &depth_srv,
+            CpuDescriptor(conversion_descriptors_.Get(),
+                conversion_descriptor_stride_, base + 4));
         D3D12_UNORDERED_ACCESS_VIEW_DESC motion_uav = {};
         motion_uav.Format = DXGI_FORMAT_R16G16_FLOAT;
         motion_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
         device_->CreateUnorderedAccessView(slot.motion.Get(), nullptr, &motion_uav,
             CpuDescriptor(conversion_descriptors_.Get(),
-                conversion_descriptor_stride_, base + 4));
+                conversion_descriptor_stride_, base + 5));
         D3D12_UNORDERED_ACCESS_VIEW_DESC mask_uav = motion_uav;
         mask_uav.Format = DXGI_FORMAT_R8_UNORM;
         device_->CreateUnorderedAccessView(slot.history_mask.Get(), nullptr,
             &mask_uav, CpuDescriptor(conversion_descriptors_.Get(),
-                conversion_descriptor_stride_, base + 5));
+                conversion_descriptor_stride_, base + 6));
+        D3D12_UNORDERED_ACCESS_VIEW_DESC depth_uav = motion_uav;
+        depth_uav.Format = DXGI_FORMAT_R32_FLOAT;
+        device_->CreateUnorderedAccessView(slot.geometry_depth.Get(), nullptr,
+            &depth_uav, CpuDescriptor(conversion_descriptors_.Get(),
+                conversion_descriptor_stride_, base + 7));
 
         const unsigned int visualization_base =
             index * kVisualizationDescriptorsPerSlot;
@@ -525,6 +563,11 @@ bool NvofMotionProvider::CreateSessionResources()
         device_->CreateShaderResourceView(slot.history_mask.Get(), &mask_srv,
             CpuDescriptor(visualization_descriptors_.Get(),
                 visualization_descriptor_stride_, visualization_base + 1));
+        D3D12_SHADER_RESOURCE_VIEW_DESC geometry_srv = motion_srv;
+        geometry_srv.Format = DXGI_FORMAT_R32_FLOAT;
+        device_->CreateShaderResourceView(slot.geometry_depth.Get(), &geometry_srv,
+            CpuDescriptor(visualization_descriptors_.Get(),
+                visualization_descriptor_stride_, visualization_base + 2));
     }
     return true;
 }
@@ -637,6 +680,7 @@ void NvofMotionProvider::Shutdown()
         slot.prep_list.Reset();
         slot.prep_allocator.Reset();
         slot.consumer_fence.Reset();
+        slot.geometry_depth.Reset();
         slot.history_mask.Reset();
         slot.motion.Reset();
         slot.backward_cost.Reset();
@@ -846,6 +890,7 @@ bool NvofMotionProvider::Submit(ID3D12Resource *source,
     submission.completion_value = completion;
     submission.motion = slot.motion.Get();
     submission.history_mask = slot.history_mask.Get();
+    submission.depth = slot.geometry_depth.Get();
     previous_slot_ = selected;
     previous_sequence_ = source_sequence;
     SetStatus("active: hardware forward/backward flow, grid %ux%u",
@@ -855,38 +900,60 @@ bool NvofMotionProvider::Submit(ID3D12Resource *source,
 
 bool NvofMotionProvider::RecordConversion(ID3D12GraphicsCommandList *commands,
     const Submission &submission, float consistency_threshold_pixels,
-    float cost_threshold)
+    float cost_threshold, ID3D12Resource *geometry_depth,
+    D3D12_RESOURCE_STATES geometry_depth_state, bool depth_reversed)
 {
     if (!ready_ || !commands || !submission.valid ||
         submission.slot >= kSlotCount) return false;
     Slot &slot = slots_[submission.slot];
-    D3D12_RESOURCE_BARRIER begin[6] = {};
-    begin[0] = Transition(slot.forward.Get(), D3D12_RESOURCE_STATE_COMMON,
+    const D3D12_RESOURCE_DESC geometry_desc = geometry_depth ?
+        geometry_depth->GetDesc() : D3D12_RESOURCE_DESC{};
+    const bool use_depth = geometry_depth &&
+        geometry_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        geometry_desc.Width > 0 && geometry_desc.Height > 0 &&
+        geometry_desc.Format == DXGI_FORMAT_R32_FLOAT;
+    const unsigned int base = submission.slot * kConversionDescriptorsPerSlot;
+    D3D12_SHADER_RESOURCE_VIEW_DESC depth_srv = {};
+    depth_srv.Format = DXGI_FORMAT_R32_FLOAT;
+    depth_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    depth_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    depth_srv.Texture2D.MipLevels = 1;
+    device_->CreateShaderResourceView(use_depth ? geometry_depth : nullptr,
+        &depth_srv, CpuDescriptor(conversion_descriptors_.Get(),
+            conversion_descriptor_stride_, base + 4));
+
+    D3D12_RESOURCE_BARRIER begin[8] = {};
+    unsigned int begin_count = 0;
+    begin[begin_count++] = Transition(slot.forward.Get(), D3D12_RESOURCE_STATE_COMMON,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    begin[1] = Transition(slot.backward.Get(), D3D12_RESOURCE_STATE_COMMON,
+    begin[begin_count++] = Transition(slot.backward.Get(), D3D12_RESOURCE_STATE_COMMON,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    begin[2] = Transition(slot.forward_cost.Get(), D3D12_RESOURCE_STATE_COMMON,
+    begin[begin_count++] = Transition(slot.forward_cost.Get(), D3D12_RESOURCE_STATE_COMMON,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    begin[3] = Transition(slot.backward_cost.Get(), D3D12_RESOURCE_STATE_COMMON,
+    begin[begin_count++] = Transition(slot.backward_cost.Get(), D3D12_RESOURCE_STATE_COMMON,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     const D3D12_RESOURCE_STATES converted_state = slot.converted_once ?
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COMMON;
-    begin[4] = Transition(slot.motion.Get(), converted_state,
+    begin[begin_count++] = Transition(slot.motion.Get(), converted_state,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    begin[5] = Transition(slot.history_mask.Get(), converted_state,
+    begin[begin_count++] = Transition(slot.history_mask.Get(), converted_state,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    commands->ResourceBarrier(6, begin);
+    begin[begin_count++] = Transition(slot.geometry_depth.Get(), converted_state,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (use_depth && geometry_depth_state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+        begin[begin_count++] = Transition(geometry_depth, geometry_depth_state,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    commands->ResourceBarrier(begin_count, begin);
     ID3D12DescriptorHeap *heaps[] = {conversion_descriptors_.Get()};
     commands->SetDescriptorHeaps(1, heaps);
     commands->SetComputeRootSignature(conversion_root_.Get());
     commands->SetPipelineState(conversion_pipeline_.Get());
-    const unsigned int base = submission.slot * kConversionDescriptorsPerSlot;
     commands->SetComputeRootDescriptorTable(0,
         GpuDescriptor(conversion_descriptors_.Get(),
             conversion_descriptor_stride_, base));
     commands->SetComputeRootDescriptorTable(1,
         GpuDescriptor(conversion_descriptors_.Get(),
-            conversion_descriptor_stride_, base + 4));
+            conversion_descriptor_stride_, base + 5));
     struct Constants
     {
         unsigned int width;
@@ -896,29 +963,43 @@ bool NvofMotionProvider::RecordConversion(ID3D12GraphicsCommandList *commands,
         float cost_threshold;
         float cost_scale;
         unsigned int reset;
-        unsigned int reserved;
+        unsigned int use_depth;
+        unsigned int depth_width;
+        unsigned int depth_height;
+        unsigned int depth_reversed;
+        float depth_sensitivity;
     } constants = {width_, height_, grid_size_,
         std::max(0.25f, consistency_threshold_pixels),
         std::clamp(cost_threshold, 0.0f, 0.99f),
         cost_format_ == DXGI_FORMAT_R8_UINT ? 1.0f / 255.0f : 1.0f / 65535.0f,
-        0u, 0u};
-    commands->SetComputeRoot32BitConstants(2, 8, &constants, 0);
+        0u, use_depth ? 1u : 0u,
+        use_depth ? static_cast<unsigned int>(geometry_desc.Width) : 1u,
+        use_depth ? geometry_desc.Height : 1u,
+        depth_reversed ? 1u : 0u, 0.02f};
+    commands->SetComputeRoot32BitConstants(2, 12, &constants, 0);
     commands->Dispatch((width_ + 7) / 8, (height_ + 7) / 8, 1);
-    D3D12_RESOURCE_BARRIER end[6] = {};
-    end[0] = Transition(slot.forward.Get(),
+    D3D12_RESOURCE_BARRIER end[8] = {};
+    unsigned int end_count = 0;
+    end[end_count++] = Transition(slot.forward.Get(),
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    end[1] = Transition(slot.backward.Get(),
+    end[end_count++] = Transition(slot.backward.Get(),
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    end[2] = Transition(slot.forward_cost.Get(),
+    end[end_count++] = Transition(slot.forward_cost.Get(),
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    end[3] = Transition(slot.backward_cost.Get(),
+    end[end_count++] = Transition(slot.backward_cost.Get(),
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    end[4] = Transition(slot.motion.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    end[end_count++] = Transition(slot.motion.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    end[5] = Transition(slot.history_mask.Get(),
+    end[end_count++] = Transition(slot.history_mask.Get(),
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    commands->ResourceBarrier(6, end);
+    end[end_count++] = Transition(slot.geometry_depth.Get(),
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (use_depth && geometry_depth_state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+        end[end_count++] = Transition(geometry_depth,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, geometry_depth_state);
+    commands->ResourceBarrier(end_count, end);
     slot.converted_once = true;
     return true;
 }
@@ -928,7 +1009,7 @@ bool NvofMotionProvider::RecordVisualization(
     ID3D12Resource *output, unsigned int mode, float magnitude_scale)
 {
     if (!ready_ || !commands || !submission.valid ||
-        submission.slot >= kSlotCount || !output || mode < 1 || mode > 2 ||
+        submission.slot >= kSlotCount || !output || mode < 1 || mode > 3 ||
         !visualization_pipeline_ || !visualization_descriptors_)
         return false;
     const D3D12_RESOURCE_DESC output_desc = output->GetDesc();
@@ -943,7 +1024,7 @@ bool NvofMotionProvider::RecordVisualization(
     output_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     device_->CreateUnorderedAccessView(output, nullptr, &output_uav,
         CpuDescriptor(visualization_descriptors_.Get(),
-            visualization_descriptor_stride_, base + 2));
+            visualization_descriptor_stride_, base + 3));
 
     D3D12_RESOURCE_BARRIER output_barrier = {};
     output_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -959,7 +1040,7 @@ bool NvofMotionProvider::RecordVisualization(
             visualization_descriptor_stride_, base));
     commands->SetComputeRootDescriptorTable(1,
         GpuDescriptor(visualization_descriptors_.Get(),
-            visualization_descriptor_stride_, base + 2));
+            visualization_descriptor_stride_, base + 3));
     struct Constants
     {
         unsigned int source_width;

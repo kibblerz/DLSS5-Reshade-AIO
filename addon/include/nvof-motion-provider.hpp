@@ -22,6 +22,7 @@ public:
         std::uint64_t completion_value = 0;
         ID3D12Resource *motion = nullptr;
         ID3D12Resource *history_mask = nullptr;
+        ID3D12Resource *depth = nullptr;
     };
 
     using LogCallback = void (*)(const char *message);
@@ -51,7 +52,9 @@ public:
     // and produces a current-frame-bias mask from flow consistency and cost.
     bool RecordConversion(ID3D12GraphicsCommandList *commands,
         const Submission &submission, float consistency_threshold_pixels,
-        float cost_threshold);
+        float cost_threshold, ID3D12Resource *geometry_depth = nullptr,
+        D3D12_RESOURCE_STATES geometry_depth_state = D3D12_RESOURCE_STATE_COMMON,
+        bool depth_reversed = true);
     bool RecordVisualization(ID3D12GraphicsCommandList *commands,
         const Submission &submission, ID3D12Resource *output,
         unsigned int mode, float magnitude_scale);
@@ -76,6 +79,7 @@ private:
         Microsoft::WRL::ComPtr<ID3D12Resource> backward_cost;
         Microsoft::WRL::ComPtr<ID3D12Resource> motion;
         Microsoft::WRL::ComPtr<ID3D12Resource> history_mask;
+        Microsoft::WRL::ComPtr<ID3D12Resource> geometry_depth;
         NvOFGPUBufferHandle input_handle = nullptr;
         NvOFGPUBufferHandle forward_handle = nullptr;
         NvOFGPUBufferHandle backward_handle = nullptr;

@@ -63,6 +63,8 @@ inline constexpr NRSetting kSettings[] = {
     { "SkinStructure", "Skin / character structure", NR_FLOAT, -1, -1, 1, "%.2f", nullptr, 0, nullptr, Group::Neural },
     { "NvidiaOpticalFlowMotion", "NVIDIA Optical Flow motion (experimental)", NR_BOOL, 0, 0, 1, nullptr, nullptr, 0,
       "Off by default. Uses the NVIDIA driver's hardware Optical Flow engine to derive motion from captured source frames; no game profile or VORT shader is required.", Group::Neural },
+    { "NvidiaOpticalFlowDepth", "Add ReShade depth geometry to Optical Flow (prototype)", NR_BOOL, 0, 0, 1, nullptr, nullptr, 0,
+      "Opt-in D3D11 prototype. Rejects optical-flow history across object depth boundaries without requiring VORT. Restart after changing.", Group::Neural },
     { "NvidiaOpticalFlowConsistency", "Optical Flow consistency tolerance", NR_FLOAT, 3, 0.5f, 12, "%.1f px", nullptr, 0,
       "Higher values trust more motion; lower values reject more inconsistent forward/backward flow from DLSS history.", Group::Neural },
     { "NvidiaOpticalFlowCost", "Optical Flow cost tolerance", NR_FLOAT, 0.35f, 0, 0.99f, "%.2f", nullptr, 0,

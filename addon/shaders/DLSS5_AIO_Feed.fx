@@ -1,10 +1,10 @@
 /*
     DLSS5 ReShade AIO guide capture for the standalone OnPresent addon.
 
-    VORT's technique is rendered explicitly by the addon inside the Present
-    callback before this pass. ReShade pools MotVectTexVort by name, so this
-    effect consumes current-frame optical flow and converts delta UV to the pixel
-    units expected by NGX. It also supplies the game's real raw depth.
+    This effect exports ReShade's game depth and, when VORT is active, converts
+    its pooled current-frame optical flow from delta UV to NGX pixel units.
+    The addon may render this pass by itself to pair hardware NVIDIA Optical
+    Flow with real geometry boundaries; that path does not require VORT.
 */
 
 texture2D MotVectTexVort
@@ -105,8 +105,8 @@ void DLSS5_AIO_CaptureGuides(float4 position : SV_Position, float2 texcoord : TE
 
 technique DLSS5_AIO_Feed
 <
-    ui_label = "DLSS5 ReShade AIO guides (same-frame VORT motion + depth)";
-    ui_tooltip = "Rendered manually at Present after VORT, before the DLSS5 ReShade AIO pipeline.";
+    ui_label = "DLSS5 ReShade AIO guides (motion + game depth)";
+    ui_tooltip = "Rendered manually at Present to export VORT motion and/or ReShade game depth to the DLSS5 ReShade AIO pipeline.";
 >
 {
     pass

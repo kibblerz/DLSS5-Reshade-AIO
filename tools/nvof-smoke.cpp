@@ -51,6 +51,25 @@ static bool MakeOutput(ID3D12Device *device, ComPtr<ID3D12Resource> &output)
         IID_PPV_ARGS(&output)));
 }
 
+static bool MakeDepth(ID3D12Device *device, ComPtr<ID3D12Resource> &depth)
+{
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC texture = {};
+    texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    // Deliberately differ from the NVOF working size to exercise the same
+    // geometry resampling path used by source-resolution overrides in games.
+    texture.Width = 1600;
+    texture.Height = 900;
+    texture.DepthOrArraySize = 1;
+    texture.MipLevels = 1;
+    texture.Format = DXGI_FORMAT_R32_FLOAT;
+    texture.SampleDesc.Count = 1;
+    return SUCCEEDED(device->CreateCommittedResource(&heap,
+        D3D12_HEAP_FLAG_NONE, &texture, D3D12_RESOURCE_STATE_COMMON,
+        nullptr, IID_PPV_ARGS(&depth)));
+}
+
 int main()
 {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -88,12 +107,13 @@ int main()
         neural_fence.Get(), 1280, 720, DXGI_FORMAT_R8G8B8A8_UNORM,
         PrintStatus);
     bool full_path = initialized;
-    ComPtr<ID3D12Resource> source_a, source_b, visualization;
+    ComPtr<ID3D12Resource> source_a, source_b, visualization, geometry_depth;
     NvofMotionProvider::Submission first, second;
     if (full_path)
         full_path = MakeSource(device.Get(), source_a) &&
             MakeSource(device.Get(), source_b) &&
-            MakeOutput(device.Get(), visualization);
+            MakeOutput(device.Get(), visualization) &&
+            MakeDepth(device.Get(), geometry_depth);
     if (full_path)
     {
         std::puts("Submitting history frame...");
@@ -121,7 +141,9 @@ int main()
             SUCCEEDED(device->CreateCommandList(0,
                 D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator.Get(), nullptr,
                 IID_PPV_ARGS(&list))) &&
-            provider.RecordConversion(list.Get(), second, 3.0f, 0.35f) &&
+            provider.RecordConversion(list.Get(), second, 3.0f, 0.35f,
+                geometry_depth.Get(), D3D12_RESOURCE_STATE_COMMON, true) &&
+            second.depth != nullptr &&
             provider.RecordVisualization(list.Get(), second,
                 visualization.Get(), 1, 16.0f) &&
             SUCCEEDED(list->Close()) &&

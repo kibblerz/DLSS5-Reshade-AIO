@@ -36,7 +36,7 @@
 #include "aio-menu-schema.hpp"
 #include "nvof-motion-provider.hpp"
 
-#define ADDON_VERSION "2.2.0-experimental.1"
+#define ADDON_VERSION "2.2.0-nvof-depth-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -562,8 +562,10 @@ static bool g_reset_every_frame = false;
 static bool g_stable_sr_history = false;
 static bool g_vort_guides_enabled = false;
 static bool g_nvof_motion_enabled = false;
+static bool g_nvof_depth_enabled = false;
 static bool g_nvof_reconfigure_requested = false;
 static bool g_using_nvof_guides = false;
+static bool g_using_nvof_depth = false;
 static float g_nvof_consistency_threshold = 3.0f;
 static float g_nvof_cost_threshold = 0.35f;
 static int g_nvof_visualization_mode = 0;
@@ -823,6 +825,7 @@ static Microsoft::WRL::ComPtr<ID3D11PixelShader> g_legacy_downsample_ps;
 static Microsoft::WRL::ComPtr<ID3D11SamplerState> g_legacy_downsample_sampler;
 static Microsoft::WRL::ComPtr<ID3D11RenderTargetView> g_legacy_post_rtv;
 static bool g_legacy_guides_ready;
+static bool g_legacy_geometry_ready;
 static Microsoft::WRL::ComPtr<IDirect3DDevice9> g_legacy_device9;
 static Microsoft::WRL::ComPtr<IDirect3DTexture9> g_legacy_input9;
 static Microsoft::WRL::ComPtr<IDirect3DTexture9> g_legacy_post9;
@@ -2025,6 +2028,7 @@ static void ServiceNvofReconfiguration()
         return;
     g_nvof_motion.Shutdown();
     g_using_nvof_guides = false;
+    g_using_nvof_depth = false;
     if (g_nvof_motion_enabled)
         InitializeNvofMotion();
     g_nvof_reconfigure_requested = false;
@@ -2075,6 +2079,7 @@ static bool LegacyCaptureMailboxEnabled()
     return g_present_api == reshade::api::device_api::d3d11 &&
         DirectOutputHandoffEnabled() && EffectiveFramegenEnabled() &&
         !g_framegen_failed && !g_vort_guides_enabled &&
+        !(g_nvof_motion_enabled && g_nvof_depth_enabled) &&
         g_capture_ready_fence11 && g_capture_ready_fence12;
 }
 
@@ -3758,6 +3763,7 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
     }
     g_nvof_motion.Shutdown();
     g_using_nvof_guides = false;
+    g_using_nvof_depth = false;
 
     DWORD exception = 0;
     if (g_fg_feature)
@@ -3832,6 +3838,7 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
     g_legacy_source_motion11.Reset(); g_legacy_source_depth11.Reset();
     g_legacy_source_mask11.Reset(); g_legacy_source_nr_mask11.Reset();
     g_legacy_guides_ready = false;
+    g_legacy_geometry_ready = false;
     g_fallback_motion.Reset(); g_fallback_depth.Reset();
     ReleaseLegacyFrameResources();
     g_fg_stage.Reset(); g_sr_stage.Reset(); g_nr_stage.Reset();
@@ -3936,6 +3943,7 @@ static void ReleaseLegacyFrameResources()
     g_legacy_source_motion11.Reset(); g_legacy_source_depth11.Reset();
     g_legacy_source_mask11.Reset(); g_legacy_source_nr_mask11.Reset();
     g_legacy_guides_ready = false;
+    g_legacy_geometry_ready = false;
     g_legacy_width = g_legacy_height = 0;
     g_legacy_format = DXGI_FORMAT_UNKNOWN;
 }
@@ -4608,9 +4616,13 @@ static bool BuildLegacyFrameResources(UINT width, UINT height, DXGI_FORMAT forma
         // NGX runs on our private D3D12 queue. Keep shared copies with the exact
         // formats exported by DLSS5_AIO_Feed.fx so D3D11 games can use the same
         // current-frame VORT contract as native D3D12 games.
+        const UINT guide_width = g_nvof_depth_enabled ?
+            g_resource_capture_width : width;
+        const UINT guide_height = g_nvof_depth_enabled ?
+            g_resource_capture_height : height;
         if (!CreateSharedPair11(width, height, DXGI_FORMAT_R16G16_FLOAT,
                 g_captured_motion, g_legacy_motion11) ||
-            !CreateSharedPair11(width, height, DXGI_FORMAT_R32_FLOAT,
+            !CreateSharedPair11(guide_width, guide_height, DXGI_FORMAT_R32_FLOAT,
                 g_captured_depth, g_legacy_depth11))
         {
             Log("legacy D3D11 guide bridge could not create required motion/depth resources");
@@ -5431,6 +5443,7 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *runtime)
     g_captured_motion.Reset(); g_captured_depth.Reset(); g_captured_mask.Reset(); g_captured_nr_mask.Reset();
     g_mask_available = false; g_nr_mask_available = false;
     g_using_external_guides = false;
+    g_using_nvof_depth = false;
     g_reshade_overlay_open = false;
     if (g_proxy_overlay_bypass.exchange(false) && g_proxy_swapchain != nullptr &&
         g_enabled && !g_neural_failed && !g_proxy_hidden &&
@@ -5558,6 +5571,7 @@ static reshade::api::resource_view GetBackbufferRtv(uint64_t backbuffer)
 
 static bool CapturedGuidesMatchInput();
 static bool CopyLegacyGuidesToD3D12();
+static bool CopyLegacyGeometryToD3D12();
 
 static bool RenderCurrentFrameGuides(ID3D12Resource *backbuffer)
 {
@@ -5671,6 +5685,37 @@ static bool RenderLegacyCurrentFrameGuides(reshade::api::resource backbuffer)
     if (frame <= 4 || frame % 1800 == 0)
         Log("same-frame D3D11 VORT optical flow copied to D3D12 before NGX: frame=%llu masks=%s/%s",
             frame, g_mask_available ? "DLSS" : "none", g_nr_mask_available ? "NR" : "none");
+    return true;
+}
+
+static bool RenderLegacyCurrentFrameGeometry(reshade::api::resource backbuffer)
+{
+    using namespace reshade::api;
+    g_legacy_geometry_ready = false;
+    if (!g_nvof_motion_enabled || !g_nvof_depth_enabled || !backbuffer.handle ||
+        !g_runtime || g_runtime->get_device()->get_api() != device_api::d3d11 ||
+        !g_feed_technique.handle || !g_depth_variable.handle)
+        return false;
+    command_queue *queue = g_runtime->get_command_queue();
+    command_list *commands = queue ? queue->get_immediate_command_list() : nullptr;
+    const resource_view rtv = GetBackbufferRtv(backbuffer.handle);
+    if (!queue || !commands || !rtv.handle) return false;
+
+    // Capture only ReShade's current game depth. NVOF still supplies motion;
+    // VORT is deliberately not rendered or required by this path.
+    commands->barrier(backbuffer, resource_usage::present,
+        resource_usage::render_target);
+    g_runtime->render_technique(g_feed_technique, commands, rtv);
+    commands->barrier(backbuffer, resource_usage::render_target,
+        resource_usage::present);
+    queue->flush_immediate_command_list();
+    if (!CopyLegacyGeometryToD3D12()) return false;
+
+    const unsigned long long frame = ++g_current_guide_frames;
+    if (frame <= 4 || frame % 1800 == 0)
+        Log("same-frame D3D11 ReShade depth copied for NVOF geometry validation: frame=%llu capture=%ux%u work=%ux%u",
+            frame, g_resource_capture_width, g_resource_capture_height,
+            g_resource_input_width, g_resource_input_height);
     return true;
 }
 
@@ -5997,6 +6042,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     ID3D12Resource *depth = use_vort_guides ? g_captured_depth.Get() : g_fallback_depth.Get();
     bool use_external_guides = use_vort_guides;
     bool use_nvof_guides = false;
+    bool use_nvof_geometry = false;
     NvofMotionProvider::Submission nvof_submission;
 
     if (DirectOutputHandoffEnabled())
@@ -6042,6 +6088,11 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
                 use_nvof_guides = true;
                 use_external_guides = true;
                 motion = nvof_submission.motion;
+                use_nvof_geometry = legacy_input &&
+                    g_present_api == reshade::api::device_api::d3d11 &&
+                    g_nvof_depth_enabled && g_legacy_geometry_ready &&
+                    g_captured_depth;
+                g_legacy_geometry_ready = false;
             }
             else
                 Log("NVOF completion dependency failed: 0x%08X; using normal guides",
@@ -6049,13 +6100,17 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
         }
     }
     if (use_external_guides != g_using_external_guides ||
-        use_nvof_guides != g_using_nvof_guides)
+        use_nvof_guides != g_using_nvof_guides ||
+        use_nvof_geometry != g_using_nvof_depth)
     {
         g_using_external_guides = use_external_guides;
         g_using_nvof_guides = use_nvof_guides;
+        g_using_nvof_depth = use_nvof_geometry;
         g_need_history_reset = true;
         Log("on-present guide source changed to %s",
-            use_nvof_guides ? "NVIDIA hardware optical flow" :
+            use_nvof_guides ? (use_nvof_geometry ?
+                "NVIDIA hardware optical flow + ReShade depth geometry" :
+                "NVIDIA hardware optical flow") :
             use_vort_guides ? "same-frame VORT motion" :
             "internal zero-motion fallback");
     }
@@ -6115,15 +6170,21 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
 
     if (use_nvof_guides && !g_nvof_motion.RecordConversion(commands,
             nvof_submission, g_nvof_consistency_threshold,
-            g_nvof_cost_threshold))
+            g_nvof_cost_threshold,
+            use_nvof_geometry ? g_captured_depth.Get() : nullptr,
+            D3D12_RESOURCE_STATE_COMMON, g_depth_reversed))
     {
         use_nvof_guides = false;
         use_external_guides = use_vort_guides;
         motion = use_vort_guides ? g_captured_motion.Get() :
             g_fallback_motion.Get();
+        use_nvof_geometry = false;
+        g_using_nvof_depth = false;
         g_using_nvof_guides = false;
         Log("NVOF vector conversion failed; using the normal guide path for this frame");
     }
+    else if (use_nvof_guides && use_nvof_geometry && nvof_submission.depth)
+        depth = nvof_submission.depth;
 
     if (legacy_input && use_vort_guides)
     {
@@ -6740,6 +6801,40 @@ static bool CopyLegacyGuidesToD3D12()
     g_legacy_context11->Flush();
     if (FAILED(g_command_queue->Wait(g_legacy_fence12.Get(), value))) return false;
     g_legacy_guides_ready = true;
+    return true;
+}
+
+static bool CopyLegacyGeometryToD3D12()
+{
+    g_legacy_geometry_ready = false;
+    if (g_present_api != reshade::api::device_api::d3d11 ||
+        !g_legacy_context11 || !g_legacy_context4 || !g_legacy_fence11 ||
+        !g_legacy_fence12 || !g_command_queue || !g_legacy_source_depth11 ||
+        !g_legacy_depth11 || !g_captured_depth)
+        return false;
+
+    D3D11_TEXTURE2D_DESC source = {}, destination = {};
+    g_legacy_source_depth11->GetDesc(&source);
+    g_legacy_depth11->GetDesc(&destination);
+    if (source.Width != destination.Width || source.Height != destination.Height ||
+        source.Format != DXGI_FORMAT_R32_FLOAT ||
+        destination.Format != DXGI_FORMAT_R32_FLOAT ||
+        source.SampleDesc.Count != 1 || destination.SampleDesc.Count != 1)
+        return false;
+
+    if (g_legacy_d3d12_done_value != 0 &&
+        FAILED(g_legacy_context4->Wait(g_legacy_fence11.Get(),
+            g_legacy_d3d12_done_value)))
+        return false;
+    g_legacy_context11->CopyResource(g_legacy_depth11.Get(),
+        g_legacy_source_depth11.Get());
+    const UINT64 value = ++g_legacy_fence_value;
+    if (FAILED(g_legacy_context4->Signal(g_legacy_fence11.Get(), value)))
+        return false;
+    g_legacy_context11->Flush();
+    if (FAILED(g_command_queue->Wait(g_legacy_fence12.Get(), value)))
+        return false;
+    g_legacy_geometry_ready = true;
     return true;
 }
 
@@ -11215,6 +11310,9 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
                 return;
             }
             if (api == reshade::api::device_api::d3d11 &&
+                g_nvof_motion_enabled && g_nvof_depth_enabled)
+                RenderLegacyCurrentFrameGeometry(backbuffer_resource);
+            else if (api == reshade::api::device_api::d3d11 &&
                 !SourceResolutionOverrideActive())
                 RenderLegacyCurrentFrameGuides(backbuffer_resource);
             if (!CopyLegacyFrameToD3D12(reinterpret_cast<void *>(backbuffer_resource.handle), false,
@@ -11950,6 +12048,16 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     }
     ImGui::TextDisabled("Off by default. Uses the NVIDIA driver's hardware Optical Flow engine; no game profile or VORT shader is required.");
     ImGui::TextDisabled("Requires asynchronous NGX compute. It may compete with Frame Generation for Optical Flow hardware on some GPUs.");
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("NvidiaOpticalFlowDepth", "Add ReShade depth geometry to Optical Flow (prototype)"), &g_nvof_depth_enabled))
+    {
+        reshade::set_config_value(nullptr, section, "NvidiaOpticalFlowDepth",
+            g_nvof_depth_enabled ? "1" : "0");
+        g_need_history_reset = true;
+        Log("NVOF ReShade depth geometry changed to %s; restart required for shared depth resources",
+            g_nvof_depth_enabled ? "enabled" : "disabled");
+    }
+    ImGui::TextDisabled("Opt-in D3D11 prototype. Uses game depth to reject optical-flow history across object edges; VORT is not required.");
+    ImGui::TextDisabled("Restart after changing. Missing or invalid depth falls back to normal NVOF behavior.");
     if (ImGui::SliderFloat(dlss5_aio_menu::Label("NvidiaOpticalFlowConsistency", "Optical Flow consistency tolerance"),
             &g_nvof_consistency_threshold, 0.5f, 12.0f, "%.1f px"))
     {
@@ -11964,7 +12072,8 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     }
     ImGui::TextDisabled("The confidence controls affect DLSS history rejection only; they never mask away the NR result.");
     const char *nvof_visualizations[] = {
-        "Off", "Motion direction + magnitude", "Confidence / rejection heatmap"};
+        "Off", "Motion direction + magnitude", "Confidence / rejection heatmap",
+        "Geometry depth boundaries"};
     if (ImGui::Combo("NVIDIA Optical Flow diagnostic view",
             &g_nvof_visualization_mode, nvof_visualizations,
             static_cast<int>(std::size(nvof_visualizations))))
@@ -11976,7 +12085,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     if (g_nvof_visualization_mode == 1)
         ImGui::SliderFloat("Motion visualization range",
             &g_nvof_visualization_scale, 1.0f, 64.0f, "%.1f px");
-    ImGui::TextDisabled("Session-only. Motion view: hue=direction, brightness=speed. Heatmap: green=trusted, red=rejected.");
+    ImGui::TextDisabled("Session-only. Motion: hue/direction. Heatmap: green/trusted, red/rejected. Geometry: cyan/depth edges.");
     ImGui::TextDisabled("Diagnostic views replace the processed picture and temporarily suppress Frame Generation.");
     if (ImGui::Checkbox(dlss5_aio_menu::Label("VortGuides", "Enable VORT motion integration (experimental)"), &g_vort_guides_enabled))
     {
@@ -12128,6 +12237,10 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         !g_nvof_motion_enabled ? "disabled" :
         g_nvof_motion.IsReady() ? g_nvof_motion.Status() : "requested / unavailable",
         g_nvof_reconfigure_requested ? " (change queued)" : "");
+    ImGui::Text("NVOF geometry: %s",
+        !g_nvof_depth_enabled ? "disabled" :
+        g_using_nvof_depth ? "active - ReShade depth boundaries" :
+        "requested / waiting for valid current-frame depth");
     ImGui::Text("NR rejection mask: %s (strength %.2f)",
         !g_vort_guides_enabled ? "inactive (VORT integration off)" :
         !g_nr_rejection_mask_enabled ? "disabled" :
@@ -12351,6 +12464,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("ResetEveryFrame", "0", value, sizeof(value)); g_reset_every_frame = strcmp(value, "0") != 0;
         read_setting("StableSrHistory", "0", value, sizeof(value)); g_stable_sr_history = strcmp(value, "0") != 0;
         read_setting("NvidiaOpticalFlowMotion", "0", value, sizeof(value)); g_nvof_motion_enabled = strcmp(value, "0") != 0;
+        read_setting("NvidiaOpticalFlowDepth", "0", value, sizeof(value)); g_nvof_depth_enabled = strcmp(value, "0") != 0;
         read_setting("NvidiaOpticalFlowConsistency", "3.0", value, sizeof(value)); g_nvof_consistency_threshold = std::clamp(static_cast<float>(atof(value)), 0.5f, 12.0f);
         read_setting("NvidiaOpticalFlowCost", "0.35", value, sizeof(value)); g_nvof_cost_threshold = std::clamp(static_cast<float>(atof(value)), 0.0f, 0.99f);
         read_setting("VortGuides", "0", value, sizeof(value)); g_vort_guides_enabled = strcmp(value, "0") != 0;
