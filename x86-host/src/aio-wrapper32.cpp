@@ -3038,7 +3038,7 @@ static bool OnSetFullscreenState(reshade::api::swapchain *swapchain, bool fullsc
     return true;
 }
 
-static void ResolveHandles(reshade::api::effect_runtime *rt)
+static void ResolveHandles(reshade::api::effect_runtime *rt, bool report_missing = true)
 {
     // ReShade 6 exposes native D3D9 effect rendering through its D3D10.1
     // presentation runtime, so both API identities use the lightweight trigger.
@@ -3062,7 +3062,7 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
             rt->set_technique_state(g.technique, true);
             Log("[feed32] native D3D9 capture trigger found and enabled");
         }
-        else
+        else if (report_missing)
             Warn("DLSS5_Feed_D3D9.fx is missing or failed to compile");
         return;
     }
@@ -3136,14 +3136,41 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
                     g_mv_problem[0] ? " " : "", other_tech, mode, kMvModeName[mode], other_mode);
         strncat_s(g_mv_problem, sizeof(g_mv_problem), more, _TRUNCATE);
     }
-    if (g_mv_problem[0]) Warn("%s", g_mv_problem);
+    if (g_mv_problem[0] && report_missing) Warn("%s", g_mv_problem);
+}
+
+static ULONGLONG g_next_effect_resolve_tick;
+static ULONGLONG g_effect_resolve_started_tick;
+static bool g_effect_missing_reported;
+
+static void OnReshadePresent(reshade::api::effect_runtime *rt)
+{
+    if (rt == nullptr || rt != g.runtime || g.handles_ok)
+        return;
+    const ULONGLONG now = GetTickCount64();
+    if (now < g_next_effect_resolve_tick)
+        return;
+    g_next_effect_resolve_tick = now + 250;
+
+    ResolveHandles(rt, false);
+    if (g.handles_ok)
+        Log("[feed32] feed shader resolved after asynchronous effect compilation");
+    else if (!g_effect_missing_reported && g_effect_resolve_started_tick != 0 &&
+             now - g_effect_resolve_started_tick >= 60000)
+    {
+        g_effect_missing_reported = true;
+        ResolveHandles(rt, true);
+    }
 }
 
 static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
 {
     g.runtime = rt;
+    g_next_effect_resolve_tick = GetTickCount64() + 250;
+    g_effect_resolve_started_tick = GetTickCount64();
+    g_effect_missing_reported = false;
     Log("[feed32] game presentation window resolved: hwnd=%p", rt->get_hwnd());
-    ResolveHandles(rt);
+    ResolveHandles(rt, false);
     static int inits = 0;
     if (++inits <= 8) Log("[feed32] effect runtime %p initialised", (void *)rt);
 }
@@ -3153,13 +3180,23 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
     if (rt != g.runtime) return;
     // The shared textures live on the game's device and survive runtime churn; keep them.
     g.runtime = nullptr;
+    g_next_effect_resolve_tick = 0;
+    g_effect_resolve_started_tick = 0;
+    g_effect_missing_reported = false;
     g.technique = {}; g.launchpad = {}; g.mv_var = {}; g.depth_var = {};
     g.handles_ok = false;
 }
 
 static void OnReloadedEffects(reshade::api::effect_runtime *rt)
 {
-    if (rt == g.runtime || g.runtime == nullptr) { g.runtime = rt; ResolveHandles(rt); }
+    if (rt == g.runtime || g.runtime == nullptr)
+    {
+        g.runtime = rt;
+        g_next_effect_resolve_tick = GetTickCount64() + 250;
+        g_effect_resolve_started_tick = GetTickCount64();
+        g_effect_missing_reported = false;
+        ResolveHandles(rt, false);
+    }
 }
 
 struct HostProxyWindowSearch
@@ -3619,7 +3656,10 @@ static void DrawOverlay(reshade::api::effect_runtime *)
 
     if (ImGui::CollapsingHeader("32-bit bridge diagnostics"))
     {
-        ImGui::TextWrapped("Feed shader: %s", g.handles_ok ? "ready" : "missing or failed to compile");
+        const bool compiling = !g.handles_ok && g_effect_resolve_started_tick != 0 &&
+            GetTickCount64() - g_effect_resolve_started_tick < 60000;
+        ImGui::TextWrapped("Feed shader: %s", g.handles_ok ? "ready" :
+            compiling ? "waiting for ReShade shader compilation" : "missing or failed to compile");
         ImGui::TextWrapped("Motion provider: %s", g_mv_status);
         if (g_mv_problem[0]) ImGui::TextWrapped("%s", g_mv_problem);
         if (g.disabled && ImGui::Button("Retry bridge"))
@@ -3673,6 +3713,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
         reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
+        reshade::register_event<reshade::addon_event::reshade_present>(OnReshadePresent);
         reshade::register_event<reshade::addon_event::reshade_open_overlay>(OnReshadeOpenOverlay);
         reshade::register_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
         reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
@@ -3689,6 +3730,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
         reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
+        reshade::unregister_event<reshade::addon_event::reshade_present>(OnReshadePresent);
         reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(OnReshadeOpenOverlay);
         reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
         reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
