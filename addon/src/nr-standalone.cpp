@@ -36,7 +36,7 @@
 #include "aio-menu-schema.hpp"
 #include "nvof-motion-provider.hpp"
 
-#define ADDON_VERSION "2.2.0-nvof-depth-prototype"
+#define ADDON_VERSION "2.2.0-nvof-depth-repair-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -568,6 +568,7 @@ static bool g_using_nvof_guides = false;
 static bool g_using_nvof_depth = false;
 static float g_nvof_consistency_threshold = 3.0f;
 static float g_nvof_cost_threshold = 0.35f;
+static float g_nvof_motion_repair_strength = 1.0f;
 static int g_nvof_visualization_mode = 0;
 static float g_nvof_visualization_scale = 16.0f;
 static NvofMotionProvider g_nvof_motion;
@@ -6183,7 +6184,8 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
             nvof_submission, g_nvof_consistency_threshold,
             g_nvof_cost_threshold,
             use_nvof_geometry ? g_captured_depth.Get() : nullptr,
-            D3D12_RESOURCE_STATE_COMMON, g_depth_reversed))
+            D3D12_RESOURCE_STATE_COMMON, g_depth_reversed,
+            use_nvof_geometry ? g_nvof_motion_repair_strength : 0.0f))
     {
         use_nvof_guides = false;
         use_external_guides = use_vort_guides;
@@ -12069,6 +12071,13 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     }
     ImGui::TextDisabled("Opt-in D3D11 prototype. Uses game depth to reject optical-flow history across object edges; VORT is not required.");
     ImGui::TextDisabled("Restart after changing. Missing or invalid depth falls back to normal NVOF behavior.");
+    if (ImGui::SliderFloat(dlss5_aio_menu::Label("NvidiaOpticalFlowMotionRepair", "Geometry/confidence motion repair"),
+            &g_nvof_motion_repair_strength, 0.0f, 1.0f, "%.2f"))
+    {
+        save_float("NvidiaOpticalFlowMotionRepair", g_nvof_motion_repair_strength);
+        g_need_history_reset = true;
+    }
+    ImGui::TextDisabled("With geometry enabled, attenuates unreliable vectors before NR, DLSS, and FG. 0=old behavior; 1=maximum stabilization.");
     if (ImGui::SliderFloat(dlss5_aio_menu::Label("NvidiaOpticalFlowConsistency", "Optical Flow consistency tolerance"),
             &g_nvof_consistency_threshold, 0.5f, 12.0f, "%.1f px"))
     {
@@ -12478,6 +12487,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("NvidiaOpticalFlowDepth", "0", value, sizeof(value)); g_nvof_depth_enabled = strcmp(value, "0") != 0;
         read_setting("NvidiaOpticalFlowConsistency", "3.0", value, sizeof(value)); g_nvof_consistency_threshold = std::clamp(static_cast<float>(atof(value)), 0.5f, 12.0f);
         read_setting("NvidiaOpticalFlowCost", "0.35", value, sizeof(value)); g_nvof_cost_threshold = std::clamp(static_cast<float>(atof(value)), 0.0f, 0.99f);
+        read_setting("NvidiaOpticalFlowMotionRepair", "1.0", value, sizeof(value)); g_nvof_motion_repair_strength = std::clamp(static_cast<float>(atof(value)), 0.0f, 1.0f);
         read_setting("VortGuides", "0", value, sizeof(value)); g_vort_guides_enabled = strcmp(value, "0") != 0;
         read_setting("NeuralRendering", "1", value, sizeof(value)); g_nr_enabled = strcmp(value, "0") != 0;
         // Multi-pass NR is deliberately session-only. Never inherit a risky

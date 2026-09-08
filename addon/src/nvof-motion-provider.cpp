@@ -228,7 +228,7 @@ bool NvofMotionProvider::CreatePipelineState()
     }
     conversion_params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     conversion_params[2].Constants.ShaderRegister = 0;
-    conversion_params[2].Constants.Num32BitValues = 12;
+    conversion_params[2].Constants.Num32BitValues = 13;
     D3D12_ROOT_SIGNATURE_DESC conversion_desc = {};
     conversion_desc.NumParameters = 3;
     conversion_desc.pParameters = conversion_params;
@@ -251,7 +251,8 @@ bool NvofMotionProvider::CreatePipelineState()
         "RWTexture2D<float> GeometryDepth:register(u2);"
         "cbuffer C:register(b0){uint Width;uint Height;uint Grid;float Consistency;"
         "float CostThreshold;float CostScale;uint Reset;uint UseDepth;"
-        "uint DepthWidth;uint DepthHeight;uint DepthReversed;float DepthSensitivity;}"
+        "uint DepthWidth;uint DepthHeight;uint DepthReversed;float DepthSensitivity;"
+        "float MotionRepairStrength;}"
         "[numthreads(8,8,1)] void CS(uint3 id:SV_DispatchThreadID){"
         "if(id.x>=Width||id.y>=Height)return;uint2 cell=id.xy/Grid;"
         "float2 f=float2(Forward.Load(int3(cell,0)))/32.0;"
@@ -280,9 +281,10 @@ bool NvofMotionProvider::CreatePipelineState()
         "float valid=abs(sceneDepth-clearDepth)>1e-7?1.0:0.0;"
         "depthReject=valid*saturate(max(smoothstep(DepthSensitivity*0.25,DepthSensitivity,localDelta),"
         "smoothstep(DepthSensitivity*0.5,DepthSensitivity*2.0,endpointDelta)));}"
-        "Motion[id.xy]=Reset!=0?float2(0,0):f;"
+        "float rejection=saturate(max(max(badFlow,badCost),depthReject));"
+        "Motion[id.xy]=Reset!=0?float2(0,0):f*(1.0-rejection*saturate(MotionRepairStrength));"
         "GeometryDepth[id.xy]=sceneDepth;"
-        "HistoryMask[id.xy]=Reset!=0||outside?1.0:saturate(max(max(badFlow,badCost),depthReject));}";
+        "HistoryMask[id.xy]=Reset!=0||outside?1.0:rejection;}";
     ComPtr<ID3DBlob> conversion_cs;
     if (SUCCEEDED(hr))
         hr = CompileShader(conversion_shader, "nvof-conversion", "CS",
@@ -901,7 +903,8 @@ bool NvofMotionProvider::Submit(ID3D12Resource *source,
 bool NvofMotionProvider::RecordConversion(ID3D12GraphicsCommandList *commands,
     const Submission &submission, float consistency_threshold_pixels,
     float cost_threshold, ID3D12Resource *geometry_depth,
-    D3D12_RESOURCE_STATES geometry_depth_state, bool depth_reversed)
+    D3D12_RESOURCE_STATES geometry_depth_state, bool depth_reversed,
+    float motion_repair_strength)
 {
     if (!ready_ || !commands || !submission.valid ||
         submission.slot >= kSlotCount) return false;
@@ -968,6 +971,7 @@ bool NvofMotionProvider::RecordConversion(ID3D12GraphicsCommandList *commands,
         unsigned int depth_height;
         unsigned int depth_reversed;
         float depth_sensitivity;
+        float motion_repair_strength;
     } constants = {width_, height_, grid_size_,
         std::max(0.25f, consistency_threshold_pixels),
         std::clamp(cost_threshold, 0.0f, 0.99f),
@@ -975,8 +979,9 @@ bool NvofMotionProvider::RecordConversion(ID3D12GraphicsCommandList *commands,
         0u, use_depth ? 1u : 0u,
         use_depth ? static_cast<unsigned int>(geometry_desc.Width) : 1u,
         use_depth ? geometry_desc.Height : 1u,
-        depth_reversed ? 1u : 0u, 0.02f};
-    commands->SetComputeRoot32BitConstants(2, 12, &constants, 0);
+        depth_reversed ? 1u : 0u, 0.02f,
+        std::clamp(motion_repair_strength, 0.0f, 1.0f)};
+    commands->SetComputeRoot32BitConstants(2, 13, &constants, 0);
     commands->Dispatch((width_ + 7) / 8, (height_ + 7) / 8, 1);
     D3D12_RESOURCE_BARRIER end[8] = {};
     unsigned int end_count = 0;

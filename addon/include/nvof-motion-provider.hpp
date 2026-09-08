@@ -54,7 +54,7 @@ public:
         const Submission &submission, float consistency_threshold_pixels,
         float cost_threshold, ID3D12Resource *geometry_depth = nullptr,
         D3D12_RESOURCE_STATES geometry_depth_state = D3D12_RESOURCE_STATE_COMMON,
-        bool depth_reversed = true);
+        bool depth_reversed = true, float motion_repair_strength = 0.0f);
     bool RecordVisualization(ID3D12GraphicsCommandList *commands,
         const Submission &submission, ID3D12Resource *output,
         unsigned int mode, float magnitude_scale);

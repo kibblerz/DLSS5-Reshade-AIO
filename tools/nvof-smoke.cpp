@@ -142,7 +142,7 @@ int main()
                 D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator.Get(), nullptr,
                 IID_PPV_ARGS(&list))) &&
             provider.RecordConversion(list.Get(), second, 3.0f, 0.35f,
-                geometry_depth.Get(), D3D12_RESOURCE_STATE_COMMON, true) &&
+                geometry_depth.Get(), D3D12_RESOURCE_STATE_COMMON, true, 1.0f) &&
             second.depth != nullptr &&
             provider.RecordVisualization(list.Get(), second,
                 visualization.Get(), 1, 16.0f) &&
