@@ -3022,6 +3022,7 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
 // borderless on a worker (never mutate a window from inside the DXGI callback).
 static std::atomic<bool> g_fullscreen_virtualization_pending{false};
 static std::atomic<bool> g_classic_d3d9_swapchain_seen{false};
+static std::atomic<bool> g_classic_d3d9_startup_activation_done{false};
 
 static DWORD WINAPI DeferredFullscreenVirtualizationWorker(void *parameter)
 {
@@ -3047,13 +3048,26 @@ static DWORD WINAPI DeferredFullscreenVirtualizationWorker(void *parameter)
     SetWindowLongPtrW(game_window, GWL_STYLE, style);
 
     const RECT &bounds = monitor_info.rcMonitor;
+    // The first exclusive-to-borderless conversion is part of game startup and
+    // must activate the real game HWND. Keeping SWP_NOACTIVATE here left Steam
+    // in front and made multiple titles look as if they had never launched.
+    // Subsequent Reset/mode-change conversions remain non-activating so a game
+    // that the user intentionally alt-tabbed away from cannot steal focus.
+    const bool startup_activation =
+        !g_classic_d3d9_startup_activation_done.exchange(true);
+    const UINT placement_flags = SWP_FRAMECHANGED | SWP_SHOWWINDOW |
+        (startup_activation ? 0u : SWP_NOACTIVATE);
     if (!SetWindowPos(game_window, HWND_TOP,
         bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top,
-        SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW))
+        placement_flags))
         Log("[feed32] exclusive-fullscreen borderless placement failed: error=%lu", GetLastError());
     else
-        Log("[feed32] exclusive fullscreen virtualized to non-activating borderless: %ldx%ld",
+    {
+        if (startup_activation) SetForegroundWindow(game_window);
+        Log("[feed32] exclusive fullscreen virtualized to %s borderless: %ldx%ld",
+            startup_activation ? "startup-activating" : "non-activating",
             bounds.right - bounds.left, bounds.bottom - bounds.top);
+    }
 
     g_fullscreen_virtualization_pending = false;
     return 0;
