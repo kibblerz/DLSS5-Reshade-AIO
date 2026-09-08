@@ -55,7 +55,7 @@
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
 #include "aio-menu-schema.hpp"
 
-#define FEED_VERSION "2.1.2"
+#define FEED_VERSION "2.1.3-downsample-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR (32-bit wrapper) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -400,6 +400,14 @@ struct Feed32
     ID3D10Query            *query10;
     ID3D10Texture2D        *d3d10_color_stage;
     ID3D10Texture2D        *d3d10_output_stage;
+    ID3D10RenderTargetView *d3d10_color_rtv;
+    ID3D10Texture2D        *d3d10_source_texture;
+    ID3D10ShaderResourceView *d3d10_source_srv;
+    ID3D10Texture2D        *d3d10_fallback_source;
+    ID3D10ShaderResourceView *d3d10_fallback_source_srv;
+    ID3D10VertexShader     *d3d10_downsample_vs;
+    ID3D10PixelShader      *d3d10_downsample_ps;
+    ID3D10SamplerState     *d3d10_downsample_sampler;
 
     // OpenGL client: the host creates the shared textures and duplicates the handles
     // in; we import them raw (feed_gl.h) and never touch D3D11 at all. tex_handle[]
@@ -901,6 +909,7 @@ static void HostClose();   // below
 static HWND FindHostProxyWindow();
 static void HideClassicD3D9Proxy();
 static void RestoreD3D9StartupFocusIfReady();
+static void ResolveWorkExtent(UINT source_w, UINT source_h, UINT &work_w, UINT &work_h);
 
 static bool TryApplyLiveHostSettings()
 {
@@ -953,7 +962,11 @@ static void HostApplySettings()
             Warn("DLSS 5 live-safe setting applied without restarting the classic D3D9 carrier");
             return;
         }
-        Warn("Classic D3D9 safety: this setting requires a game restart; the active carrier was left running");
+        // Do not tear down resources owned by a classic D3D9 device mid-frame,
+        // but do persist non-live settings such as SourceResolutionOverride.
+        // The next launch can then build both halves at the requested size.
+        WriteHostNR();
+        Warn("Classic D3D9 safety: setting saved and will apply after restarting the game; the active carrier was left running");
         return;
     }
     CaptureGameFocus();   // spent once the replacement host has connected
@@ -1025,6 +1038,14 @@ static void ReleaseShared()
     g.d3d9_pending_deadline = 0;
     g.d3d9_resume_after = 0;
     g.d3d9_cpu_bridge = false;
+    SafeRelease(g.d3d10_downsample_sampler);
+    SafeRelease(g.d3d10_downsample_ps);
+    SafeRelease(g.d3d10_downsample_vs);
+    SafeRelease(g.d3d10_fallback_source_srv);
+    SafeRelease(g.d3d10_fallback_source);
+    SafeRelease(g.d3d10_source_srv);
+    SafeRelease(g.d3d10_source_texture);
+    SafeRelease(g.d3d10_color_rtv);
     SafeRelease(g.d3d10_output_stage);
     SafeRelease(g.d3d10_color_stage);
     SafeRelease(g.output_srv);
@@ -1168,7 +1189,9 @@ static bool InitializeD3D9Transport(IDirect3DDevice9 *device9)
 }
 
 static bool CreateD3D9SharedStage(UINT width, UINT height, DXGI_FORMAT format,
-                                  IDirect3DTexture9 **texture9, ID3D11Texture2D **texture11)
+                                  IDirect3DTexture9 **texture9, ID3D11Texture2D **texture11,
+                                  UINT cpu_width = 0, UINT cpu_height = 0,
+                                  bool allow_cpu_fallback = true)
 {
     const D3DFORMAT format9 = ToD3D9Format(format);
     if (format9 == D3DFMT_UNKNOWN || g.dev9 == nullptr || g.dev == nullptr) return false;
@@ -1196,7 +1219,7 @@ static bool CreateD3D9SharedStage(UINT width, UINT height, DXGI_FORMAT format,
     if (FAILED(hr))
     {
         SafeRelease(*texture9); SafeRelease(*texture11);
-        if (g_cfg.classic_d3d9_cpu_fallback == 0)
+        if (g_cfg.classic_d3d9_cpu_fallback == 0 || !allow_cpu_fallback)
         {
             Log("[feed32] D3D9/D3D11 shared stage unsupported: %ux%u fmt=%u hr=0x%08X; "
                 "classic D3D9 CPU fallback is disabled",
@@ -1209,24 +1232,29 @@ static bool CreateD3D9SharedStage(UINT width, UINT height, DXGI_FORMAT format,
         // system-memory readback. The x64 carrier owns the detached processed
         // output, so this path only has to move the source frame into D3D11;
         // it does not need an equally expensive CPU copy back into D3D9.
+        const UINT fallback_width = cpu_width >= 2 ? cpu_width : width;
+        const UINT fallback_height = cpu_height >= 2 ? cpu_height : height;
         D3D11_TEXTURE2D_DESC local_desc = desc;
+        local_desc.Width = fallback_width;
+        local_desc.Height = fallback_height;
         local_desc.MiscFlags = 0;
-        HRESULT fallback_hr = g.dev9->CreateTexture(width, height, 1, D3DUSAGE_RENDERTARGET, format9,
+        HRESULT fallback_hr = g.dev9->CreateTexture(fallback_width, fallback_height, 1, D3DUSAGE_RENDERTARGET, format9,
                                                      D3DPOOL_DEFAULT, texture9, nullptr);
         if (SUCCEEDED(fallback_hr))
             fallback_hr = g.dev->CreateTexture2D(&local_desc, nullptr, texture11);
         if (SUCCEEDED(fallback_hr) && g.d3d9_cpu_readback == nullptr)
-            fallback_hr = g.dev9->CreateOffscreenPlainSurface(width, height, format9, D3DPOOL_SYSTEMMEM,
+            fallback_hr = g.dev9->CreateOffscreenPlainSurface(fallback_width, fallback_height, format9, D3DPOOL_SYSTEMMEM,
                                                                &g.d3d9_cpu_readback, nullptr);
         if (FAILED(fallback_hr))
         {
             SafeRelease(*texture9); SafeRelease(*texture11);
             Log("[feed32] D3D9/D3D11 shared stage failed: %ux%u fmt=%u shared=0x%08X fallback=0x%08X",
-                width, height, format, hr, fallback_hr);
+                fallback_width, fallback_height, format, hr, fallback_hr);
             return false;
         }
         if (!g.d3d9_cpu_bridge)
-            Log("[feed32] classic D3D9 device rejected shared textures (0x%08X); using CPU capture + detached x64 output", hr);
+            Log("[feed32] classic D3D9 device rejected shared textures (0x%08X); using %ux%u CPU capture + detached x64 output",
+                hr, fallback_width, fallback_height);
         g.d3d9_cpu_bridge = true;
     }
     return true;
@@ -1345,6 +1373,219 @@ static bool WaitForD3D10Copy()
     while ((hr = g.query10->GetData(nullptr, 0, 0)) == S_FALSE && GetTickCount64() < deadline)
         SwitchToThread();
     return hr == S_OK;
+}
+
+static bool MakeD3D10DownsamplePipeline()
+{
+    if (g.dev10 == nullptr || g.d3d10_color_stage == nullptr) return false;
+    if (g.d3d10_downsample_vs != nullptr && g.d3d10_downsample_ps != nullptr &&
+        g.d3d10_downsample_sampler != nullptr && g.d3d10_color_rtv != nullptr)
+        return true;
+
+    static const char shader[] =
+        "Texture2D<float4> source_texture : register(t0);\n"
+        "SamplerState source_sampler : register(s0);\n"
+        "struct VSOut { float4 position : SV_Position; float2 uv : TEXCOORD0; };\n"
+        "VSOut vs(uint id : SV_VertexID) { VSOut o; float2 uv=float2((id<<1)&2,id&2);"
+        " o.uv=uv; o.position=float4(uv*float2(2,-2)+float2(-1,1),0,1); return o; }\n"
+        "float4 ps(VSOut i) : SV_Target { return source_texture.SampleLevel(source_sampler,i.uv,0); }\n";
+    HMODULE compiler_module = LoadLibraryW(L"d3dcompiler_47.dll");
+    auto compile = compiler_module != nullptr ?
+        reinterpret_cast<pD3DCompile>(GetProcAddress(compiler_module, "D3DCompile")) : nullptr;
+    if (compile == nullptr)
+    {
+        Log("[feed32] D3D10.1 source downsample requires d3dcompiler_47.dll");
+        return false;
+    }
+
+    ID3DBlob *vs_blob = nullptr, *ps_blob = nullptr, *errors = nullptr;
+    HRESULT hr = compile(shader, sizeof(shader) - 1, "feed32-d3d10-downsample", nullptr,
+        nullptr, "vs", "vs_4_0", 0, 0, &vs_blob, &errors);
+    SafeRelease(errors);
+    if (SUCCEEDED(hr))
+        hr = compile(shader, sizeof(shader) - 1, "feed32-d3d10-downsample", nullptr,
+            nullptr, "ps", "ps_4_0", 0, 0, &ps_blob, &errors);
+    if (FAILED(hr))
+    {
+        if (errors != nullptr)
+            Log("[feed32] D3D10.1 source downsample shader compilation failed: %s",
+                static_cast<const char *>(errors->GetBufferPointer()));
+        SafeRelease(errors); SafeRelease(vs_blob); SafeRelease(ps_blob);
+        return false;
+    }
+    SafeRelease(errors);
+
+    hr = g.dev10->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
+        &g.d3d10_downsample_vs);
+    if (SUCCEEDED(hr))
+        hr = g.dev10->CreatePixelShader(ps_blob->GetBufferPointer(), ps_blob->GetBufferSize(),
+            &g.d3d10_downsample_ps);
+    SafeRelease(vs_blob); SafeRelease(ps_blob);
+
+    D3D10_SAMPLER_DESC sampler = {};
+    sampler.Filter = D3D10_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D10_TEXTURE_ADDRESS_CLAMP;
+    sampler.MaxLOD = D3D10_FLOAT32_MAX;
+    if (SUCCEEDED(hr)) hr = g.dev10->CreateSamplerState(&sampler, &g.d3d10_downsample_sampler);
+
+    D3D10_RENDER_TARGET_VIEW_DESC rtv = {};
+    rtv.Format = g.color_fmt;
+    rtv.ViewDimension = D3D10_RTV_DIMENSION_TEXTURE2D;
+    if (SUCCEEDED(hr))
+        hr = g.dev10->CreateRenderTargetView(g.d3d10_color_stage, &rtv,
+            &g.d3d10_color_rtv);
+    if (FAILED(hr))
+    {
+        Log("[feed32] D3D10.1 source downsample pipeline creation failed: 0x%08X", hr);
+        return false;
+    }
+    return true;
+}
+
+static ID3D10ShaderResourceView *D3D10SourceSrv(ID3D10Texture2D *source)
+{
+    if (source == nullptr || g.dev10 == nullptr) return nullptr;
+    if (g.d3d10_source_texture == source && g.d3d10_source_srv != nullptr)
+        return g.d3d10_source_srv;
+
+    SafeRelease(g.d3d10_source_srv);
+    SafeRelease(g.d3d10_source_texture);
+    D3D10_TEXTURE2D_DESC source_desc = {};
+    source->GetDesc(&source_desc);
+    D3D10_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+    srv_desc.Format = g.color_fmt;
+    srv_desc.ViewDimension = D3D10_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Texture2D.MipLevels = 1;
+    HRESULT hr = g.dev10->CreateShaderResourceView(source, &srv_desc,
+        &g.d3d10_source_srv);
+    if (SUCCEEDED(hr))
+    {
+        g.d3d10_source_texture = source;
+        source->AddRef();
+        return g.d3d10_source_srv;
+    }
+
+    // Some ReShade D3D10 effect targets are render-target-only. Keep the
+    // fallback copy entirely on D3D10, then shrink it before crossing into the
+    // D3D11/shared transport instead of synchronizing a native-sized resource.
+    D3D10_TEXTURE2D_DESC fallback_desc = source_desc;
+    fallback_desc.Format = g.color_fmt;
+    fallback_desc.Usage = D3D10_USAGE_DEFAULT;
+    fallback_desc.BindFlags = D3D10_BIND_SHADER_RESOURCE;
+    fallback_desc.CPUAccessFlags = 0;
+    fallback_desc.MiscFlags = 0;
+    if (g.d3d10_fallback_source != nullptr)
+    {
+        D3D10_TEXTURE2D_DESC existing = {};
+        g.d3d10_fallback_source->GetDesc(&existing);
+        if (existing.Width != fallback_desc.Width || existing.Height != fallback_desc.Height ||
+            existing.Format != fallback_desc.Format)
+        {
+            SafeRelease(g.d3d10_fallback_source_srv);
+            SafeRelease(g.d3d10_fallback_source);
+        }
+    }
+    if (g.d3d10_fallback_source == nullptr)
+    {
+        hr = g.dev10->CreateTexture2D(&fallback_desc, nullptr,
+            &g.d3d10_fallback_source);
+        if (SUCCEEDED(hr))
+            hr = g.dev10->CreateShaderResourceView(g.d3d10_fallback_source,
+                &srv_desc, &g.d3d10_fallback_source_srv);
+        if (FAILED(hr))
+        {
+            SafeRelease(g.d3d10_fallback_source_srv);
+            SafeRelease(g.d3d10_fallback_source);
+            Log("[feed32] D3D10.1 source is not shader-readable and fallback creation failed: 0x%08X", hr);
+            return nullptr;
+        }
+        Log("[feed32] D3D10.1 source needs a local shader-readable fallback before pre-interop downsampling");
+    }
+    g.dev10->CopyResource(g.d3d10_fallback_source, source);
+    return g.d3d10_fallback_source_srv;
+}
+
+static bool DownsampleD3D10Frame(ID3D10Texture2D *source)
+{
+    if (source == nullptr || g.dev10 == nullptr || g.d3d10_color_stage == nullptr)
+        return false;
+    D3D10_TEXTURE2D_DESC source_desc = {};
+    source->GetDesc(&source_desc);
+    if (source_desc.Width == g.width && source_desc.Height == g.height)
+    {
+        g.dev10->CopyResource(g.d3d10_color_stage, source);
+        return true;
+    }
+    if (!MakeD3D10DownsamplePipeline()) return false;
+    ID3D10ShaderResourceView *source_srv = D3D10SourceSrv(source);
+    if (source_srv == nullptr) return false;
+
+    ID3D10RenderTargetView *old_rtv = nullptr;
+    ID3D10DepthStencilView *old_dsv = nullptr;
+    ID3D10VertexShader *old_vs = nullptr;
+    ID3D10GeometryShader *old_gs = nullptr;
+    ID3D10PixelShader *old_ps = nullptr;
+    ID3D10ShaderResourceView *old_srv = nullptr;
+    ID3D10SamplerState *old_sampler = nullptr;
+    ID3D10InputLayout *old_layout = nullptr;
+    ID3D10BlendState *old_blend = nullptr;
+    ID3D10DepthStencilState *old_depth = nullptr;
+    ID3D10RasterizerState *old_rasterizer = nullptr;
+    ID3D10Predicate *old_predicate = nullptr;
+    BOOL old_predicate_value = FALSE;
+    FLOAT old_blend_factor[4] = {};
+    UINT old_sample_mask = 0, old_stencil_reference = 0;
+    D3D10_PRIMITIVE_TOPOLOGY old_topology = D3D10_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    UINT viewport_count = D3D10_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    D3D10_VIEWPORT old_viewports[D3D10_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+
+    g.dev10->OMGetRenderTargets(1, &old_rtv, &old_dsv);
+    g.dev10->VSGetShader(&old_vs); g.dev10->GSGetShader(&old_gs); g.dev10->PSGetShader(&old_ps);
+    g.dev10->PSGetShaderResources(0, 1, &old_srv);
+    g.dev10->PSGetSamplers(0, 1, &old_sampler);
+    g.dev10->IAGetInputLayout(&old_layout); g.dev10->IAGetPrimitiveTopology(&old_topology);
+    g.dev10->OMGetBlendState(&old_blend, old_blend_factor, &old_sample_mask);
+    g.dev10->OMGetDepthStencilState(&old_depth, &old_stencil_reference);
+    g.dev10->RSGetState(&old_rasterizer); g.dev10->RSGetViewports(&viewport_count, old_viewports);
+    g.dev10->GetPredication(&old_predicate, &old_predicate_value);
+
+    D3D10_VIEWPORT viewport = {};
+    viewport.Width = g.width; viewport.Height = g.height; viewport.MaxDepth = 1.0f;
+    ID3D10RenderTargetView *target = g.d3d10_color_rtv;
+    ID3D10SamplerState *sampler = g.d3d10_downsample_sampler;
+    g.dev10->SetPredication(nullptr, FALSE);
+    g.dev10->RSSetViewports(1, &viewport);
+    g.dev10->RSSetState(nullptr);
+    g.dev10->OMSetRenderTargets(1, &target, nullptr);
+    g.dev10->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    g.dev10->OMSetDepthStencilState(nullptr, 0);
+    g.dev10->IASetInputLayout(nullptr);
+    g.dev10->IASetPrimitiveTopology(D3D10_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.dev10->VSSetShader(g.d3d10_downsample_vs);
+    g.dev10->GSSetShader(nullptr);
+    g.dev10->PSSetShader(g.d3d10_downsample_ps);
+    g.dev10->PSSetShaderResources(0, 1, &source_srv);
+    g.dev10->PSSetSamplers(0, 1, &sampler);
+    g.dev10->Draw(3, 0);
+
+    ID3D10ShaderResourceView *null_srv = nullptr;
+    g.dev10->PSSetShaderResources(0, 1, &null_srv);
+    g.dev10->OMSetRenderTargets(1, &old_rtv, old_dsv);
+    g.dev10->VSSetShader(old_vs); g.dev10->GSSetShader(old_gs); g.dev10->PSSetShader(old_ps);
+    g.dev10->PSSetShaderResources(0, 1, &old_srv);
+    g.dev10->PSSetSamplers(0, 1, &old_sampler);
+    g.dev10->IASetInputLayout(old_layout); g.dev10->IASetPrimitiveTopology(old_topology);
+    g.dev10->OMSetBlendState(old_blend, old_blend_factor, old_sample_mask);
+    g.dev10->OMSetDepthStencilState(old_depth, old_stencil_reference);
+    g.dev10->RSSetState(old_rasterizer);
+    if (viewport_count != 0) g.dev10->RSSetViewports(viewport_count, old_viewports);
+    g.dev10->SetPredication(old_predicate, old_predicate_value);
+
+    SafeRelease(old_predicate); SafeRelease(old_rasterizer); SafeRelease(old_depth);
+    SafeRelease(old_blend); SafeRelease(old_layout); SafeRelease(old_sampler);
+    SafeRelease(old_srv); SafeRelease(old_ps); SafeRelease(old_gs); SafeRelease(old_vs);
+    SafeRelease(old_dsv); SafeRelease(old_rtv);
+    return true;
 }
 
 static bool MakeShared(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav, bool render_target)
@@ -1496,17 +1737,29 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
         if (g.is_d3d9)
         {
             if (!CreateD3D9SharedStage(backbuffer_w, backbuffer_h, g.color_fmt,
-                                       &g.d3d9_color_stage, &g.color_stage) ||
+                                       &g.d3d9_color_stage, &g.color_stage, w, h))
+            { ReleaseShared(); return false; }
+            // The CPU fallback presents through the detached x64 carrier and
+            // never copies its output back into D3D9. Avoid a second unsupported
+            // shared-resource attempt and an unused native-size allocation.
+            if (!g.d3d9_cpu_bridge &&
                 !CreateD3D9SharedStage(backbuffer_w, backbuffer_h, g.color_fmt,
-                                       &g.d3d9_output_stage, &g.d3d9_output_stage11))
+                                       &g.d3d9_output_stage, &g.d3d9_output_stage11,
+                                       0, 0, false))
             { ReleaseShared(); return false; }
         }
         else if (g.is_d3d10)
         {
-            if (!CreateD3D10SharedStage(backbuffer_w, backbuffer_h, g.color_fmt,
+            // Scale on the D3D10.1 side before the shared D3D11 handoff. The
+            // previous path synchronized a native-sized texture and only then
+            // reduced it, which made BioShock pay the expensive interop cost at
+            // full resolution.
+            if (!CreateD3D10SharedStage(w, h, g.color_fmt,
                                         &g.d3d10_color_stage, &g.color_stage) ||
                 !CreateD3D10SharedStage(backbuffer_w, backbuffer_h, g.color_fmt,
                                         &g.d3d10_output_stage, &g.d3d9_output_stage11))
+            { ReleaseShared(); return false; }
+            if (!MakeD3D10DownsamplePipeline())
             { ReleaseShared(); return false; }
         }
         else
@@ -1531,19 +1784,29 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
         if (FAILED(g.dev->CreateShaderResourceView(g.color_stage, &ss, &g.color_stage_srv)))
         { Log("[feed32] work-resolution staging SRV failed"); ReleaseShared(); return false; }
 
-        Log("[feed32] work-resolution source: %ux%u staging copy -> %ux%u", backbuffer_w, backbuffer_h, w, h);
+        if (g.is_d3d10)
+            Log("[feed32] D3D10.1 pre-interop source downsample: %ux%u -> %ux%u shared transport",
+                backbuffer_w, backbuffer_h, w, h);
+        else
+            Log("[feed32] work-resolution source: %ux%u staging copy -> %ux%u", backbuffer_w, backbuffer_h, w, h);
     }
 
     if (legacy_surface_bridge)
     {
-        D3D11_RENDER_TARGET_VIEW_DESC rv = {};
-        rv.Format = g.color_fmt; rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-        if (FAILED(g.dev->CreateRenderTargetView(g.d3d9_output_stage11, &rv, &g.d3d9_output_rtv)))
-        { Log("[feed32] legacy output RTV failed"); ReleaseShared(); return false; }
+        if (g.d3d9_output_stage11 != nullptr)
+        {
+            D3D11_RENDER_TARGET_VIEW_DESC rv = {};
+            rv.Format = g.color_fmt; rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+            if (FAILED(g.dev->CreateRenderTargetView(g.d3d9_output_stage11, &rv, &g.d3d9_output_rtv)))
+            { Log("[feed32] legacy output RTV failed"); ReleaseShared(); return false; }
+        }
 
-        auto make_neutral = [](DXGI_FORMAT fmt, ID3D11Texture2D **tex, ID3D11ShaderResourceView **srv, const FLOAT clear[4]) -> bool {
+        const bool guides_at_work_resolution = g.d3d9_cpu_bridge || g.is_d3d10;
+        const UINT guide_w = guides_at_work_resolution ? g.width : g.backbuffer_width;
+        const UINT guide_h = guides_at_work_resolution ? g.height : g.backbuffer_height;
+        auto make_neutral = [guide_w, guide_h](DXGI_FORMAT fmt, ID3D11Texture2D **tex, ID3D11ShaderResourceView **srv, const FLOAT clear[4]) -> bool {
             D3D11_TEXTURE2D_DESC td = {};
-            td.Width = g.backbuffer_width; td.Height = g.backbuffer_height; td.MipLevels = 1; td.ArraySize = 1;
+            td.Width = guide_w; td.Height = guide_h; td.MipLevels = 1; td.ArraySize = 1;
             td.Format = fmt; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
             td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
             if (FAILED(g.dev->CreateTexture2D(&td, nullptr, tex)) ||
@@ -1559,6 +1822,15 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
         if (!make_neutral(DXGI_FORMAT_R16G16_FLOAT, &g.d3d9_zero_mv, &g.d3d9_zero_mv_srv, zero_mv) ||
             !make_neutral(DXGI_FORMAT_R32_FLOAT, &g.d3d9_zero_depth, &g.d3d9_zero_depth_srv, far_depth))
         { Log("[feed32] legacy neutral guide creation failed"); ReleaseShared(); return false; }
+        if (g.d3d9_cpu_bridge && (backbuffer_w != w || backbuffer_h != h))
+        {
+            const unsigned long long source_pixels = static_cast<unsigned long long>(backbuffer_w) * backbuffer_h;
+            const unsigned long long work_pixels = static_cast<unsigned long long>(w) * h;
+            const unsigned saved = source_pixels != 0
+                ? static_cast<unsigned>(100ull - (work_pixels * 100ull / source_pixels)) : 0;
+            Log("[feed32] classic D3D9 pre-readback downsample: %ux%u -> %ux%u (CPU transfer reduced about %u%%)",
+                backbuffer_w, backbuffer_h, w, h, saved);
+        }
     }
 
     if (!EnsureHost()) return false;
@@ -2179,6 +2451,7 @@ static void FeedFrameD3D9(reshade::api::effect_runtime *rt, reshade::api::resour
     if (FAILED(source9->GetDesc(&sd))) return;
 
     g.is_d3d9 = true;
+    g.is_d3d10 = false;
     if (g.d3d9_device_lost)
     {
         const HRESULT cooperative = device9->TestCooperativeLevel();
@@ -2236,8 +2509,8 @@ static void FeedFrameD3D9(reshade::api::effect_runtime *rt, reshade::api::resour
     if (g.d3d9_cpu_bridge) g.d3d9_resume_after = 0;
 
     const DXGI_FORMAT bb_fmt = FromD3D9Format(sd.Format);
-    const UINT work_w = ScaledExtent(sd.Width, g_cfg.work_resolution);
-    const UINT work_h = ScaledExtent(sd.Height, g_cfg.work_resolution);
+    UINT work_w = 0, work_h = 0;
+    ResolveWorkExtent(sd.Width, sd.Height, work_w, work_h);
     bool ok = bb_fmt != DXGI_FORMAT_UNKNOWN;
     if (ok && (!g.built || work_w != g.width || work_h != g.height ||
                sd.Width != g.backbuffer_width || sd.Height != g.backbuffer_height || bb_fmt != g.bb_fmt))
@@ -2269,7 +2542,14 @@ static void FeedFrameD3D9(reshade::api::effect_runtime *rt, reshade::api::resour
                 // classic D3D9. Upload to our local D3D11 staging texture; the
                 // normal resample/shared-input path continues from there.
                 D3DLOCKED_RECT locked = {};
-                capture_hr = device9->StretchRect(source9, nullptr, stage_in9, nullptr, D3DTEXF_NONE);
+                const bool pre_readback_scale = sd.Width != g.width || sd.Height != g.height;
+                capture_hr = device9->StretchRect(source9, nullptr, stage_in9, nullptr,
+                                                  pre_readback_scale ? D3DTEXF_LINEAR : D3DTEXF_NONE);
+                // A few old drivers reject linear filtering for particular RT
+                // formats but still support StretchRect scaling. Retain a
+                // point-filter fallback rather than disabling the bridge.
+                if (FAILED(capture_hr) && pre_readback_scale)
+                    capture_hr = device9->StretchRect(source9, nullptr, stage_in9, nullptr, D3DTEXF_NONE);
                 if (FAILED(capture_hr)) capture_failure = "StretchRect";
                 if (SUCCEEDED(capture_hr))
                 {
@@ -2288,7 +2568,7 @@ static void FeedFrameD3D9(reshade::api::effect_runtime *rt, reshade::api::resour
                     g.d3d9_cpu_readback->UnlockRect();
                     captured = CopyOrResampleInputs(g.ctx4, g.color_stage, g.d3d9_zero_mv, g.d3d9_zero_depth,
                                                     g.d3d9_zero_mv_srv, g.d3d9_zero_depth_srv,
-                                                    sd.Width, sd.Height);
+                                                    g.width, g.height);
                     if (!captured) capture_failure = "D3D11 upload/resample";
                 }
             }
@@ -2799,8 +3079,8 @@ static void FeedFrameD3D10(reshade::api::effect_runtime *rt, reshade::api::resou
         return;
     }
 
-    const UINT work_w = ScaledExtent(sd.Width, g_cfg.work_resolution);
-    const UINT work_h = ScaledExtent(sd.Height, g_cfg.work_resolution);
+    UINT work_w = 0, work_h = 0;
+    ResolveWorkExtent(sd.Width, sd.Height, work_w, work_h);
     bool ok = TypedColorFormat(sd.Format) != DXGI_FORMAT_UNKNOWN && sd.SampleDesc.Count == 1;
     if (ok && (!g.built || work_w != g.width || work_h != g.height ||
                sd.Width != g.backbuffer_width || sd.Height != g.backbuffer_height || sd.Format != g.bb_fmt))
@@ -2817,10 +3097,10 @@ static void FeedFrameD3D10(reshade::api::effect_runtime *rt, reshade::api::resou
 
     if (ok && g.built && HostAlive())
     {
-        device10->CopyResource(g.d3d10_color_stage, source10);
-        if (WaitForD3D10Copy() &&
+        if (DownsampleD3D10Frame(source10) && WaitForD3D10Copy() &&
             CopyOrResampleInputs(g.ctx4, g.color_stage, g.d3d9_zero_mv, g.d3d9_zero_depth,
-                                 g.d3d9_zero_mv_srv, g.d3d9_zero_depth_srv, sd.Width, sd.Height))
+                                 g.d3d9_zero_mv_srv, g.d3d9_zero_depth_srv,
+                                 g.width, g.height))
         {
             const UINT64 n = ++g.frame_n;
             const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
@@ -2930,6 +3210,7 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
     if (ok && g.dev == nullptr)
     {
         g.is_d3d9 = false;
+        g.is_d3d10 = false;
         g.owns_d3d11_device = false;
         ctx->GetDevice(&g.dev);
         if (g.dev != nullptr) g.dev->Release();   // not owned; the game outlives us
@@ -2937,8 +3218,8 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
         { FeedDisable("ID3D11DeviceContext4 unavailable (Windows 10 1703+ required)"); ok = false; }
     }
 
-    const UINT work_w = ScaledExtent(cd.Width, g_cfg.work_resolution);
-    const UINT work_h = ScaledExtent(cd.Height, g_cfg.work_resolution);
+    UINT work_w = 0, work_h = 0;
+    ResolveWorkExtent(cd.Width, cd.Height, work_w, work_h);
     if (ok && (!g.built || work_w != g.width || work_h != g.height ||
                cd.Width != g.backbuffer_width || cd.Height != g.backbuffer_height || cd.Format != g.bb_fmt))
     {
@@ -3233,6 +3514,61 @@ static void ResolveHandles(reshade::api::effect_runtime *rt, bool report_missing
         strncat_s(g_mv_problem, sizeof(g_mv_problem), more, _TRUNCATE);
     }
     if (g_mv_problem[0] && report_missing) Warn("%s", g_mv_problem);
+}
+
+// The normal AIO menu stores an exact source-resolution choice in the x64
+// carrier's ReShade.ini. Make that choice authoritative before the x86 bridge
+// captures a frame. This matters most for classic D3D9, where shrinking only
+// after GetRenderTargetData would save NR work but not CPU-transfer cost.
+static void ResolveWorkExtent(UINT source_w, UINT source_h, UINT &work_w, UINT &work_h)
+{
+    if (!g_host_nr_loaded)
+    {
+        ReadHostNR();
+        g_host_nr_loaded = true;
+    }
+
+    int source_index = -1;
+    for (int i = 0; i < NR_COUNT; ++i)
+        if (strcmp(kNR[i].key, "SourceResolutionOverride") == 0)
+        {
+            source_index = i;
+            break;
+        }
+
+    UINT requested_w = 0, requested_h = 0;
+    if (source_index >= 0)
+    {
+        const int choice = static_cast<int>(g_nr[source_index]);
+        const NRSetting &setting = kNR[source_index];
+        if (choice > 0 && choice < setting.item_count)
+        {
+            const char *dash = strchr(setting.items[choice], '-');
+            if (dash != nullptr)
+                sscanf_s(dash + 1, " %u x %u", &requested_w, &requested_h);
+        }
+    }
+
+    bool valid = requested_w >= 2 && requested_h >= 2 &&
+                 requested_w <= source_w && requested_h <= source_h;
+    if (valid)
+    {
+        const unsigned long long lhs = static_cast<unsigned long long>(requested_w) * source_h;
+        const unsigned long long rhs = static_cast<unsigned long long>(requested_h) * source_w;
+        const unsigned long long delta = lhs > rhs ? lhs - rhs : rhs - lhs;
+        valid = rhs != 0 && delta * 100ull <= rhs * 2ull;
+    }
+
+    if (valid)
+    {
+        work_w = requested_w & ~1u;
+        work_h = requested_h & ~1u;
+    }
+    else
+    {
+        work_w = ScaledExtent(source_w, g_cfg.work_resolution);
+        work_h = ScaledExtent(source_h, g_cfg.work_resolution);
+    }
 }
 
 static void RestoreD3D9StartupFocusIfReady()
