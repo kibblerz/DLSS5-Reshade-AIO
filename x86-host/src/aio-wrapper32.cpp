@@ -121,12 +121,14 @@ struct Cfg
     int   host_window;     // 1 = show the host's window (it carries the DLSS 5 tuning panel: press Home there)
     int   show_processed_output; // initial virtual-screen A/B state; F10 still toggles it live
     int   work_resolution; // 50..100 percent of each backbuffer axis; the game stays native-sized
+    int   classic_d3d9_cpu_fallback; // opt-in CPU readback when D3D9/D3D11 sharing is unsupported
+    int   classic_d3d9_fullscreen_virtualization; // opt-in initial exclusive -> borderless rewrite
     float mv_scale_x, mv_scale_y;
 };
 
 // The AIO wrapper must start in the full processing path. Mode 1 exists only
 // as a transport diagnostic and intentionally returns the unprocessed frame.
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 1, 100, 1.0f, 1.0f };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 1, 100, 0, 0, 1.0f, 1.0f };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -155,9 +157,12 @@ static void CfgWriteDefault()
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
-               "host_window=%d\nshow_processed_output=%d\nwork_resolution=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+               "host_window=%d\nshow_processed_output=%d\nwork_resolution=%d\n"
+               "classic_d3d9_cpu_fallback=%d\nclassic_d3d9_fullscreen_virtualization=%d\n"
+               "mv_scale_x=%.3f\nmv_scale_y=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.log_frames, g_cfg.host_window, g_cfg.show_processed_output, g_cfg.work_resolution,
+            g_cfg.classic_d3d9_cpu_fallback, g_cfg.classic_d3d9_fullscreen_virtualization,
             g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     fclose(f);
 }
@@ -172,9 +177,12 @@ static void CfgSave()
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
-               "host_window=%d\nshow_processed_output=%d\nwork_resolution=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+               "host_window=%d\nshow_processed_output=%d\nwork_resolution=%d\n"
+               "classic_d3d9_cpu_fallback=%d\nclassic_d3d9_fullscreen_virtualization=%d\n"
+               "mv_scale_x=%.3f\nmv_scale_y=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.log_frames, g_cfg.host_window, g_cfg.show_processed_output, g_cfg.work_resolution,
+            g_cfg.classic_d3d9_cpu_fallback, g_cfg.classic_d3d9_fullscreen_virtualization,
             g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     fclose(f);
 }
@@ -218,13 +226,19 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "host_window")    == 0) next.host_window    = iv;
         else if (_stricmp(key, "show_processed_output") == 0) next.show_processed_output = iv;
         else if (_stricmp(key, "work_resolution")== 0) next.work_resolution = iv;
+        else if (_stricmp(key, "classic_d3d9_cpu_fallback") == 0) next.classic_d3d9_cpu_fallback = iv;
+        else if (_stricmp(key, "classic_d3d9_fullscreen_virtualization") == 0) next.classic_d3d9_fullscreen_virtualization = iv;
         else if (_stricmp(key, "mv_scale_x")     == 0) next.mv_scale_x     = val;
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
     }
     fclose(f);
     if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
+    next.classic_d3d9_cpu_fallback = next.classic_d3d9_cpu_fallback != 0 ? 1 : 0;
+    next.classic_d3d9_fullscreen_virtualization =
+        next.classic_d3d9_fullscreen_virtualization != 0 ? 1 : 0;
     const bool rebuild = next.mode != g_cfg.mode || next.hdr != g_cfg.hdr ||
                          next.depth_inverted != g_cfg.depth_inverted || next.flags != g_cfg.flags ||
+                         next.classic_d3d9_cpu_fallback != g_cfg.classic_d3d9_cpu_fallback ||
                          next.mv_scale_x != g_cfg.mv_scale_x || next.mv_scale_y != g_cfg.mv_scale_y;
     const bool changed = memcmp(&next, &g_cfg, sizeof(Cfg)) != 0;
     if (changed)
@@ -1180,6 +1194,13 @@ static bool CreateD3D9SharedStage(UINT width, UINT height, DXGI_FORMAT format,
     if (FAILED(hr))
     {
         SafeRelease(*texture9); SafeRelease(*texture11);
+        if (g_cfg.classic_d3d9_cpu_fallback == 0)
+        {
+            Log("[feed32] D3D9/D3D11 shared stage unsupported: %ux%u fmt=%u hr=0x%08X; "
+                "classic D3D9 CPU fallback is disabled",
+                width, height, format, hr);
+            return false;
+        }
         // A classic IDirect3DDevice9 (rather than IDirect3DDevice9Ex) rejects
         // shared handles with D3DERR_INVALIDCALL. Keep the existing fast path
         // for Ex devices, but fall back to an ordinary render target plus a
@@ -2918,6 +2939,7 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
 // forwarding it to DXGI, then turn the real game HWND into monitor-sized
 // borderless on a worker (never mutate a window from inside the DXGI callback).
 static std::atomic<bool> g_fullscreen_virtualization_pending{false};
+static std::atomic<bool> g_classic_d3d9_swapchain_seen{false};
 
 static DWORD WINAPI DeferredFullscreenVirtualizationWorker(void *parameter)
 {
@@ -2958,8 +2980,10 @@ static DWORD WINAPI DeferredFullscreenVirtualizationWorker(void *parameter)
 static bool OnCreateSwapchain(reshade::api::device_api api,
     reshade::api::swapchain_desc &desc, void *window)
 {
+    if (api == reshade::api::device_api::d3d9)
+        g_classic_d3d9_swapchain_seen = true;
     if (g_cfg.enabled == 0 || api != reshade::api::device_api::d3d9 ||
-        !desc.fullscreen_state)
+        g_cfg.classic_d3d9_fullscreen_virtualization == 0 || !desc.fullscreen_state)
         return false;
 
     // A second, detached native-output HWND cannot coexist reliably with classic
@@ -2987,6 +3011,13 @@ static bool OnCreateSwapchain(reshade::api::device_api api,
 static bool OnSetFullscreenState(reshade::api::swapchain *swapchain, bool fullscreen, void *)
 {
     if (g_cfg.enabled == 0 || !fullscreen || swapchain == nullptr)
+        return false;
+
+    if (swapchain->get_device() == nullptr)
+        return false;
+    const auto api = swapchain->get_device()->get_api();
+    if ((api == reshade::api::device_api::d3d9 || g_classic_d3d9_swapchain_seen.load()) &&
+        g_cfg.classic_d3d9_fullscreen_virtualization == 0)
         return false;
 
     const HWND game_window = static_cast<HWND>(swapchain->get_hwnd());
@@ -3192,7 +3223,8 @@ static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::ef
 
 static void OnDestroySwapchain(reshade::api::swapchain *swapchain, bool resize)
 {
-    if (swapchain == nullptr || swapchain->get_device() == nullptr ||
+    if (g_cfg.classic_d3d9_cpu_fallback == 0 || swapchain == nullptr ||
+        swapchain->get_device() == nullptr ||
         swapchain->get_device()->get_api() != reshade::api::device_api::d3d9)
         return;
     PrepareClassicD3D9ForReset(resize ? "swapchain resize/reset" : "swapchain destruction");
@@ -3200,7 +3232,8 @@ static void OnDestroySwapchain(reshade::api::swapchain *swapchain, bool resize)
 
 static void OnInitSwapchain(reshade::api::swapchain *swapchain, bool resize)
 {
-    if (!g.is_d3d9 || swapchain == nullptr || swapchain->get_device() == nullptr ||
+    if (g_cfg.classic_d3d9_cpu_fallback == 0 || !g.is_d3d9 ||
+        swapchain == nullptr || swapchain->get_device() == nullptr ||
         swapchain->get_device()->get_api() != reshade::api::device_api::d3d9)
         return;
     g.d3d9_device_lost = false;
@@ -3536,7 +3569,45 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     DrawAioGroup(dlss5_aio_menu::Group::Output);
 
     if (ImGui::CollapsingHeader("Compatibility / troubleshooting"))
+    {
         DrawAioGroup(dlss5_aio_menu::Group::Compatibility);
+
+        ImGui::SeparatorText("Classic Direct3D 9 (32-bit only)");
+        bool cpu_fallback = g_cfg.classic_d3d9_cpu_fallback != 0;
+        if (ImGui::Checkbox("Allow classic D3D9 CPU bridge", &cpu_fallback))
+        {
+            g_cfg.classic_d3d9_cpu_fallback = cpu_fallback ? 1 : 0;
+            CfgSave();
+            g.disabled = false;
+            g.consecutive_fails = 0;
+            g_retry_at = 0;
+            g.built = false;
+            g.need_reset = true;
+            Log("[feed32] classic D3D9 CPU fallback %s; bridge rebuild requested",
+                cpu_fallback ? "enabled" : "disabled");
+        }
+        ImGui::SameLine();
+        HelpMarker("Leave disabled normally. Enable only when a 32-bit Direct3D 9 game reports that "
+                   "D3D9/D3D11 shared textures are unsupported. This slower fallback copies frames "
+                   "through system memory and can reduce performance.");
+
+        bool virtualize_fullscreen = g_cfg.classic_d3d9_fullscreen_virtualization != 0;
+        if (ImGui::Checkbox("Virtualize classic D3D9 fullscreen at startup", &virtualize_fullscreen))
+        {
+            g_cfg.classic_d3d9_fullscreen_virtualization = virtualize_fullscreen ? 1 : 0;
+            CfgSave();
+            Log("[feed32] classic D3D9 startup fullscreen virtualization %s; applies on next swapchain creation",
+                virtualize_fullscreen ? "enabled" : "disabled");
+        }
+        ImGui::SameLine();
+        HelpMarker("Leave disabled normally. Enable if a 32-bit Direct3D 9 game minimizes, loses its "
+                   "device, or cannot coexist with the detached processed-output window in exclusive "
+                   "fullscreen. Restart the game after changing this option.");
+
+        if (g.is_d3d9)
+            ImGui::TextDisabled("Current classic D3D9 transport: %s",
+                g.d3d9_cpu_bridge ? "CPU fallback" : "GPU shared textures (fast path)");
+    }
 
     ImGui::Separator();
     if (ImGui::Button("Apply settings and restart 64-bit AIO"))
