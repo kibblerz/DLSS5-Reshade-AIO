@@ -4809,7 +4809,16 @@ static bool ResourceContractIsStable(UINT capture_width, UINT capture_height,
     }
 
     const bool initial_native = !g_neural_ready && iw == ow && ih == oh;
-    const ULONGLONG settle_ms = initial_native ? kInitialNativeSettleMs : kReducedOrResizeSettleMs;
+    // The x86 carrier does not observe a game's transient startup swapchains
+    // directly: addon32 has already selected, normalized and explicitly built
+    // the shared frame contract before it sends the first frame. Treating that
+    // carrier swapchain like a native x64 game adds the full 15-second startup
+    // guard and can leave an old D3D9 title on its unprocessed image for nearly
+    // the entire loading/menu transition. Keep the frame-count stability check,
+    // but use the ordinary resize interval for an external carrier.
+    const ULONGLONG settle_ms =
+        (initial_native && g_external_game_process_id == 0) ?
+            kInitialNativeSettleMs : kReducedOrResizeSettleMs;
     const ULONGLONG elapsed = now - g_candidate_contract_since;
     if (elapsed < settle_ms || g_candidate_contract_frames < kStableContractFrames)
     {
