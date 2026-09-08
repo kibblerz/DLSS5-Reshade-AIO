@@ -566,6 +566,8 @@ static bool g_nvof_reconfigure_requested = false;
 static bool g_using_nvof_guides = false;
 static float g_nvof_consistency_threshold = 3.0f;
 static float g_nvof_cost_threshold = 0.35f;
+static int g_nvof_visualization_mode = 0;
+static float g_nvof_visualization_scale = 16.0f;
 static NvofMotionProvider g_nvof_motion;
 static bool g_nr_rejection_mask_enabled = false;
 static float g_nr_rejection_mask_strength = 1.0f;
@@ -6299,10 +6301,19 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
         Fail("on-present DLSS SR evaluation exception", exception);
         return false;
     }
+    const bool nvof_visualization_active = use_nvof_guides &&
+        g_nvof_visualization_mode > 0 &&
+        NVSDK_NGX_SUCCEED(sr_result);
+    if (nvof_visualization_active &&
+        !g_nvof_motion.RecordVisualization(commands, nvof_submission,
+            real_output, static_cast<unsigned int>(g_nvof_visualization_mode),
+            g_nvof_visualization_scale))
+        Log("NVOF diagnostic visualization could not be recorded for this frame");
     timestamp(3);
     NVSDK_NGX_Result fg_result = static_cast<NVSDK_NGX_Result>(0xBAD00004);
     bool evaluate_fg = EffectiveFramegenEnabled() && !g_framegen_failed && g_fg_feature &&
-        NVSDK_NGX_SUCCEED(nr_result) && NVSDK_NGX_SUCCEED(sr_result);
+        NVSDK_NGX_SUCCEED(nr_result) && NVSDK_NGX_SUCCEED(sr_result) &&
+        !nvof_visualization_active;
     const bool split_fg_path = evaluate_fg &&
         PhaseScheduledFrameGenerationEnabled() &&
         direct_reservation.index >= 0;
@@ -11952,6 +11963,21 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g_need_history_reset = true;
     }
     ImGui::TextDisabled("The confidence controls affect DLSS history rejection only; they never mask away the NR result.");
+    const char *nvof_visualizations[] = {
+        "Off", "Motion direction + magnitude", "Confidence / rejection heatmap"};
+    if (ImGui::Combo("NVIDIA Optical Flow diagnostic view",
+            &g_nvof_visualization_mode, nvof_visualizations,
+            static_cast<int>(std::size(nvof_visualizations))))
+    {
+        g_need_history_reset = true;
+        Log("NVOF diagnostic view changed to %d (session-only)",
+            g_nvof_visualization_mode);
+    }
+    if (g_nvof_visualization_mode == 1)
+        ImGui::SliderFloat("Motion visualization range",
+            &g_nvof_visualization_scale, 1.0f, 64.0f, "%.1f px");
+    ImGui::TextDisabled("Session-only. Motion view: hue=direction, brightness=speed. Heatmap: green=trusted, red=rejected.");
+    ImGui::TextDisabled("Diagnostic views replace the processed picture and temporarily suppress Frame Generation.");
     if (ImGui::Checkbox(dlss5_aio_menu::Label("VortGuides", "Enable VORT motion integration (experimental)"), &g_vort_guides_enabled))
     {
         reshade::set_config_value(nullptr, section, "VortGuides",

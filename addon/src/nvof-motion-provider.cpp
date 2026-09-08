@@ -16,6 +16,7 @@ namespace
 {
 constexpr unsigned int kPrepDescriptorsPerSlot = 2;
 constexpr unsigned int kConversionDescriptorsPerSlot = 6;
+constexpr unsigned int kVisualizationDescriptorsPerSlot = 3;
 
 D3D12_RESOURCE_BARRIER Transition(ID3D12Resource *resource,
     D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
@@ -149,6 +150,10 @@ bool NvofMotionProvider::CreatePipelineState()
     if (SUCCEEDED(hr))
         hr = device_->CreateDescriptorHeap(&heap,
             IID_PPV_ARGS(&conversion_descriptors_));
+    heap.NumDescriptors = kSlotCount * kVisualizationDescriptorsPerSlot;
+    if (SUCCEEDED(hr))
+        hr = device_->CreateDescriptorHeap(&heap,
+            IID_PPV_ARGS(&visualization_descriptors_));
     if (FAILED(hr))
     {
         SetStatus("Optical Flow descriptor allocation failed (0x%08X)",
@@ -158,6 +163,7 @@ bool NvofMotionProvider::CreatePipelineState()
     prep_descriptor_stride_ = device_->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     conversion_descriptor_stride_ = prep_descriptor_stride_;
+    visualization_descriptor_stride_ = prep_descriptor_stride_;
 
     D3D12_DESCRIPTOR_RANGE prep_ranges[2] = {};
     prep_ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -270,6 +276,72 @@ bool NvofMotionProvider::CreatePipelineState()
     if (SUCCEEDED(hr))
         hr = device_->CreateComputePipelineState(&conversion_pso,
             IID_PPV_ARGS(&conversion_pipeline_));
+
+    D3D12_DESCRIPTOR_RANGE visualization_ranges[2] = {};
+    visualization_ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    visualization_ranges[0].NumDescriptors = 2;
+    visualization_ranges[0].BaseShaderRegister = 0;
+    visualization_ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    visualization_ranges[1].NumDescriptors = 1;
+    visualization_ranges[1].BaseShaderRegister = 0;
+    D3D12_ROOT_PARAMETER visualization_params[3] = {};
+    for (unsigned int index = 0; index < 2; ++index)
+    {
+        visualization_params[index].ParameterType =
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        visualization_params[index].DescriptorTable.NumDescriptorRanges = 1;
+        visualization_params[index].DescriptorTable.pDescriptorRanges =
+            &visualization_ranges[index];
+        visualization_params[index].ShaderVisibility =
+            D3D12_SHADER_VISIBILITY_ALL;
+    }
+    visualization_params[2].ParameterType =
+        D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    visualization_params[2].Constants.ShaderRegister = 0;
+    visualization_params[2].Constants.Num32BitValues = 8;
+    D3D12_ROOT_SIGNATURE_DESC visualization_desc = {};
+    visualization_desc.NumParameters = 3;
+    visualization_desc.pParameters = visualization_params;
+    signature.Reset();
+    errors.Reset();
+    if (SUCCEEDED(hr))
+        hr = D3D12SerializeRootSignature(&visualization_desc,
+            D3D_ROOT_SIGNATURE_VERSION_1, &signature, &errors);
+    if (SUCCEEDED(hr))
+        hr = device_->CreateRootSignature(0, signature->GetBufferPointer(),
+            signature->GetBufferSize(), IID_PPV_ARGS(&visualization_root_));
+    static const char visualization_shader[] =
+        "Texture2D<float2> Motion:register(t0);"
+        "Texture2D<float> Rejection:register(t1);"
+        "RWTexture2D<float4> Output:register(u0);"
+        "cbuffer C:register(b0){uint SourceWidth;uint SourceHeight;"
+        "uint OutputWidth;uint OutputHeight;uint Mode;float MagnitudeScale;"
+        "uint Reserved0;uint Reserved1;}"
+        "[numthreads(8,8,1)] void CS(uint3 id:SV_DispatchThreadID){"
+        "if(id.x>=OutputWidth||id.y>=OutputHeight)return;"
+        "uint2 p=min(uint2((float2(id.xy)+0.5)*float2(SourceWidth,SourceHeight)/"
+        "float2(OutputWidth,OutputHeight)),uint2(SourceWidth-1,SourceHeight-1));"
+        "float2 mv=Motion.Load(int3(p,0));float rejection=Rejection.Load(int3(p,0));"
+        "float3 color;if(Mode==1){float angle=atan2(mv.y,mv.x)/6.2831853+0.5;"
+        "float3 hue=saturate(abs(frac(angle+float3(0,0.6666667,0.3333333))*6-3)-1);"
+        "float magnitude=1-exp(-length(mv)/max(MagnitudeScale,0.01));"
+        "color=lerp(float3(0.01,0.01,0.01),hue,magnitude);"
+        "color+=saturate(length(mv)/(MagnitudeScale*8))*0.2;}else{"
+        "color=lerp(float3(0.02,0.65,0.02),float3(1,0.02,0.02),rejection);"
+        "color+=smoothstep(0.45,0.55,rejection)*float3(0.2,0.1,0);}"
+        "Output[id.xy]=float4(color,1);}";
+    ComPtr<ID3DBlob> visualization_cs;
+    if (SUCCEEDED(hr))
+        hr = CompileShader(visualization_shader, "nvof-visualization", "CS",
+            visualization_cs, compile_error);
+    D3D12_COMPUTE_PIPELINE_STATE_DESC visualization_pso = {};
+    visualization_pso.pRootSignature = visualization_root_.Get();
+    if (visualization_cs)
+        visualization_pso.CS = {visualization_cs->GetBufferPointer(),
+            visualization_cs->GetBufferSize()};
+    if (SUCCEEDED(hr))
+        hr = device_->CreateComputePipelineState(&visualization_pso,
+            IID_PPV_ARGS(&visualization_pipeline_));
     if (FAILED(hr))
     {
         if (!compile_error.empty()) Log("shader compiler: %s", compile_error.c_str());
@@ -436,6 +508,23 @@ bool NvofMotionProvider::CreateSessionResources()
         device_->CreateUnorderedAccessView(slot.history_mask.Get(), nullptr,
             &mask_uav, CpuDescriptor(conversion_descriptors_.Get(),
                 conversion_descriptor_stride_, base + 5));
+
+        const unsigned int visualization_base =
+            index * kVisualizationDescriptorsPerSlot;
+        D3D12_SHADER_RESOURCE_VIEW_DESC motion_srv = {};
+        motion_srv.Format = DXGI_FORMAT_R16G16_FLOAT;
+        motion_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        motion_srv.Shader4ComponentMapping =
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        motion_srv.Texture2D.MipLevels = 1;
+        device_->CreateShaderResourceView(slot.motion.Get(), &motion_srv,
+            CpuDescriptor(visualization_descriptors_.Get(),
+                visualization_descriptor_stride_, visualization_base));
+        D3D12_SHADER_RESOURCE_VIEW_DESC mask_srv = motion_srv;
+        mask_srv.Format = DXGI_FORMAT_R8_UNORM;
+        device_->CreateShaderResourceView(slot.history_mask.Get(), &mask_srv,
+            CpuDescriptor(visualization_descriptors_.Get(),
+                visualization_descriptor_stride_, visualization_base + 1));
     }
     return true;
 }
@@ -566,6 +655,9 @@ void NvofMotionProvider::Shutdown()
         if (api_.nvOFDestroy) api_.nvOFDestroy(session_);
         session_ = nullptr;
     }
+    visualization_descriptors_.Reset();
+    visualization_pipeline_.Reset();
+    visualization_root_.Reset();
     conversion_descriptors_.Reset();
     conversion_pipeline_.Reset();
     conversion_root_.Reset();
@@ -828,6 +920,61 @@ bool NvofMotionProvider::RecordConversion(ID3D12GraphicsCommandList *commands,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     commands->ResourceBarrier(6, end);
     slot.converted_once = true;
+    return true;
+}
+
+bool NvofMotionProvider::RecordVisualization(
+    ID3D12GraphicsCommandList *commands, const Submission &submission,
+    ID3D12Resource *output, unsigned int mode, float magnitude_scale)
+{
+    if (!ready_ || !commands || !submission.valid ||
+        submission.slot >= kSlotCount || !output || mode < 1 || mode > 2 ||
+        !visualization_pipeline_ || !visualization_descriptors_)
+        return false;
+    const D3D12_RESOURCE_DESC output_desc = output->GetDesc();
+    if (output_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        output_desc.Width == 0 || output_desc.Height == 0)
+        return false;
+
+    const unsigned int base =
+        submission.slot * kVisualizationDescriptorsPerSlot;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC output_uav = {};
+    output_uav.Format = output_desc.Format;
+    output_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    device_->CreateUnorderedAccessView(output, nullptr, &output_uav,
+        CpuDescriptor(visualization_descriptors_.Get(),
+            visualization_descriptor_stride_, base + 2));
+
+    D3D12_RESOURCE_BARRIER output_barrier = {};
+    output_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    output_barrier.UAV.pResource = output;
+    commands->ResourceBarrier(1, &output_barrier);
+
+    ID3D12DescriptorHeap *heaps[] = {visualization_descriptors_.Get()};
+    commands->SetDescriptorHeaps(1, heaps);
+    commands->SetComputeRootSignature(visualization_root_.Get());
+    commands->SetPipelineState(visualization_pipeline_.Get());
+    commands->SetComputeRootDescriptorTable(0,
+        GpuDescriptor(visualization_descriptors_.Get(),
+            visualization_descriptor_stride_, base));
+    commands->SetComputeRootDescriptorTable(1,
+        GpuDescriptor(visualization_descriptors_.Get(),
+            visualization_descriptor_stride_, base + 2));
+    struct Constants
+    {
+        unsigned int source_width;
+        unsigned int source_height;
+        unsigned int output_width;
+        unsigned int output_height;
+        unsigned int mode;
+        float magnitude_scale;
+        unsigned int reserved0;
+        unsigned int reserved1;
+    } constants = {width_, height_, static_cast<unsigned int>(output_desc.Width),
+        output_desc.Height, mode, std::max(0.1f, magnitude_scale), 0, 0};
+    commands->SetComputeRoot32BitConstants(2, 8, &constants, 0);
+    commands->Dispatch((constants.output_width + 7) / 8,
+        (constants.output_height + 7) / 8, 1);
     return true;
 }
 
