@@ -111,6 +111,14 @@ VORT motion integration is **disabled by default** because its optical-flow and 
 
 To experiment with motion guidance, install VORT Motion and `DLSS5_AIO_Feed.fx` in the same ReShade shader search path, then enable **Enable VORT motion integration (experimental)** under the addon's Neural Rendering controls. The addon schedules both effects itself; leave their ordinary ReShade technique checkboxes disabled. Turn the option back off if performance drops or image quality does not improve. The option now supports both native D3D12 and the addon's D3D11-to-D3D12 transport.
 
+### Experimental NVIDIA Optical Flow motion
+
+Version 2.2.0 experimental 1 adds an optional motion provider backed by NVIDIA Optical Flow hardware. It derives screen-space motion from consecutive captured game frames without a game profile or VORT shader. The resulting motion vectors guide NR, DLSS/DLAA, and Frame Generation; forward/backward consistency and NVIDIA cost data build a separate rejection mask for DLSS temporal history. The private NR `ControlMask` is deliberately not used.
+
+The option is **disabled by default** and requires asynchronous NGX compute plus a supported NVIDIA GPU and driver. No extra Optical Flow DLL is included or normally installed by the user: the addon discovers the NVIDIA driver-provided `nvofapi64.dll` dynamically when the option is enabled. If initialization fails, the normal VORT or zero-motion path remains active.
+
+Use **Motion direction + magnitude** to inspect screen-space motion and **Confidence / rejection heatmap** to inspect DLSS history trust. Green means trusted history; orange/red means increasingly rejected history. Lower consistency or cost tolerances reject uncertain motion more aggressively. These controls affect DLSS history rejection, not whether NR is applied.
+
 ### Source-resolution override
 
 The source-resolution selector is separate from the game's resolution. Leave it **Disabled** for the normal path. Select a lower resolution with the same aspect ratio when the game reports the wrong source size or when you want the addon to downsample the captured frame before NR. This can reduce NR cost without changing the game's configured resolution, window size, or the final native output.
@@ -152,6 +160,7 @@ Open **ReShade > Add-ons > Standalone DLSS-NR + SR**, then expand **Compatibilit
 | **A native 32-bit D3D9 game minimizes, stays behind Steam, or cannot coexist with the processed output in exclusive fullscreen** | Enable **Virtualize classic D3D9 fullscreen at startup**, then restart. The first borderless conversion activates the game; later resets remain non-activating so normal alt-tab behavior is preserved. |
 | **The log says `required private runtime dependency missing`** | Install `nvngx.dll` beside the addon. Also supply `nvngx_dlssnr.dll` and `nvngx_dlss.dll`; `nvngx_dlssg.dll` is required for Frame Generation. |
 | **The overlay reports fallback or zero-motion guides** | This is the normal default. VORT motion integration is optional and disabled by default because it may significantly reduce performance. To test it, install `DLSS5_AIO_Feed.fx` and VORT Motion under the configured ReShade shader path, then enable **Enable VORT motion integration (experimental)**. |
+| **NVIDIA Optical Flow is unavailable after enabling it** | Confirm asynchronous NGX compute is enabled and the system has a supported NVIDIA GPU and current driver. Do not download a loose `nvofapi64.dll`; it is supplied by the NVIDIA display driver. The addon safely retains its normal guide fallback when initialization fails. |
 | **Vulkan waits for a shared frame** | Confirm ReShade's Vulkan layer is active. If no other ReShade effect is loaded, install `StandaloneBoundary.fx` so the required effects boundary runs. |
 | **A game worked in 1.x but not in 2.0** | Remove the 2.0 `standalone-dlssnr.addon64` and use [v1.7.24, the latest 1.x release](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/tag/v1.7.24). Please include the game, API, display mode, and `standalone-dlssnr.log` when reporting the 2.0 regression. |
 
@@ -336,7 +345,7 @@ Run `addon\build.bat`. The available runtime set is emitted under `addon\build`:
 - `nvngx_dlssg.dll`
 - `DLSS5_AIO_Feed.fx`
 
-Every GitHub release from v2.1.0 onward must attach exactly two end-user archives: `DLSS5-ReShade-AIO-vX.Y.Z-64-bit.zip` and `DLSS5-ReShade-AIO-vX.Y.Z-32-bit.zip`. Build both with `release\package-release.ps1 -Version vX.Y.Z`. The ZIPs contain the project-owned binaries, shaders, ready-made directory layout, notices, and architecture-specific instructions. ReShade and the NVIDIA runtime DLLs remain user-supplied and must not be attached to public releases.
+Every GitHub release from v2.1.0 onward must attach exactly two end-user archives: `DLSS5-ReShade-AIO-vX.Y.Z-64-bit.zip` and `DLSS5-ReShade-AIO-vX.Y.Z-32-bit.zip` (with an optional prerelease suffix). Build both with `release\package-release.ps1 -Version vX.Y.Z`. The ZIPs contain the project-owned binaries, shaders, ready-made directory layout, notices, and architecture-specific instructions. ReShade and the NVIDIA runtime DLLs remain user-supplied and must not be attached to public releases.
 
 Windowed mode is recommended at the desired render resolution, particularly while configuring the addon: it tends to expose the intended lower-resolution swapchain and gives the ReShade menu and processed preview separate screen space. Fullscreen and borderless remain supported where the game creates the expected backbuffer. A native-resolution game swapchain selects DLAA automatically; a lower-resolution swapchain selects DLSS Super Resolution. The addon keeps the desktop at native resolution, rejects auxiliary/helper swapchains, and presents the processed native output in its proxy window.
 
