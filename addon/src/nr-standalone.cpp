@@ -5692,6 +5692,17 @@ static bool RenderLegacyCurrentFrameGeometry(reshade::api::resource backbuffer)
 {
     using namespace reshade::api;
     g_legacy_geometry_ready = false;
+    // ReShade may finish compiling effects several seconds after runtime
+    // creation without delivering a useful reload callback to this runtime.
+    // Retry lazily from Present so an initially missing feed/depth handle does
+    // not leave the geometry option silently running plain NVOF forever.
+    if (g_runtime && (!g_feed_technique.handle || !g_depth_variable.handle))
+    {
+        static unsigned int retry_count = 0;
+        ++retry_count;
+        if (retry_count == 1 || retry_count % 30 == 0)
+            ResolveHandles(g_runtime);
+    }
     if (!g_nvof_motion_enabled || !g_nvof_depth_enabled || !backbuffer.handle ||
         !g_runtime || g_runtime->get_device()->get_api() != device_api::d3d11 ||
         !g_feed_technique.handle || !g_depth_variable.handle)
