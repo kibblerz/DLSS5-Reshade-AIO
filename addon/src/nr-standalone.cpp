@@ -566,6 +566,7 @@ static bool g_nvof_reconfigure_requested = false;
 static bool g_using_nvof_guides = false;
 static float g_nvof_consistency_threshold = 3.0f;
 static float g_nvof_cost_threshold = 0.35f;
+static bool g_nvof_nr_mask_enabled = false;
 static int g_nvof_visualization_mode = 0;
 static float g_nvof_visualization_scale = 16.0f;
 static NvofMotionProvider g_nvof_motion;
@@ -6190,9 +6191,21 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     // Strength zero is an exact bypass for this experiment: do not merely bind
     // an all-white texture, since the presence of ControlMask selects a
     // different provider path than NVIDIA's automatic mask.
-    ID3D12Resource *nr_control_mask = g_nr_rejection_mask_enabled &&
+    ID3D12Resource *nr_control_mask = nullptr;
+    const char *nr_control_mask_provider = "none";
+    if (g_nvof_nr_mask_enabled && use_nvof_guides &&
+        nvof_submission.history_mask != nullptr)
+    {
+        nr_control_mask = nvof_submission.history_mask;
+        nr_control_mask_provider = "NVOF";
+    }
+    else if (g_nr_rejection_mask_enabled &&
         g_nr_rejection_mask_strength > 0.0001f && use_vort_guides &&
-        g_nr_mask_available ? g_captured_nr_mask.Get() : nullptr;
+        g_nr_mask_available)
+    {
+        nr_control_mask = g_captured_nr_mask.Get();
+        nr_control_mask_provider = "VORT";
+    }
     const bool evaluate_second_nr = evaluate_nr && g_nr_pass_count >= 2 &&
         !g_nr_second_pass_failed && g_nr_second_feature && g_nr_second_stage;
     const bool evaluate_third_nr = evaluate_second_nr && g_nr_pass_count >= 3 &&
@@ -6535,7 +6548,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
             completed_nr_passes, g_nr_second_frames.load(), g_nr_third_frames.load(),
             SrModeName(), g_active_nr_model,
             reset ? 1 : 0, use_external_guides ? "same-frame-motion" : "fallback",
-            nr_control_mask ? "BOUND" : "none", g_nr_rejection_mask_strength,
+            nr_control_mask ? nr_control_mask_provider : "none", g_nr_rejection_mask_strength,
             g_stable_sr_history ? "per-frame-reset/zero-motion" : "temporal/VORT",
             history_mask ? "BOUND" : "none",
             g_resource_input_width, g_resource_input_height, g_resource_output_width, g_resource_output_height);
@@ -11962,7 +11975,17 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         save_float("NvidiaOpticalFlowCost", g_nvof_cost_threshold);
         g_need_history_reset = true;
     }
-    ImGui::TextDisabled("The confidence controls affect DLSS history rejection only; they never mask away the NR result.");
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("NvidiaOpticalFlowNrMask", "Apply Optical Flow rejection mask to NR (experimental)"),
+            &g_nvof_nr_mask_enabled))
+    {
+        reshade::set_config_value(nullptr, section, "NvidiaOpticalFlowNrMask",
+            g_nvof_nr_mask_enabled ? "1" : "0");
+        g_need_history_reset = true;
+        Log("NVIDIA Optical Flow NR rejection mask changed to %s",
+            g_nvof_nr_mask_enabled ? "enabled" : "disabled");
+    }
+    ImGui::TextDisabled("Off by default. Sends the red/rejected Optical Flow regions to NR as its control mask.");
+    ImGui::TextDisabled("This can reduce temporal smearing, but may suppress NR wherever the mask rejects history.");
     const char *nvof_visualizations[] = {
         "Off", "Motion direction + magnitude", "Confidence / rejection heatmap"};
     if (ImGui::Combo("NVIDIA Optical Flow diagnostic view",
@@ -12128,6 +12151,10 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         !g_nvof_motion_enabled ? "disabled" :
         g_nvof_motion.IsReady() ? g_nvof_motion.Status() : "requested / unavailable",
         g_nvof_reconfigure_requested ? " (change queued)" : "");
+    ImGui::Text("Optical Flow -> NR rejection mask: %s",
+        !g_nvof_nr_mask_enabled ? "disabled" :
+        !g_nvof_motion_enabled ? "waiting (Optical Flow is disabled)" :
+        g_using_nvof_guides ? "active" : "waiting for a valid Optical Flow frame");
     ImGui::Text("NR rejection mask: %s (strength %.2f)",
         !g_vort_guides_enabled ? "inactive (VORT integration off)" :
         !g_nr_rejection_mask_enabled ? "disabled" :
@@ -12353,6 +12380,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("NvidiaOpticalFlowMotion", "0", value, sizeof(value)); g_nvof_motion_enabled = strcmp(value, "0") != 0;
         read_setting("NvidiaOpticalFlowConsistency", "3.0", value, sizeof(value)); g_nvof_consistency_threshold = std::clamp(static_cast<float>(atof(value)), 0.5f, 12.0f);
         read_setting("NvidiaOpticalFlowCost", "0.35", value, sizeof(value)); g_nvof_cost_threshold = std::clamp(static_cast<float>(atof(value)), 0.0f, 0.99f);
+        read_setting("NvidiaOpticalFlowNrMask", "0", value, sizeof(value)); g_nvof_nr_mask_enabled = strcmp(value, "0") != 0;
         read_setting("VortGuides", "0", value, sizeof(value)); g_vort_guides_enabled = strcmp(value, "0") != 0;
         read_setting("NeuralRendering", "1", value, sizeof(value)); g_nr_enabled = strcmp(value, "0") != 0;
         // Multi-pass NR is deliberately session-only. Never inherit a risky
@@ -12416,9 +12444,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             g_opaque_composition ? "enabled" : "disabled",
             g_synchronous_proxy_presentation ? "serialized" : "asynchronous",
             g_performance_telemetry_enabled ? "enabled" : "disabled");
-        Log("NVIDIA Optical Flow prototype: requested=%s consistency=%.1fpx cost=%.2f (default off)",
+        Log("NVIDIA Optical Flow prototype: requested=%s consistency=%.1fpx cost=%.2f NR-mask=%s (default off)",
             g_nvof_motion_enabled ? "enabled" : "disabled",
-            g_nvof_consistency_threshold, g_nvof_cost_threshold);
+            g_nvof_consistency_threshold, g_nvof_cost_threshold,
+            g_nvof_nr_mask_enabled ? "enabled" : "disabled");
         if (g_startup_recovery_detected)
             Log("previous game session did not shut down cleanly; preserving configured presentation mode (automatic serialized recovery disabled): state=%s",
                 g_startup_recovery_path[0] != '\0' ? g_startup_recovery_path : "marker unavailable");
