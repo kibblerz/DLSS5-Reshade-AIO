@@ -36,7 +36,7 @@
 #include "aio-menu-schema.hpp"
 #include "nvof-motion-provider.hpp"
 
-#define ADDON_VERSION "2.2.0-nvof-depth-coverage-prototype"
+#define ADDON_VERSION "2.2.0-nvof-object-confidence-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -12079,7 +12079,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         save_float("NvidiaOpticalFlowMotionRepair", g_nvof_motion_repair_strength);
         g_need_history_reset = true;
     }
-    ImGui::TextDisabled("With geometry enabled, repairs unreliable edge vectors from nearby pixels on the same depth surface. 0=old behavior; 1=full repair.");
+    ImGui::TextDisabled("Uses nearby pixels on the same depth surface to repair motion and fill object confidence inward without bleeding in the background. 0=off; 1=full.");
     if (ImGui::Checkbox(dlss5_aio_menu::Label("NvidiaOpticalFlowSubmitDepth", "Submit captured ReShade depth directly to NGX (experimental)"),
             &g_nvof_submit_depth))
     {
