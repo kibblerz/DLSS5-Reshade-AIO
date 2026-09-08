@@ -36,7 +36,7 @@
 #include "aio-menu-schema.hpp"
 #include "nvof-motion-provider.hpp"
 
-#define ADDON_VERSION "2.2.0-nvof-object-confidence-prototype"
+#define ADDON_VERSION "2.2.0-nvof-foreground-halo-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -12073,13 +12073,13 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     }
     ImGui::TextDisabled("Opt-in D3D11 prototype. Uses game depth to reject optical-flow history across object edges; VORT is not required.");
     ImGui::TextDisabled("Restart after changing. Missing or invalid depth falls back to normal NVOF behavior.");
-    if (ImGui::SliderFloat(dlss5_aio_menu::Label("NvidiaOpticalFlowMotionRepair", "Geometry/confidence motion repair"),
+    if (ImGui::SliderFloat(dlss5_aio_menu::Label("NvidiaOpticalFlowMotionRepair", "Geometry object-fill strength"),
             &g_nvof_motion_repair_strength, 0.0f, 1.0f, "%.2f"))
     {
         save_float("NvidiaOpticalFlowMotionRepair", g_nvof_motion_repair_strength);
         g_need_history_reset = true;
     }
-    ImGui::TextDisabled("Uses nearby pixels on the same depth surface to repair motion and fill object confidence inward without bleeding in the background. 0=off; 1=full.");
+    ImGui::TextDisabled("Repairs motion/confidence inside depth objects and protects the foreground side of thin silhouettes. 0=off; 1=full.");
     if (ImGui::Checkbox(dlss5_aio_menu::Label("NvidiaOpticalFlowSubmitDepth", "Submit captured ReShade depth directly to NGX (experimental)"),
             &g_nvof_submit_depth))
     {
@@ -12088,19 +12088,21 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g_need_history_reset = true;
     }
     ImGui::TextDisabled("Off by default. Geometry still repairs motion when off; enable only to test raw game depth in NR/DLSS/FG.");
-    if (ImGui::SliderFloat(dlss5_aio_menu::Label("NvidiaOpticalFlowConsistency", "Optical Flow consistency tolerance"),
+    if (ImGui::SliderFloat(dlss5_aio_menu::Label("NvidiaOpticalFlowConsistency", "Flow disagreement tolerance"),
             &g_nvof_consistency_threshold, 0.5f, 12.0f, "%.1f px"))
     {
         save_float("NvidiaOpticalFlowConsistency", g_nvof_consistency_threshold);
         g_need_history_reset = true;
     }
-    if (ImGui::SliderFloat(dlss5_aio_menu::Label("NvidiaOpticalFlowCost", "Optical Flow cost tolerance"),
+    ImGui::TextDisabled("Raise only when moving geometry is red because forward/backward motion disagrees. Too high may trust incorrect motion.");
+    if (ImGui::SliderFloat(dlss5_aio_menu::Label("NvidiaOpticalFlowCost", "Low-texture confidence tolerance"),
             &g_nvof_cost_threshold, 0.0f, 0.99f, "%.2f"))
     {
         save_float("NvidiaOpticalFlowCost", g_nvof_cost_threshold);
         g_need_history_reset = true;
     }
-    ImGui::TextDisabled("The confidence controls affect DLSS history rejection only; they never mask away the NR result.");
+    ImGui::TextDisabled("Raise when dark or textureless moving areas remain red. Too high may trust uncertain Optical Flow data.");
+    ImGui::TextDisabled("These confidence controls affect DLSS history rejection only; they never mask away the NR result.");
     const char *nvof_visualizations[] = {
         "Off", "Motion direction + magnitude", "Confidence / rejection heatmap",
         "Geometry depth boundaries"};
