@@ -2117,21 +2117,40 @@ static void FeedFrameD3D9(reshade::api::effect_runtime *rt, reshade::api::resour
     auto *source_object = reinterpret_cast<IUnknown *>(resource.handle);
     if (source_object == nullptr) return;
 
-    // Some native D3D9 games expose ReShade's effect target as the internal
-    // D3D10.1 texture even though the API identity remains D3D9. Select the
-    // transport from the actual COM resource type rather than the API label.
+    // ReShade's D3D9 resource-view handle is an IDirect3DResource9. Depending
+    // on the game/backend, that may be either a surface directly or the parent
+    // texture (New Vegas uses the latter). Resolve a level-zero surface before
+    // falling through to the internal D3D10.1 effect-renderer route.
     IDirect3DSurface9 *source9 = nullptr;
     if (FAILED(source_object->QueryInterface(__uuidof(IDirect3DSurface9),
             reinterpret_cast<void **>(&source9))) || source9 == nullptr)
     {
-        static bool reported_d3d10_effect_target = false;
-        if (!reported_d3d10_effect_target)
+        IDirect3DTexture9 *source_texture9 = nullptr;
+        if (SUCCEEDED(source_object->QueryInterface(__uuidof(IDirect3DTexture9),
+                reinterpret_cast<void **>(&source_texture9))) && source_texture9 != nullptr)
         {
-            reported_d3d10_effect_target = true;
-            Log("[feed32] D3D9 API exposes a D3D10.1 effect target; selecting the ReShade D3D10.1 transport");
+            const HRESULT surface_hr = source_texture9->GetSurfaceLevel(0, &source9);
+            source_texture9->Release();
+            if (FAILED(surface_hr)) source9 = nullptr;
+            static bool reported_d3d9_texture_target = false;
+            if (source9 != nullptr && !reported_d3d9_texture_target)
+            {
+                reported_d3d9_texture_target = true;
+                Log("[feed32] D3D9 effect target is a texture; capturing its level-zero surface");
+            }
         }
-        FeedFrameD3D10(rt, rtv);
-        return;
+
+        if (source9 == nullptr)
+        {
+            static bool reported_d3d10_effect_target = false;
+            if (!reported_d3d10_effect_target)
+            {
+                reported_d3d10_effect_target = true;
+                Log("[feed32] D3D9 API exposes a non-D3D9 effect target; trying the ReShade D3D10.1 transport");
+            }
+            FeedFrameD3D10(rt, rtv);
+            return;
+        }
     }
 
     LARGE_INTEGER t0 = {}, t1 = {};
