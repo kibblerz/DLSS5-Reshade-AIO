@@ -34,8 +34,9 @@
 #include "../../external/DLSS5-Feeder/src/feed_vk_hook.h"
 #include "performance-telemetry.h"
 #include "aio-menu-schema.hpp"
+#include "nvof-motion-provider.hpp"
 
-#define ADDON_VERSION "2.1.3"
+#define ADDON_VERSION "2.2.0-nvof-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -560,6 +561,12 @@ static float g_nr_skin_structure = -1.0f;
 static bool g_reset_every_frame = false;
 static bool g_stable_sr_history = false;
 static bool g_vort_guides_enabled = false;
+static bool g_nvof_motion_enabled = false;
+static bool g_nvof_reconfigure_requested = false;
+static bool g_using_nvof_guides = false;
+static float g_nvof_consistency_threshold = 3.0f;
+static float g_nvof_cost_threshold = 0.35f;
+static NvofMotionProvider g_nvof_motion;
 static bool g_nr_rejection_mask_enabled = false;
 static float g_nr_rejection_mask_strength = 1.0f;
 static bool g_nr_enabled = true;
@@ -1181,6 +1188,11 @@ static void Log(const char *format, ...)
     }
     LeaveCriticalSection(&g_log_lock);
     reshade::log::message(reshade::log::level::info, message);
+}
+
+static void LogNvof(const char *message)
+{
+    Log("NVOF: %s", message ? message : "unknown status");
 }
 
 static const char *DlssRenderPresetName(DlssRenderPreset preset)
@@ -1985,6 +1997,40 @@ static bool AsyncFgGpuIdle()
 {
     return !g_async_fg_fence || g_async_fg_fence_value == 0 ||
         g_async_fg_fence->GetCompletedValue() >= g_async_fg_fence_value;
+}
+
+static bool InitializeNvofMotion()
+{
+    if (!g_nvof_motion_enabled) return true;
+    if (g_nvof_motion.IsReady()) return true;
+    if (!g_async_compute_active || !g_async_compute_queue || !g_neural_device ||
+        !g_neural_fence || g_resource_input_width == 0 ||
+        g_resource_input_height == 0)
+    {
+        Log("NVOF requested but asynchronous D3D12 host resources are unavailable; zero-motion/VORT fallback remains active");
+        return false;
+    }
+    return g_nvof_motion.Initialize(g_neural_device.Get(),
+        g_async_compute_queue.Get(), g_neural_fence.Get(),
+        g_resource_input_width, g_resource_input_height,
+        g_resource_input_format, LogNvof);
+}
+
+static void ServiceNvofReconfiguration()
+{
+    if (!g_nvof_reconfigure_requested) return;
+    if (!NeuralGpuIdle() || !AsyncFgGpuIdle() || !g_nvof_motion.IsIdle())
+        return;
+    g_nvof_motion.Shutdown();
+    g_using_nvof_guides = false;
+    if (g_nvof_motion_enabled)
+        InitializeNvofMotion();
+    g_nvof_reconfigure_requested = false;
+    g_need_history_reset = true;
+    Log("NVIDIA Optical Flow motion provider %s: %s",
+        g_nvof_motion.IsReady() ? "active" :
+            (g_nvof_motion_enabled ? "unavailable" : "disabled"),
+        g_nvof_motion.Status());
 }
 
 static UINT64 AsyncFgOutstandingJobs()
@@ -3703,6 +3749,14 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
     if (!WaitForNeuralGpu(0, false, "resolution transition GPU fence"))
         return false;
 
+    if (!g_nvof_motion.IsIdle())
+    {
+        Log("resolution reconfiguration deferred: NVIDIA Optical Flow work is still active");
+        return false;
+    }
+    g_nvof_motion.Shutdown();
+    g_using_nvof_guides = false;
+
     DWORD exception = 0;
     if (g_fg_feature)
     {
@@ -5073,6 +5127,8 @@ static bool EnsureStandaloneResources(UINT capture_width, UINT capture_height, D
     if (!CreateGuideTexture(iw, ih, DXGI_FORMAT_R16G16_FLOAT, motion_clear, 0, g_fallback_motion) ||
         !CreateGuideTexture(iw, ih, DXGI_FORMAT_R32_FLOAT, depth_clear, 1, g_fallback_depth) ||
         !InitializeAsyncFallbackGuides()) return false;
+    if (g_nvof_motion_enabled && !InitializeNvofMotion())
+        Log("NVOF prototype did not initialize; continuing with the normal guide path");
     if (!InitializeNgx() || !CreateFeatures()) return false;
     PublishOutput(g_sr_stage.Get());
     g_neural_ready = true;
@@ -5735,10 +5791,14 @@ static bool CaptureAsyncD3D12Backbuffer(PipelineFrameSlot &slot,
     const D3D12_BOX source_box = {0, 0, 0,
         g_resource_input_width, g_resource_input_height, 1};
     slot.capture_list->CopyTextureRegion(&target, 0, 0, 0, &source, &source_box);
+    const D3D12_RESOURCE_STATES destination_state =
+        g_nvof_motion_enabled && g_nvof_motion.IsReady() ?
+            D3D12_RESOURCE_STATE_COMMON :
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     D3D12_RESOURCE_BARRIER end[2] = {
         Transition(backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT),
         Transition(destination, D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+            destination_state)
     };
     slot.capture_list->ResourceBarrier(2, end);
     }
@@ -5862,6 +5922,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
             LegacyCaptureSlotReserved;
     if (prepared_capture_slot >= 0 && !mailbox_d3d11_input) return false;
     if ((!legacy_input && !EnsureStandaloneResources(backbuffer)) || (legacy_input && !g_neural_ready)) return false;
+    ServiceNvofReconfiguration();
     if (g_feature_recreate_requested.load())
     {
         if (!NeuralGpuIdle()) return false;
@@ -5921,23 +5982,20 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     }
     const bool evaluate_nr = g_nr_enabled && g_nr_feature != nullptr;
 
-    bool use_external_guides = false;
+    bool use_vort_guides = false;
     if (!legacy_input && !SourceResolutionOverrideActive())
-        use_external_guides = RenderCurrentFrameGuides(backbuffer);
+        use_vort_guides = RenderCurrentFrameGuides(backbuffer);
     else if (!SourceResolutionOverrideActive() &&
         g_present_api == reshade::api::device_api::d3d11 && !mailbox_d3d11_input)
     {
-        use_external_guides = g_legacy_guides_ready && CapturedGuidesMatchInput();
+        use_vort_guides = g_legacy_guides_ready && CapturedGuidesMatchInput();
         g_legacy_guides_ready = false;
     }
-    if (use_external_guides != g_using_external_guides)
-    {
-        g_using_external_guides = use_external_guides;
-        g_need_history_reset = true;
-        Log("on-present guide source changed to %s", use_external_guides ? "same-frame VORT optical flow" : "internal zero-motion fallback");
-    }
-    ID3D12Resource *motion = use_external_guides ? g_captured_motion.Get() : g_fallback_motion.Get();
-    ID3D12Resource *depth = use_external_guides ? g_captured_depth.Get() : g_fallback_depth.Get();
+    ID3D12Resource *motion = use_vort_guides ? g_captured_motion.Get() : g_fallback_motion.Get();
+    ID3D12Resource *depth = use_vort_guides ? g_captured_depth.Get() : g_fallback_depth.Get();
+    bool use_external_guides = use_vort_guides;
+    bool use_nvof_guides = false;
+    NvofMotionProvider::Submission nvof_submission;
 
     if (DirectOutputHandoffEnabled())
     {
@@ -5964,6 +6022,40 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     {
         pipeline_slot.state.store(PipelineSlotFree, std::memory_order_release);
         return false;
+    }
+
+    const bool pending_history_reset = g_need_history_reset || g_reset_every_frame;
+    if (g_nvof_motion_enabled && g_nvof_motion.IsReady())
+    {
+        if (QueueAsyncInputDependency(pipeline_slot) &&
+            g_nvof_motion.Submit(packed_color, D3D12_RESOURCE_STATE_COMMON,
+                source_sequence, pending_history_reset, nvof_submission) &&
+            nvof_submission.valid)
+        {
+            const HRESULT wait_hr = g_async_compute_queue->Wait(
+                g_nvof_motion.CompletionFence(),
+                nvof_submission.completion_value);
+            if (SUCCEEDED(wait_hr))
+            {
+                use_nvof_guides = true;
+                use_external_guides = true;
+                motion = nvof_submission.motion;
+            }
+            else
+                Log("NVOF completion dependency failed: 0x%08X; using normal guides",
+                    static_cast<unsigned int>(wait_hr));
+        }
+    }
+    if (use_external_guides != g_using_external_guides ||
+        use_nvof_guides != g_using_nvof_guides)
+    {
+        g_using_external_guides = use_external_guides;
+        g_using_nvof_guides = use_nvof_guides;
+        g_need_history_reset = true;
+        Log("on-present guide source changed to %s",
+            use_nvof_guides ? "NVIDIA hardware optical flow" :
+            use_vort_guides ? "same-frame VORT motion" :
+            "internal zero-motion fallback");
     }
 
     if (!BeginNeuralFrameCommands(slot_index)) return false;
@@ -6019,7 +6111,19 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
         commands->ResourceBarrier(1, &input_to_srv);
     }
 
-    if (legacy_input && use_external_guides)
+    if (use_nvof_guides && !g_nvof_motion.RecordConversion(commands,
+            nvof_submission, g_nvof_consistency_threshold,
+            g_nvof_cost_threshold))
+    {
+        use_nvof_guides = false;
+        use_external_guides = use_vort_guides;
+        motion = use_vort_guides ? g_captured_motion.Get() :
+            g_fallback_motion.Get();
+        g_using_nvof_guides = false;
+        Log("NVOF vector conversion failed; using the normal guide path for this frame");
+    }
+
+    if (legacy_input && use_vort_guides)
     {
         D3D12_RESOURCE_BARRIER guide_barriers[4] = {};
         UINT guide_count = 0;
@@ -6085,7 +6189,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     // an all-white texture, since the presence of ControlMask selects a
     // different provider path than NVIDIA's automatic mask.
     ID3D12Resource *nr_control_mask = g_nr_rejection_mask_enabled &&
-        g_nr_rejection_mask_strength > 0.0001f && use_external_guides &&
+        g_nr_rejection_mask_strength > 0.0001f && use_vort_guides &&
         g_nr_mask_available ? g_captured_nr_mask.Get() : nullptr;
     const bool evaluate_second_nr = evaluate_nr && g_nr_pass_count >= 2 &&
         !g_nr_second_pass_failed && g_nr_second_feature && g_nr_second_stage;
@@ -6181,7 +6285,10 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     // Keep motion-guided NR, but do not let generic optical-flow errors persist
     // through DLSS SR's temporal accumulator in the stable mode.
     ID3D12Resource *sr_motion = g_stable_sr_history ? g_fallback_motion.Get() : motion;
-    ID3D12Resource *history_mask = !g_stable_sr_history && use_external_guides && g_mask_available ? g_captured_mask.Get() : nullptr;
+    ID3D12Resource *history_mask = !g_stable_sr_history ?
+        (use_nvof_guides ? nvof_submission.history_mask :
+            (use_vort_guides && g_mask_available ? g_captured_mask.Get() : nullptr)) :
+        nullptr;
     const bool sr_reset = g_stable_sr_history || reset;
     SetSrEvaluationContract(sr_color, real_output, depth, sr_motion, history_mask, sr_reset);
     NVSDK_NGX_Result sr_result = static_cast<NVSDK_NGX_Result>(0xBAD00004);
@@ -6257,7 +6364,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     if (legacy_input)
         restore[restore_count++] = Transition(packed_color,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    if (legacy_input && use_external_guides)
+    if (legacy_input && use_vort_guides)
     {
         restore[restore_count++] = Transition(motion,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -6308,6 +6415,9 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
             D3D12_QUERY_TYPE_TIMESTAMP, 0, kTelemetryQueryCount,
             pipeline_slot.telemetry_readback.Get(), 0);
     if (!SubmitNeuralFrameCommands(slot_index)) return false;
+    if (use_nvof_guides)
+        g_nvof_motion.MarkNeuralUse(nvof_submission,
+            pipeline_slot.neural_fence_value);
     if (mailbox_d3d11_input)
         capture_reservation.Commit(pipeline_slot.neural_fence_value);
     if (split_fg)
@@ -6327,6 +6437,9 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
             split_fg = false;
             pipeline_slot.fg_split_submission = false;
         }
+        else if (use_nvof_guides)
+            g_nvof_motion.MarkConsumerUse(nvof_submission,
+                g_async_fg_fence.Get(), g_async_fg_fence_value);
     }
     if (direct_reservation.index >= 0)
     {
@@ -11815,6 +11928,30 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     if (ImGui::SliderFloat(dlss5_aio_menu::Label("LocalTone", "Local tone strength"), &g_nr_local_tone, 0.0f, 2.0f, "%.2f")) save_float("LocalTone", g_nr_local_tone);
     if (ImGui::SliderFloat(dlss5_aio_menu::Label("LocalStructure", "Local structure strength"), &g_nr_local_structure, 0.0f, 2.0f, "%.2f")) save_float("LocalStructure", g_nr_local_structure);
     if (ImGui::SliderFloat(dlss5_aio_menu::Label("SkinStructure", "Skin / character structure"), &g_nr_skin_structure, -1.0f, 1.0f, "%.2f")) save_float("SkinStructure", g_nr_skin_structure);
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("NvidiaOpticalFlowMotion", "NVIDIA Optical Flow motion (experimental)"), &g_nvof_motion_enabled))
+    {
+        reshade::set_config_value(nullptr, section, "NvidiaOpticalFlowMotion",
+            g_nvof_motion_enabled ? "1" : "0");
+        g_nvof_reconfigure_requested = true;
+        g_need_history_reset = true;
+        Log("NVIDIA Optical Flow motion changed to %s; reconfiguration queued",
+            g_nvof_motion_enabled ? "enabled" : "disabled");
+    }
+    ImGui::TextDisabled("Off by default. Uses the NVIDIA driver's hardware Optical Flow engine; no game profile or VORT shader is required.");
+    ImGui::TextDisabled("Requires asynchronous NGX compute. It may compete with Frame Generation for Optical Flow hardware on some GPUs.");
+    if (ImGui::SliderFloat(dlss5_aio_menu::Label("NvidiaOpticalFlowConsistency", "Optical Flow consistency tolerance"),
+            &g_nvof_consistency_threshold, 0.5f, 12.0f, "%.1f px"))
+    {
+        save_float("NvidiaOpticalFlowConsistency", g_nvof_consistency_threshold);
+        g_need_history_reset = true;
+    }
+    if (ImGui::SliderFloat(dlss5_aio_menu::Label("NvidiaOpticalFlowCost", "Optical Flow cost tolerance"),
+            &g_nvof_cost_threshold, 0.0f, 0.99f, "%.2f"))
+    {
+        save_float("NvidiaOpticalFlowCost", g_nvof_cost_threshold);
+        g_need_history_reset = true;
+    }
+    ImGui::TextDisabled("The confidence controls affect DLSS history rejection only; they never mask away the NR result.");
     if (ImGui::Checkbox(dlss5_aio_menu::Label("VortGuides", "Enable VORT motion integration (experimental)"), &g_vort_guides_enabled))
     {
         reshade::set_config_value(nullptr, section, "VortGuides",
@@ -11951,12 +12088,20 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g_framegen_failed ? "failed/off" : (EffectiveFramegenEnabled() ? "2x" : "off"),
         g_active_nr_model);
     ImGui::Text("Contract: %ux%u -> %ux%u", g_input_width.load(), g_input_height.load(), g_output_width.load(), g_output_height.load());
+    const char *guide_status = g_using_nvof_guides ?
+        "NVIDIA hardware Optical Flow" :
+        (g_vort_guides_enabled && g_using_external_guides ?
+            "same-frame VORT motion" : "zero-motion fallback");
     ImGui::Text("NR guides: %s; DLSS SR history: %s; validation mask=%s",
-        !g_vort_guides_enabled ? "VORT disabled / zero-motion default" :
-            g_using_external_guides ? "same-frame VORT optical flow" : "VORT requested / zero-motion fallback",
+        guide_status,
         g_stable_sr_history ? "per-frame reset / zero motion" :
-            g_vort_guides_enabled && g_using_external_guides ? "experimental temporal VORT" : "temporal zero motion",
-        g_mask_available ? "valid" : "automatic mask");
+            g_using_external_guides ? "motion-guided temporal" : "temporal zero motion",
+        g_using_nvof_guides ? "NVOF consistency/cost" :
+            (g_mask_available ? "VORT valid" : "automatic mask"));
+    ImGui::Text("NVIDIA Optical Flow: %s%s",
+        !g_nvof_motion_enabled ? "disabled" :
+        g_nvof_motion.IsReady() ? g_nvof_motion.Status() : "requested / unavailable",
+        g_nvof_reconfigure_requested ? " (change queued)" : "");
     ImGui::Text("NR rejection mask: %s (strength %.2f)",
         !g_vort_guides_enabled ? "inactive (VORT integration off)" :
         !g_nr_rejection_mask_enabled ? "disabled" :
@@ -12179,6 +12324,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("NrRejectionStrength", "1.0", value, sizeof(value)); g_nr_rejection_mask_strength = std::clamp(static_cast<float>(atof(value)), 0.0f, 1.0f);
         read_setting("ResetEveryFrame", "0", value, sizeof(value)); g_reset_every_frame = strcmp(value, "0") != 0;
         read_setting("StableSrHistory", "0", value, sizeof(value)); g_stable_sr_history = strcmp(value, "0") != 0;
+        read_setting("NvidiaOpticalFlowMotion", "0", value, sizeof(value)); g_nvof_motion_enabled = strcmp(value, "0") != 0;
+        read_setting("NvidiaOpticalFlowConsistency", "3.0", value, sizeof(value)); g_nvof_consistency_threshold = std::clamp(static_cast<float>(atof(value)), 0.5f, 12.0f);
+        read_setting("NvidiaOpticalFlowCost", "0.35", value, sizeof(value)); g_nvof_cost_threshold = std::clamp(static_cast<float>(atof(value)), 0.0f, 0.99f);
         read_setting("VortGuides", "0", value, sizeof(value)); g_vort_guides_enabled = strcmp(value, "0") != 0;
         read_setting("NeuralRendering", "1", value, sizeof(value)); g_nr_enabled = strcmp(value, "0") != 0;
         // Multi-pass NR is deliberately session-only. Never inherit a risky
@@ -12242,6 +12390,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             g_opaque_composition ? "enabled" : "disabled",
             g_synchronous_proxy_presentation ? "serialized" : "asynchronous",
             g_performance_telemetry_enabled ? "enabled" : "disabled");
+        Log("NVIDIA Optical Flow prototype: requested=%s consistency=%.1fpx cost=%.2f (default off)",
+            g_nvof_motion_enabled ? "enabled" : "disabled",
+            g_nvof_consistency_threshold, g_nvof_cost_threshold);
         if (g_startup_recovery_detected)
             Log("previous game session did not shut down cleanly; preserving configured presentation mode (automatic serialized recovery disabled): state=%s",
                 g_startup_recovery_path[0] != '\0' ? g_startup_recovery_path : "marker unavailable");

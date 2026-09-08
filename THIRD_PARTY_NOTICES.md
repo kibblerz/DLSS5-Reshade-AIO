@@ -15,6 +15,11 @@ NVIDIA NGX, DLSS, DLSS Frame Generation, and DLSS Neural Rendering runtime binar
 
 NVIDIA, DLSS, and related product names are trademarks or registered trademarks of NVIDIA Corporation. This project is independent and is not endorsed by NVIDIA.
 
+The experimental NVIDIA Optical Flow motion provider vendors the public NVIDIA Optical Flow SDK 5.0 interface headers `nvOpticalFlowCommon.h` and `nvOpticalFlowD3D12.h`. Their original copyright and permissive license notices are retained in each header. At runtime, the provider dynamically loads the Optical Flow API installed by the NVIDIA display driver; this repository does not redistribute that driver library.
+
+- [`NVIDIA Optical Flow SDK`](https://developer.nvidia.com/opticalflow-sdk)
+- [`NVIDIA Optical Flow documentation`](https://docs.nvidia.com/video-technologies/optical-flow-sdk/)
+
 ## ReShade
 
 ReShade is developed by Patrick Mours and contributors and is governed by its own license. This project is a ReShade addon and is not affiliated with or endorsed by the ReShade project. Relevant ReShade notices are retained in the dependency tree.
