@@ -36,7 +36,7 @@
 #include "aio-menu-schema.hpp"
 #include "nvof-motion-provider.hpp"
 
-#define ADDON_VERSION "2.2.0-nvof-depth-dilation-prototype"
+#define ADDON_VERSION "2.2.0-nvof-depth-coverage-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
