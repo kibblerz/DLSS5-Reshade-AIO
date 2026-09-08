@@ -35,7 +35,7 @@
 #include "performance-telemetry.h"
 #include "aio-menu-schema.hpp"
 
-#define ADDON_VERSION "2.1.1"
+#define ADDON_VERSION "2.1.2"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =

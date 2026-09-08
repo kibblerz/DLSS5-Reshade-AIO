@@ -55,7 +55,7 @@
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
 #include "aio-menu-schema.hpp"
 
-#define FEED_VERSION "2.1.1"
+#define FEED_VERSION "2.1.2"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR (32-bit wrapper) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =

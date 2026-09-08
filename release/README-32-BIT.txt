@@ -31,5 +31,12 @@ needs Windows' real DXGI library and a duplicate local proxy can prevent the
 addon from loading. DLSS5_Feed_D3D9.fx is included and enabled automatically.
 No dgVoodoo wrapper is required. OpenGL and Vulkan x86 remain experimental.
 
+For older native D3D9 games that remain on Ready or report unsupported shared
+textures, open Compatibility / troubleshooting and enable "Allow classic D3D9
+CPU bridge". If exclusive fullscreen minimizes, stays behind Steam, or cannot
+show the processed output, also enable "Virtualize classic D3D9 fullscreen at
+startup" and restart the game. Both options remain off by default and are only
+needed for classic D3D9 compatibility.
+
 Full setup and troubleshooting:
 https://github.com/kibblerz/DLSS5-Reshade-AIO

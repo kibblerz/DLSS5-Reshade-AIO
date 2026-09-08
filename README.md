@@ -148,6 +148,8 @@ Open **ReShade > Add-ons > Standalone DLSS-NR + SR**, then expand **Compatibilit
 | **The addon is missing from ReShade** | Confirm ReShade was installed with addon support and that you extracted the ZIP matching the game's architecture. For 64-bit games, `standalone-dlssnr.addon64` belongs beside the game executable. For 32-bit games, `standalone-dlssnr.addon32` belongs beside the game executable and the x64 processing files remain under `host64`. |
 | **A 32-bit game says the host process is not running** | Keep `AIO DLSS5 32-bit Wrapper.exe`, `standalone-dlssnr.addon64`, the included `nvngx.dll`, 64-bit ReShade `dxgi.dll`, and all NVIDIA runtime DLLs together inside `host64`. Do not place the x64 files beside the 32-bit game executable. Check `dlss5-aio-x86.log` in the game folder and the logs under `host64`. |
 | **A native 32-bit D3D9 game reports addon load error 1359** | Keep the game's 32-bit ReShade proxy named `d3d9.dll`. Remove or rename any duplicate ReShade proxy named `dxgi.dll` beside that D3D9 executable; the bridge must resolve Windows' real DXGI library. This does not apply to `host64\dxgi.dll`, which is required. |
+| **A native 32-bit D3D9 game stays on Ready, reports shared textures are unsupported, or never shows processed output** | Enable **Allow classic D3D9 CPU bridge**. This copies the completed D3D9 frame through system memory and is slower than GPU sharing, but supports older non-D3D9Ex devices. |
+| **A native 32-bit D3D9 game minimizes, stays behind Steam, or cannot coexist with the processed output in exclusive fullscreen** | Enable **Virtualize classic D3D9 fullscreen at startup**, then restart. The first borderless conversion activates the game; later resets remain non-activating so normal alt-tab behavior is preserved. |
 | **The log says `required private runtime dependency missing`** | Install `nvngx.dll` beside the addon. Also supply `nvngx_dlssnr.dll` and `nvngx_dlss.dll`; `nvngx_dlssg.dll` is required for Frame Generation. |
 | **The overlay reports fallback or zero-motion guides** | This is the normal default. VORT motion integration is optional and disabled by default because it may significantly reduce performance. To test it, install `DLSS5_AIO_Feed.fx` and VORT Motion under the configured ReShade shader path, then enable **Enable VORT motion integration (experimental)**. |
 | **Vulkan waits for a shared frame** | Confirm ReShade's Vulkan layer is active. If no other ReShade effect is loaded, install `StandaloneBoundary.fx` so the required effects boundary runs. |
@@ -183,6 +185,14 @@ The new **Compatibility / troubleshooting** panel provides opt-in fixes for game
 Resolution transitions are serialized outside the game's DXGI callback, failed sessions can recover into serialized mode by holding **F8** during launch, and startup contract changes hold the last completed native frame instead of repeatedly exposing the low-resolution game surface.
 
 Because presentation behavior varies substantially between engines, 2.0 may work better or worse than 1.x in a particular game. Keep [v1.7.24](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/tag/v1.7.24) available as the stable 1.x fallback and report regressions with the game name, graphics API, display mode, and persistent addon log.
+
+### Version 2.1.2
+
+- Broadens native 32-bit D3D9 capture to effect targets exposed as D3D9 surfaces, D3D9 textures, or ReShade's internal D3D10.1 resources.
+- Adds an opt-in CPU capture bridge for classic non-D3D9Ex devices that reject shared textures, with non-blocking loading recovery instead of a stuck game or permanently disabled pipeline.
+- Reduces unnecessary x86-carrier startup delay while retaining presentation-contract stabilization for normal 64-bit games.
+- Fixes virtualized D3D9 games launching behind Steam by activating the first borderless startup window while keeping later mode changes non-activating.
+- Resolves feed techniques after asynchronous ReShade shader compilation and avoids compiling the heavy motion-provider feed on legacy D3D9.
 
 ### Version 2.1.1
 
