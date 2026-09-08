@@ -28,7 +28,8 @@ foreach ($runtime in 'nvngx_dlssnr.dll', 'nvngx_dlss.dll', 'nvngx_dlssg.dll') {
     Copy-Item -LiteralPath (Join-Path $RuntimeSource $runtime) -Destination (Join-Path $hostDirectory $runtime) -Force
 }
 Copy-Item -LiteralPath (Join-Path $root 'addon\shaders\DLSS5_AIO_Feed.fx') -Destination (Join-Path $hostShaders 'DLSS5_AIO_Feed.fx') -Force
-Copy-Item -LiteralPath (Join-Path $root 'external\DLSS5-Feeder\shaders\DLSS5_Feed.fx') -Destination (Join-Path $gameShaders 'DLSS5_Feed.fx') -Force
+Copy-Item -LiteralPath (Join-Path $root 'x86-host\shaders\DLSS5_Feed.fx') -Destination (Join-Path $gameShaders 'DLSS5_Feed.fx') -Force
+Copy-Item -LiteralPath (Join-Path $root 'external\DLSS5-Feeder\shaders\DLSS5_Feed.fx') -Destination (Join-Path $gameShaders 'DLSS5_Feed_impl.fxh') -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'shaders\DLSS5_Feed_D3D9.fx') -Destination (Join-Path $gameShaders 'DLSS5_Feed_D3D9.fx') -Force
 foreach ($include in 'ReShade.fxh', 'ReShadeUI.fxh') {
     Copy-Item -LiteralPath (Join-Path $ReShadeShaderSource $include) -Destination (Join-Path $gameShaders $include) -Force
