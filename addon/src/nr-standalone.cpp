@@ -36,7 +36,7 @@
 #include "aio-menu-schema.hpp"
 #include "nvof-motion-provider.hpp"
 
-#define ADDON_VERSION "2.2.0-nvof-depth-repair-prototype"
+#define ADDON_VERSION "2.2.0-nvof-depth-dilation-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -569,6 +569,7 @@ static bool g_using_nvof_depth = false;
 static float g_nvof_consistency_threshold = 3.0f;
 static float g_nvof_cost_threshold = 0.35f;
 static float g_nvof_motion_repair_strength = 1.0f;
+static bool g_nvof_submit_depth = false;
 static int g_nvof_visualization_mode = 0;
 static float g_nvof_visualization_scale = 16.0f;
 static NvofMotionProvider g_nvof_motion;
@@ -6196,7 +6197,8 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
         g_using_nvof_guides = false;
         Log("NVOF vector conversion failed; using the normal guide path for this frame");
     }
-    else if (use_nvof_guides && use_nvof_geometry && nvof_submission.depth)
+    else if (use_nvof_guides && use_nvof_geometry && g_nvof_submit_depth &&
+        nvof_submission.depth)
         depth = nvof_submission.depth;
 
     if (legacy_input && use_vort_guides)
@@ -12077,7 +12079,15 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         save_float("NvidiaOpticalFlowMotionRepair", g_nvof_motion_repair_strength);
         g_need_history_reset = true;
     }
-    ImGui::TextDisabled("With geometry enabled, attenuates unreliable vectors before NR, DLSS, and FG. 0=old behavior; 1=maximum stabilization.");
+    ImGui::TextDisabled("With geometry enabled, repairs unreliable edge vectors from nearby pixels on the same depth surface. 0=old behavior; 1=full repair.");
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("NvidiaOpticalFlowSubmitDepth", "Submit captured ReShade depth directly to NGX (experimental)"),
+            &g_nvof_submit_depth))
+    {
+        reshade::set_config_value(nullptr, section, "NvidiaOpticalFlowSubmitDepth",
+            g_nvof_submit_depth ? "1" : "0");
+        g_need_history_reset = true;
+    }
+    ImGui::TextDisabled("Off by default. Geometry still repairs motion when off; enable only to test raw game depth in NR/DLSS/FG.");
     if (ImGui::SliderFloat(dlss5_aio_menu::Label("NvidiaOpticalFlowConsistency", "Optical Flow consistency tolerance"),
             &g_nvof_consistency_threshold, 0.5f, 12.0f, "%.1f px"))
     {
@@ -12488,6 +12498,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("NvidiaOpticalFlowConsistency", "3.0", value, sizeof(value)); g_nvof_consistency_threshold = std::clamp(static_cast<float>(atof(value)), 0.5f, 12.0f);
         read_setting("NvidiaOpticalFlowCost", "0.35", value, sizeof(value)); g_nvof_cost_threshold = std::clamp(static_cast<float>(atof(value)), 0.0f, 0.99f);
         read_setting("NvidiaOpticalFlowMotionRepair", "1.0", value, sizeof(value)); g_nvof_motion_repair_strength = std::clamp(static_cast<float>(atof(value)), 0.0f, 1.0f);
+        read_setting("NvidiaOpticalFlowSubmitDepth", "0", value, sizeof(value)); g_nvof_submit_depth = strcmp(value, "0") != 0;
         read_setting("VortGuides", "0", value, sizeof(value)); g_vort_guides_enabled = strcmp(value, "0") != 0;
         read_setting("NeuralRendering", "1", value, sizeof(value)); g_nr_enabled = strcmp(value, "0") != 0;
         // Multi-pass NR is deliberately session-only. Never inherit a risky
