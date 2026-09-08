@@ -385,6 +385,7 @@ struct Feed32
     ULONGLONG               d3d9_pending_deadline;
     ULONGLONG               d3d9_resume_after;
     bool                    d3d9_device_lost;
+    bool                    d3d9_startup_focus_restored;
     ID3D11Texture2D        *d3d9_output_stage11;
     ID3D11RenderTargetView *d3d9_output_rtv;
     ID3D11Texture2D        *d3d9_zero_mv;
@@ -899,6 +900,7 @@ static void LogHostNR(const char *what)
 static void HostClose();   // below
 static HWND FindHostProxyWindow();
 static void HideClassicD3D9Proxy();
+static void RestoreD3D9StartupFocusIfReady();
 
 static bool TryApplyLiveHostSettings()
 {
@@ -2209,6 +2211,7 @@ static void FeedFrameD3D9(reshade::api::effect_runtime *rt, reshade::api::resour
             g.need_reset = true;
             ++g.frames_done;
             g.consecutive_fails = 0;
+            RestoreD3D9StartupFocusIfReady();
         }
         else
         {
@@ -2335,6 +2338,7 @@ static void FeedFrameD3D9(reshade::api::effect_runtime *rt, reshade::api::resour
                     {
                         const UINT64 done = ++g.frames_done;
                         g.consecutive_fails = 0;
+                        RestoreD3D9StartupFocusIfReady();
                         if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
                             Log("[feed32] frame %llu delivered (%ux%u, reset=%d, classic D3D9 CPU capture)",
                                 done, g.width, g.height, reset);
@@ -3215,6 +3219,47 @@ static void ResolveHandles(reshade::api::effect_runtime *rt, bool report_missing
         strncat_s(g_mv_problem, sizeof(g_mv_problem), more, _TRUNCATE);
     }
     if (g_mv_problem[0] && report_missing) Warn("%s", g_mv_problem);
+}
+
+static void RestoreD3D9StartupFocusIfReady()
+{
+    if (g.d3d9_startup_focus_restored || FindHostProxyWindow() == nullptr ||
+        g.runtime == nullptr)
+        return;
+
+    const HWND game_window = static_cast<HWND>(g.runtime->get_hwnd());
+    if (game_window == nullptr || !IsWindow(game_window)) return;
+
+    DWORD foreground_process = 0;
+    const HWND foreground = GetForegroundWindow();
+    if (foreground != nullptr)
+        GetWindowThreadProcessId(foreground, &foreground_process);
+    if (foreground_process == GetCurrentProcessId())
+    {
+        g.d3d9_startup_focus_restored = true;
+        return;
+    }
+
+    // The detached host is deliberately non-activating. If it becomes ready
+    // while Steam or an Unreal splash window is foreground, an old D3D9 game
+    // that was converted from exclusive fullscreen may never activate its new
+    // borderless HWND on its own. Perform the handoff from inside the game
+    // process once the processed proxy actually exists; the host watchdog can
+    // then validate the real game PID normally without weakening its desktop
+    // escape safety.
+    if (IsIconic(game_window)) ShowWindowAsync(game_window, SW_RESTORE);
+    else ShowWindowAsync(game_window, SW_SHOW);
+    SetForegroundWindow(game_window);
+
+    foreground_process = 0;
+    const HWND restored = GetForegroundWindow();
+    if (restored != nullptr)
+        GetWindowThreadProcessId(restored, &foreground_process);
+    if (foreground_process == GetCurrentProcessId())
+    {
+        g.d3d9_startup_focus_restored = true;
+        Log("[feed32] processed carrier ready; startup focus handed back to the D3D9 game");
+    }
 }
 
 static ULONGLONG g_next_effect_resolve_tick;
