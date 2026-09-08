@@ -2108,27 +2108,51 @@ static ID3D11Texture2D *AsTexture2D(ID3D11Resource *res, D3D11_TEXTURE2D_DESC *d
     return tex;
 }
 
+static void FeedFrameD3D10(reshade::api::effect_runtime *rt, reshade::api::resource_view rtv);
+
 static void FeedFrameD3D9(reshade::api::effect_runtime *rt, reshade::api::resource_view rtv)
 {
-    LARGE_INTEGER t0 = {}, t1 = {};
-    QueryPerformanceCounter(&t0);
     auto *dev_api = rt->get_device();
     auto resource = dev_api->get_resource_from_view(rtv);
-    auto *source9 = reinterpret_cast<IDirect3DSurface9 *>(resource.handle);
-    if (source9 == nullptr) return;
+    auto *source_object = reinterpret_cast<IUnknown *>(resource.handle);
+    if (source_object == nullptr) return;
+
+    // Some native D3D9 games expose ReShade's effect target as the internal
+    // D3D10.1 texture even though the API identity remains D3D9. Select the
+    // transport from the actual COM resource type rather than the API label.
+    IDirect3DSurface9 *source9 = nullptr;
+    if (FAILED(source_object->QueryInterface(__uuidof(IDirect3DSurface9),
+            reinterpret_cast<void **>(&source9))) || source9 == nullptr)
+    {
+        static bool reported_d3d10_effect_target = false;
+        if (!reported_d3d10_effect_target)
+        {
+            reported_d3d10_effect_target = true;
+            Log("[feed32] D3D9 API exposes a D3D10.1 effect target; selecting the ReShade D3D10.1 transport");
+        }
+        FeedFrameD3D10(rt, rtv);
+        return;
+    }
+
+    LARGE_INTEGER t0 = {}, t1 = {};
+    QueryPerformanceCounter(&t0);
 
     // ReShade's D3D9 effect runtime may be backed by its internal D3D10.1
-    // renderer. In that configuration get_native() is not guaranteed to be the
-    // IDirect3DDevice9 that owns this effect render target (Fallout New Vegas
-    // returns a non-COM value there). The surface itself is authoritative and
-    // always returns the actual owning D3D9 device.
-    struct ScopedD3D9Device
+    // renderer. get_native() is therefore not guaranteed to be the D3D9 device
+    // that owns this render target. The surface itself is authoritative.
+    struct ScopedD3D9Refs
     {
+        IDirect3DSurface9 *surface = nullptr;
         IDirect3DDevice9 *value = nullptr;
-        ~ScopedD3D9Device() { if (value != nullptr) value->Release(); }
-    } device_ref;
-    if (FAILED(source9->GetDevice(&device_ref.value)) || device_ref.value == nullptr) return;
-    IDirect3DDevice9 *const device9 = device_ref.value;
+        ~ScopedD3D9Refs()
+        {
+            if (value != nullptr) value->Release();
+            if (surface != nullptr) surface->Release();
+        }
+    } refs;
+    refs.surface = source9;
+    if (FAILED(source9->GetDevice(&refs.value)) || refs.value == nullptr) return;
+    IDirect3DDevice9 *const device9 = refs.value;
 
     D3DSURFACE_DESC sd = {};
     if (FAILED(source9->GetDesc(&sd))) return;
@@ -2710,13 +2734,24 @@ static void FeedFrameD3D10(reshade::api::effect_runtime *rt, reshade::api::resou
     LARGE_INTEGER t0 = {}, t1 = {};
     QueryPerformanceCounter(&t0);
     auto *dev_api = rt->get_device();
-    auto *device10 = reinterpret_cast<ID3D10Device1 *>(dev_api->get_native());
     auto resource = dev_api->get_resource_from_view(rtv);
-    auto *source_resource = reinterpret_cast<ID3D10Resource *>(resource.handle);
+    auto *source_object = reinterpret_cast<IUnknown *>(resource.handle);
     ID3D10Texture2D *source10 = nullptr;
-    if (device10 == nullptr || source_resource == nullptr ||
-        FAILED(source_resource->QueryInterface(__uuidof(ID3D10Texture2D), reinterpret_cast<void **>(&source10))) ||
+    if (source_object == nullptr ||
+        FAILED(source_object->QueryInterface(__uuidof(ID3D10Texture2D), reinterpret_cast<void **>(&source10))) ||
         source10 == nullptr) return;
+
+    ID3D10Device *device10_base = nullptr;
+    ID3D10Device1 *device10 = nullptr;
+    source10->GetDevice(&device10_base);
+    HRESULT device_hr = device10_base != nullptr ?
+        device10_base->QueryInterface(__uuidof(ID3D10Device1), reinterpret_cast<void **>(&device10)) : E_NOINTERFACE;
+    SafeRelease(device10_base);
+    if (FAILED(device_hr) || device10 == nullptr)
+    {
+        SafeRelease(source10);
+        return;
+    }
     D3D10_TEXTURE2D_DESC sd = {};
     source10->GetDesc(&sd);
 
@@ -2724,10 +2759,11 @@ static void FeedFrameD3D10(reshade::api::effect_runtime *rt, reshade::api::resou
     g.is_d3d9 = false;
     if (ApplyPendingWorkResolution()) g.built = false;
     if ((g.frames_done % 60) == 0 && CfgReload()) g.built = false;
-    if (!g_cfg.enabled || g_cfg.mode == 0) { source10->Release(); return; }
+    if (!g_cfg.enabled || g_cfg.mode == 0) { SafeRelease(device10); SafeRelease(source10); return; }
     if (!InitializeD3D10Transport(device10))
     {
-        source10->Release();
+        SafeRelease(device10);
+        SafeRelease(source10);
         FeedDisable("ReShade D3D10.1 transport initialization failed");
         return;
     }
@@ -2787,7 +2823,8 @@ static void FeedFrameD3D10(reshade::api::effect_runtime *rt, reshade::api::resou
     }
     else if (ok && !HostAlive() && g.hproc != nullptr) HostLost("process died");
 
-    source10->Release();
+    SafeRelease(device10);
+    SafeRelease(source10);
     QueryPerformanceCounter(&t1);
     TimingTick(t0.QuadPart, t1.QuadPart);
 }
