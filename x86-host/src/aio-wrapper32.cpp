@@ -2342,7 +2342,15 @@ static void FeedFrameD3D9(reshade::api::effect_runtime *rt, reshade::api::resour
                     else
                     {
                         g.d3d9_pending_frame = n;
-                        g.d3d9_pending_deadline = GetTickCount64() + 3000;
+                        // Feature creation in the x64 carrier can legitimately
+                        // hold its first NGX frame for several seconds. The game
+                        // is already back on its original D3D9 presentation path
+                        // here and no unsignalled wait was queued on either game
+                        // GPU stream, so allowing a longer CPU-side recovery
+                        // window is safe. The old three-second deadline raced NR
+                        // initialization in New Vegas and disabled the bridge a
+                        // fraction of a second before the carrier became ready.
+                        g.d3d9_pending_deadline = GetTickCount64() + 15000;
                         g.d3d9_resume_after = GetTickCount64() + 1500;
                         g.need_reset = true;
                         HideClassicD3D9Proxy();
