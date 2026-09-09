@@ -2,6 +2,11 @@
 
 Bring Neural Rendering, DLAA/DLSS Super Resolution, and Frame Generation to supported 32-bit and 64-bit Windows games even when the game does not include those features. The normal addon supports 64-bit D3D9, D3D11, D3D12, and Vulkan games through ReShade. The 32-bit package uses a small x86 capture addon and a bundled x64 carrier so the same 64-bit AIO processing pipeline can handle the game frame.
 
+> [!IMPORTANT]
+> **NVIDIA Optical Flow motion stabilization is now integrated.** It analyzes consecutive game frames with NVIDIA's driver-provided Optical Flow hardware, then supplies stable screen-space motion to Neural Rendering, DLSS/DLAA, and Frame Generation. In multi-game testing this has **massively reduced boiling, smearing, and ghosting**, including with the demanding **3x NR** mode. The stable motion history keeps reconstructed details anchored between frames instead of allowing each NR pass to reinterpret moving edges independently.
+>
+> Optical Flow remains experimental because its GPU cost varies by game. Version 2.2.0 Experimental 1 exposes it as an opt-in feature; current development builds enable it by default. It can be disabled persistently, requires no separately downloaded Optical Flow DLL, and safely falls back to VORT or zero-motion guides if the NVIDIA provider is unavailable.
+
 This project's original code and documentation are licensed under the [Apache License 2.0](LICENSE). Forks and redistributed derivatives must preserve the license and the attribution in [`NOTICE`](NOTICE), retain applicable notices, and mark modified files. Third-party components and NVIDIA runtime files remain under their own terms; see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 > [!NOTE]
@@ -77,7 +82,8 @@ The x86 package supports native 32-bit D3D9 and D3D11 output. ReShade 6 presents
 5. If a lower game resolution still reports **DLAA**, the game is still presenting a native-size backbuffer. Try windowed mode first, then borderless or fullscreen; restart after changing modes if necessary. Alternatively, select a lower pipeline source override to activate DLSS without changing the game resolution.
 6. Neural Rendering and Frame Generation are enabled by default and can be toggled independently in ReShade. Disabling both leaves an SR/DLAA-only pipeline.
 7. **NR pass count** offers optional 2x and 3x high-cost quality experiments. It always returns to 1x when the game starts and is never saved, so a crash during a multi-pass test cannot leave the next launch stuck in that mode.
-8. The source and native resolutions are shown at the top of the addon menu. Confirm they match the intended pipeline. The addon reports **DLAA** when source and native match, and **DLSS** when the source is smaller.
+8. For the cleanest temporal result, enable **NVIDIA Optical Flow motion** and confirm the add-on status reports the NVIDIA hardware provider rather than VORT or zero-motion fallback. This is particularly valuable with 2x or 3x NR, where unstable motion can otherwise be amplified by every pass.
+9. The source and native resolutions are shown at the top of the addon menu. Confirm they match the intended pipeline. The addon reports **DLAA** when source and native match, and **DLSS** when the source is smaller.
 
 Reduced-resolution DLSS SR can provide major performance improvements. Native-resolution DLAA instead prioritizes image quality.
 
@@ -110,6 +116,18 @@ These presets tune reconstruction behavior; they do not change the input resolut
 VORT motion integration is **disabled by default** because its optical-flow and guide-conversion passes can have a substantial performance cost. The addon normally uses its zero-motion fallback and does not require VORT.
 
 To experiment with motion guidance, install VORT Motion and `DLSS5_AIO_Feed.fx` in the same ReShade shader search path, then enable **Enable VORT motion integration (experimental)** under the addon's Neural Rendering controls. The addon schedules both effects itself; leave their ordinary ReShade technique checkboxes disabled. Turn the option back off if performance drops or image quality does not improve. The option now supports both native D3D12 and the addon's D3D11-to-D3D12 transport.
+
+### NVIDIA Optical Flow motion — major artifact reduction (experimental)
+
+Version 2.2.0 Experimental 1 adds a motion provider backed by NVIDIA Optical Flow hardware. It derives screen-space motion from consecutive captured game frames without a per-game profile or VORT shader. The resulting motion vectors guide NR, DLSS/DLAA, and Frame Generation; forward/backward consistency and NVIDIA cost data build a separate rejection mask for DLSS temporal history. The private NR `ControlMask` is deliberately not used.
+
+The practical improvement is strongest in motion. Optical Flow gives the temporal stages a stable estimate of where pixels moved, so fine geometry, lighting detail, and reconstructed texture are less likely to trail, boil, smear, or be regenerated in a different place. This can transform 2x and 3x NR from an unstable or holographic-looking image into a much more consistent one. It cannot guarantee perfect motion in every scene—disocclusions, thin geometry, transparency, particles, and rapid camera movement can still produce artifacts—but it is the recommended motion source when quality matters.
+
+The public 2.2.0 Experimental 1 build leaves the option manual; current development builds enable it by default. It requires asynchronous NGX compute plus a supported NVIDIA GPU and driver. Users can disable it persistently in the add-on menu if its cost is too high in a particular game. No extra Optical Flow DLL is included or normally installed by the user: the addon discovers the NVIDIA driver-provided `nvofapi64.dll` dynamically. If initialization fails, the normal VORT or zero-motion path remains active. The optional ReShade depth-geometry enhancement remains disabled by default.
+
+Use **Motion direction + magnitude** to inspect screen-space motion and **Confidence / rejection heatmap** to inspect DLSS history trust. Green means trusted history; orange/red means increasingly rejected history. Lower consistency or cost tolerances reject uncertain motion more aggressively. These controls affect DLSS history rejection, not whether NR is applied.
+
+For a first test, leave the tolerances at their defaults, enable Optical Flow, and compare movement rather than a still frame. Look for reduced trails behind characters, fewer crawling or boiling edges, and details that remain attached during camera motion. If processed FPS drops substantially, lower the pipeline source resolution or disable Optical Flow for that game; multiple NR passes already multiply NR cost and leave less GPU headroom for motion analysis.
 
 ### Source-resolution override
 
@@ -152,6 +170,8 @@ Open **ReShade > Add-ons > Standalone DLSS-NR + SR**, then expand **Compatibilit
 | **A native 32-bit D3D9 game minimizes, stays behind Steam, or cannot coexist with the processed output in exclusive fullscreen** | Enable **Virtualize classic D3D9 fullscreen at startup**, then restart. The first borderless conversion activates the game; later resets remain non-activating so normal alt-tab behavior is preserved. |
 | **The log says `required private runtime dependency missing`** | Install `nvngx.dll` beside the addon. Also supply `nvngx_dlssnr.dll` and `nvngx_dlss.dll`; `nvngx_dlssg.dll` is required for Frame Generation. |
 | **The overlay reports fallback or zero-motion guides** | This is the normal default. VORT motion integration is optional and disabled by default because it may significantly reduce performance. To test it, install `DLSS5_AIO_Feed.fx` and VORT Motion under the configured ReShade shader path, then enable **Enable VORT motion integration (experimental)**. |
+| **NVIDIA Optical Flow reports unavailable** | Confirm asynchronous NGX compute is enabled and the system has a supported NVIDIA GPU and current driver. Do not download a loose `nvofapi64.dll`; it is supplied by the NVIDIA display driver. The addon safely retains its normal VORT or zero-motion fallback when initialization fails. |
+| **Optical Flow greatly reduces artifacts but costs too much performance** | Lower the pipeline source resolution first. If the game still loses too much processed FPS, disable **NVIDIA Optical Flow motion** for that game; the choice persists and the addon falls back safely. 2x/3x NR also multiplies NR cost, so validate Optical Flow at 1x before increasing the pass count. |
 | **Vulkan waits for a shared frame** | Confirm ReShade's Vulkan layer is active. If no other ReShade effect is loaded, install `StandaloneBoundary.fx` so the required effects boundary runs. |
 | **A game worked in 1.x but not in 2.0** | Remove the 2.0 `standalone-dlssnr.addon64` and use [v1.7.24, the latest 1.x release](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/tag/v1.7.24). Please include the game, API, display mode, and `standalone-dlssnr.log` when reporting the 2.0 regression. |
 
@@ -174,7 +194,6 @@ The persistent log records `early_proxy=enabled` at startup when the saved setti
 - The processed side preview is designed primarily for reduced-resolution windowed mode. Fullscreen and borderless behavior while ReShade is open remains game-dependent.
 - No Man's Sky and potentially other Vulkan games may not display the ReShade menu correctly.
 - Additional game-specific and Vulkan issues are expected.
-- The experimental VORT NR rejection mask currently behaves more like a hard gate than a gradual blend at nonzero strength. Leave it disabled unless testing this feature; strength zero is an exact bypass that restores NVIDIA automatic masking.
 
 ## What changed in 2.x
 
@@ -185,6 +204,15 @@ The new **Compatibility / troubleshooting** panel provides opt-in fixes for game
 Resolution transitions are serialized outside the game's DXGI callback, failed sessions can recover into serialized mode by holding **F8** during launch, and startup contract changes hold the last completed native frame instead of repeatedly exposing the low-resolution game surface.
 
 Because presentation behavior varies substantially between engines, 2.0 may work better or worse than 1.x in a particular game. Keep [v1.7.24](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/tag/v1.7.24) available as the stable 1.x fallback and report regressions with the game name, graphics API, display mode, and persistent addon log.
+
+### Version 2.2.0 Experimental 1
+
+- Adds NVIDIA Optical Flow as a profile-free motion source for NR, DLSS/DLAA, and Frame Generation.
+- Massively reduces temporal boiling, smearing, and ghosting in tested games, with especially visible stabilization at 2x and 3x NR.
+- Adds motion-vector and confidence/rejection diagnostic views for tuning and verification.
+- Loads the Optical Flow API supplied by the NVIDIA display driver; users do not install a separate `nvofapi64.dll`.
+- Falls back safely to VORT or zero-motion guides when the provider is unsupported or disabled.
+- Remains experimental because the performance cost and the handling of thin geometry, transparency, and disocclusions vary by game.
 
 ### Version 2.1.3
 
