@@ -36,7 +36,7 @@
 #include "aio-menu-schema.hpp"
 #include "nvof-motion-provider.hpp"
 
-#define ADDON_VERSION "2.2.0-nvof-pipelined-smooth-prototype"
+#define ADDON_VERSION "2.2.0-nvof-liveness-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -579,6 +579,12 @@ static std::atomic<unsigned long long> g_nvof_staged_not_ready{0};
 static std::atomic<unsigned long long> g_nvof_staged_backpressure_holds{0};
 static std::atomic<unsigned int> g_nvof_staged_latency_us{0};
 static std::atomic<unsigned int> g_nvof_staged_latency_peak_us{0};
+static std::atomic<unsigned long long> g_nvof_watchdog_drains{0};
+static std::atomic<unsigned long long> g_nvof_watchdog_resets{0};
+static std::atomic<unsigned long long> g_nvof_watchdog_stalls{0};
+static ULONGLONG g_nvof_watchdog_saturated_tick;
+static ULONGLONG g_nvof_watchdog_last_log_tick;
+static unsigned long long g_nvof_watchdog_saturated_sequence;
 static bool g_nr_rejection_mask_enabled = false;
 static float g_nr_rejection_mask_strength = 1.0f;
 static bool g_nr_enabled = true;
@@ -1751,6 +1757,11 @@ static void ResetPerformanceTelemetry()
     g_async_fg_completed_in_time = 0; g_async_fg_phase_waits = 0;
     g_async_fg_common_phase_deferrals = 0;
     g_async_fg_common_phase_logged = false;
+    g_nvof_watchdog_drains = 0; g_nvof_watchdog_resets = 0;
+    g_nvof_watchdog_stalls = 0;
+    g_nvof_watchdog_saturated_tick = 0;
+    g_nvof_watchdog_last_log_tick = 0;
+    g_nvof_watchdog_saturated_sequence = 0;
     g_adaptive_governor_wait_us = 0;
     g_adaptive_governor_waits = 0;
     g_telemetry_samples = 0;
@@ -6805,6 +6816,106 @@ static bool DispatchCompletedNvofPipelineFrame(ID3D12Resource *d3d12_backbuffer)
     return false;
 }
 
+static void ResetNvofPipelineWatchdog()
+{
+    g_nvof_watchdog_saturated_tick = 0;
+    g_nvof_watchdog_saturated_sequence = 0;
+}
+
+static bool NvofPipelineRingFullyPending()
+{
+    ReclaimPipelineFrameSlots();
+    for (const PipelineFrameSlot &slot : g_pipeline_slots)
+    {
+        if (slot.state.load(std::memory_order_acquire) != PipelineSlotNvofPending)
+            return false;
+    }
+    return true;
+}
+
+// A completed NVOF slot normally gets claimed while a newer flow job is being
+// staged. If all pipeline slots become NVOF-pending first, however, the next
+// Present cannot acquire the recording slot needed to reach that claim path.
+// Drain one completed job before attempting another capture. This is both the
+// normal full-ring escape hatch and the first stage of the liveness watchdog.
+static bool ServiceNvofPipelineLiveness(ID3D12Resource *d3d12_backbuffer)
+{
+    if (!g_nvof_motion_enabled || !g_nvof_motion.IsReady() ||
+        !NvofPipelineRingFullyPending())
+    {
+        ResetNvofPipelineWatchdog();
+        return false;
+    }
+
+    const ULONGLONG now = GetTickCount64();
+    const unsigned long long source_sequence =
+        g_source_frame_sequence.load(std::memory_order_acquire);
+    if (g_nvof_watchdog_saturated_tick == 0)
+    {
+        g_nvof_watchdog_saturated_tick = now;
+        g_nvof_watchdog_saturated_sequence = source_sequence;
+    }
+
+    if (DispatchCompletedNvofPipelineFrame(d3d12_backbuffer))
+    {
+        const unsigned long long drains = ++g_nvof_watchdog_drains;
+        if (now - g_nvof_watchdog_saturated_tick >= 250 ||
+            drains <= 4 || drains % 600 == 0)
+            Log("NVOF liveness drain dispatched a completed full-ring frame (drain=%llu stalled=%llums source_delta=%llu)",
+                drains, now - g_nvof_watchdog_saturated_tick,
+                source_sequence >= g_nvof_watchdog_saturated_sequence ?
+                    source_sequence - g_nvof_watchdog_saturated_sequence : 0);
+        ResetNvofPipelineWatchdog();
+        return true;
+    }
+
+    const ULONGLONG stalled_ms = now - g_nvof_watchdog_saturated_tick;
+    const unsigned long long source_delta =
+        source_sequence >= g_nvof_watchdog_saturated_sequence ?
+            source_sequence - g_nvof_watchdog_saturated_sequence : 0;
+    if (stalled_ms < 2000 || source_delta < 30)
+        return false;
+
+    if (g_nvof_watchdog_last_log_tick == 0 ||
+        now - g_nvof_watchdog_last_log_tick >= 5000)
+    {
+        g_nvof_watchdog_last_log_tick = now;
+        const unsigned long long stalls = ++g_nvof_watchdog_stalls;
+        Log("NVOF liveness watchdog: full pending ring made no dispatch progress for %llums across %llu source frames (stall=%llu provider_idle=%u)",
+            stalled_ms, source_delta, stalls, g_nvof_motion.IsIdle() ? 1u : 0u);
+    }
+
+    // Only tear down registered NVOF resources after every provider, neural,
+    // and split-FG fence has completed. This recovers inconsistent bookkeeping
+    // without ever freeing a texture that the GPU or NVOFA may still own.
+    if (!g_nvof_motion.IsIdle() || !NeuralGpuIdle() || !AsyncFgGpuIdle())
+        return false;
+
+    unsigned int released = 0;
+    for (PipelineFrameSlot &slot : g_pipeline_slots)
+    {
+        unsigned int expected = PipelineSlotNvofPending;
+        if (slot.state.compare_exchange_strong(expected, PipelineSlotFree,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+            slot.staged_nvof = {};
+            slot.staged_nvof_qpc = {};
+            slot.staged_nvof_reset = false;
+            ++released;
+        }
+    }
+    g_nvof_motion.Shutdown();
+    const bool restarted = InitializeNvofMotion();
+    g_using_nvof_guides = false;
+    g_using_nvof_depth = false;
+    g_need_history_reset = true;
+    const unsigned long long resets = ++g_nvof_watchdog_resets;
+    Log("NVOF liveness watchdog safely reset %u idle pending slots and %s the provider (reset=%llu)",
+        released, restarted ? "restarted" : "could not restart", resets);
+    ResetNvofPipelineWatchdog();
+    return false;
+}
+
 static WPARAM MouseMessageKeyState(UINT message, DWORD mouse_data)
 {
     UINT keys = 0;
@@ -9128,6 +9239,9 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
             g_nvof_staged_backpressure_holds.load(),
             g_nvof_staged_latency_us.load() / 1000.0f,
             g_nvof_staged_latency_peak_us.load() / 1000.0f);
+        Log("performance NVOF liveness: full-ring-drains=%llu stalls=%llu safe-resets=%llu",
+            g_nvof_watchdog_drains.load(), g_nvof_watchdog_stalls.load(),
+            g_nvof_watchdog_resets.load());
         Log("performance proxy: GPU generated=%.3fms real=%.3fms pair=%.3fms samples=%llu available=%u; CPU mailbox=%.3fms fence_wait=%.3fms swap_wait=%.3fms pacing_wait=%.3fms Present=%.3fms worker=%.3fms peak=%.3fms; output interval current=%.3fms avg=%.3fms peak=%.3fms generated->real=%.3fms real->generated=%.3fms target=%uHz late=%llu; requests=%llu completed=%llu coalesced=%llu timeouts=%llu display_backpressure=%llu; neural deferrals presenter=%llu GPU=%llu",
             g_gpu_proxy_generated_us.load() / 1000.0f, g_gpu_proxy_real_us.load() / 1000.0f,
             g_gpu_proxy_total_us.load() / 1000.0f, g_proxy_telemetry_samples.load(),
@@ -11446,6 +11560,12 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
                 g_pending_proxy_frame = true;
             return;
         }
+        if (ServiceNvofPipelineLiveness(backbuffer))
+        {
+            if (g_nr_output != nullptr && EnsureProxy(g_nr_output))
+                g_pending_proxy_frame = true;
+            return;
+        }
         if (!ExecuteOnPresentPipeline(backbuffer))
         {
             // A genuinely full pipeline ring is fail-open: the existing proxy
@@ -11524,7 +11644,7 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
                 AcquirePipelineFrameSlot() : -1;
             if (api == reshade::api::device_api::d3d11 && prepared_slot < 0)
             {
-                if (DispatchCompletedNvofPipelineFrame(nullptr) &&
+                if (ServiceNvofPipelineLiveness(nullptr) &&
                     g_nr_output != nullptr && EnsureProxy(g_nr_output))
                 {
                     g_pending_proxy_frame = true;
