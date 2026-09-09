@@ -6209,13 +6209,16 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
                 &ready_submission, ready_sequence, ready_reset);
         }
 
-        // Priming the first NVOF history frame and temporary NVOF surface
-        // pressure must not evaluate a one-off zero-motion frame. Alternating
-        // the guide contract forces temporal resets and produces a periodic
-        // step-like hitch despite high average throughput. Preserve the last
-        // completed output until another coherent NVOF-guided frame is ready.
-        if (input_ready && (submit_ok ||
-                g_nvof_motion.LastSubmitWasBackpressured()))
+        // Temporary NVOF surface pressure must not evaluate a one-off
+        // zero-motion frame. Alternating the guide contract forces temporal
+        // resets and produces a periodic step-like hitch despite high average
+        // throughput. Preserve the last completed output until another
+        // coherent NVOF-guided frame is ready. A successful history-prime with
+        // no flow submission deliberately falls through: its preparation work
+        // still reads this pipeline slot, so normal neural ownership must keep
+        // the captured texture alive until that GPU work has completed.
+        if (input_ready && !submit_ok &&
+            g_nvof_motion.LastSubmitWasBackpressured())
         {
             pipeline_slot.state.store(PipelineSlotFree,
                 std::memory_order_release);
