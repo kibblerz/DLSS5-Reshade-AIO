@@ -47,6 +47,7 @@ public:
     // Queue this fence wait before submitting the command list that contains
     // RecordConversion. NVOFA signals it after both flow directions are ready.
     ID3D12Fence *CompletionFence() const { return completion_fence_.Get(); }
+    bool IsComplete(const Submission &submission) const;
 
     // Converts S10.5 forward/backward flow into full-resolution pixel motion
     // and produces a current-frame-bias mask from flow consistency and cost.

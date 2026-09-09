@@ -846,6 +846,12 @@ bool NvofMotionProvider::IsIdle() const
     return true;
 }
 
+bool NvofMotionProvider::IsComplete(const Submission &submission) const
+{
+    return submission.valid && submission.slot < kSlotCount && completion_fence_ &&
+        completion_fence_->GetCompletedValue() >= submission.completion_value;
+}
+
 bool NvofMotionProvider::Submit(ID3D12Resource *source,
     D3D12_RESOURCE_STATES source_state, std::uint64_t source_sequence,
     bool reset, Submission &submission)

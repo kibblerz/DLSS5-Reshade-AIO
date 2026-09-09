@@ -36,7 +36,7 @@
 #include "aio-menu-schema.hpp"
 #include "nvof-motion-provider.hpp"
 
-#define ADDON_VERSION "2.2.0-nvof-default-prototype"
+#define ADDON_VERSION "2.2.0-nvof-pipelined-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -573,6 +573,11 @@ static bool g_nvof_submit_depth = false;
 static int g_nvof_visualization_mode = 0;
 static float g_nvof_visualization_scale = 16.0f;
 static NvofMotionProvider g_nvof_motion;
+static std::atomic<unsigned long long> g_nvof_staged_submissions{0};
+static std::atomic<unsigned long long> g_nvof_staged_completions{0};
+static std::atomic<unsigned long long> g_nvof_staged_not_ready{0};
+static std::atomic<unsigned int> g_nvof_staged_latency_us{0};
+static std::atomic<unsigned int> g_nvof_staged_latency_peak_us{0};
 static bool g_nr_rejection_mask_enabled = false;
 static float g_nr_rejection_mask_strength = 1.0f;
 static bool g_nr_enabled = true;
@@ -657,6 +662,7 @@ enum PipelineFrameSlotState : unsigned int
     PipelineSlotPresentRecording = 3,
     PipelineSlotPresenting = 4,
     PipelineSlotAbandoned = 5,
+    PipelineSlotNvofPending = 6,
 };
 struct PipelineFrameSlot
 {
@@ -679,6 +685,9 @@ struct PipelineFrameSlot
     bool input_dependency_satisfied = false;
     bool fg_split_submission = false;
     int presentation_slot_index = -1;
+    NvofMotionProvider::Submission staged_nvof;
+    LARGE_INTEGER staged_nvof_qpc = {};
+    bool staged_nvof_reset = false;
     Microsoft::WRL::ComPtr<ID3D12QueryHeap> telemetry_query_heap;
     Microsoft::WRL::ComPtr<ID3D12Resource> telemetry_readback;
     UINT64 telemetry_fence_value = 0;
@@ -2028,6 +2037,17 @@ static void ServiceNvofReconfiguration()
     if (!g_nvof_reconfigure_requested) return;
     if (!NeuralGpuIdle() || !AsyncFgGpuIdle() || !g_nvof_motion.IsIdle())
         return;
+    for (PipelineFrameSlot &slot : g_pipeline_slots)
+    {
+        unsigned int expected = PipelineSlotNvofPending;
+        if (slot.state.compare_exchange_strong(expected, PipelineSlotFree,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+            slot.staged_nvof = {};
+            slot.staged_nvof_qpc = {};
+            slot.staged_nvof_reset = false;
+        }
+    }
     g_nvof_motion.Shutdown();
     g_using_nvof_guides = false;
     g_using_nvof_depth = false;
@@ -2316,6 +2336,9 @@ static int AcquirePipelineFrameSlot()
             g_pipeline_slots[index].input_dependency_satisfied = false;
             g_pipeline_slots[index].fg_split_submission = false;
             g_pipeline_slots[index].presentation_slot_index = -1;
+            g_pipeline_slots[index].staged_nvof = {};
+            g_pipeline_slots[index].staged_nvof_qpc = {};
+            g_pipeline_slots[index].staged_nvof_reset = false;
             return static_cast<int>(index);
         }
     }
@@ -3693,7 +3716,17 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
     ReclaimPipelineFrameSlots();
     for (PipelineFrameSlot &slot : g_pipeline_slots)
     {
-        const unsigned int state = slot.state.load(std::memory_order_acquire);
+        unsigned int state = slot.state.load(std::memory_order_acquire);
+        if (state == PipelineSlotNvofPending &&
+            g_nvof_motion.IsComplete(slot.staged_nvof) &&
+            slot.state.compare_exchange_strong(state, PipelineSlotFree,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+            slot.staged_nvof = {};
+            slot.staged_nvof_qpc = {};
+            slot.staged_nvof_reset = false;
+            state = PipelineSlotFree;
+        }
         if (state != PipelineSlotFree)
         {
             if (state == PipelineSlotReady && g_proxy_present_event)
@@ -3859,6 +3892,9 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
         slot.input_dependency_satisfied = false;
         slot.fg_split_submission = false;
         slot.presentation_slot_index = -1;
+        slot.staged_nvof = {};
+        slot.staged_nvof_qpc = {};
+        slot.staged_nvof_reset = false;
     }
     for (PresentationFrameSlot &slot : g_presentation_slots)
     {
@@ -5086,6 +5122,9 @@ static bool EnsureStandaloneResources(UINT capture_width, UINT capture_height, D
         slot.sequence = 0;
         slot.has_generated_frame = false;
         slot.presentation_slot_index = -1;
+        slot.staged_nvof = {};
+        slot.staged_nvof_qpc = {};
+        slot.staged_nvof_reset = false;
         slot.state.store(PipelineSlotFree, std::memory_order_release);
         if (!CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, slot.real_output) ||
             !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, slot.generated_output) ||
@@ -5690,6 +5729,58 @@ static bool RenderLegacyCurrentFrameGuides(reshade::api::resource backbuffer)
     return true;
 }
 
+static int ClaimOldestCompletedNvofPipelineSlot(int excluded_slot = -1)
+{
+    int selected = -1;
+    unsigned long long oldest = ULLONG_MAX;
+    bool pending_not_ready = false;
+    for (UINT index = 0; index < kPipelineFrameSlotCount; ++index)
+    {
+        if (static_cast<int>(index) == excluded_slot) continue;
+        PipelineFrameSlot &slot = g_pipeline_slots[index];
+        if (slot.state.load(std::memory_order_acquire) != PipelineSlotNvofPending)
+            continue;
+        if (!g_nvof_motion.IsComplete(slot.staged_nvof))
+        {
+            pending_not_ready = true;
+            continue;
+        }
+        if (slot.sequence < oldest)
+        {
+            oldest = slot.sequence;
+            selected = static_cast<int>(index);
+        }
+    }
+    if (selected < 0)
+    {
+        if (pending_not_ready) ++g_nvof_staged_not_ready;
+        return -1;
+    }
+
+    unsigned int expected = PipelineSlotNvofPending;
+    if (!g_pipeline_slots[selected].state.compare_exchange_strong(expected,
+            PipelineSlotRecording, std::memory_order_acq_rel,
+            std::memory_order_acquire))
+        return -1;
+
+    PipelineFrameSlot &slot = g_pipeline_slots[selected];
+    LARGE_INTEGER now = {};
+    if (slot.staged_nvof_qpc.QuadPart != 0 && QueryPerformanceCounter(&now))
+    {
+        const unsigned int latency = CounterDeltaMicroseconds(
+            slot.staged_nvof_qpc, now);
+        SmoothMicroseconds(g_nvof_staged_latency_us, latency);
+        unsigned int peak = g_nvof_staged_latency_peak_us.load(
+            std::memory_order_relaxed);
+        while (latency > peak && !g_nvof_staged_latency_peak_us.compare_exchange_weak(
+                peak, latency, std::memory_order_relaxed))
+        {
+        }
+    }
+    ++g_nvof_staged_completions;
+    return selected;
+}
+
 static bool RenderLegacyCurrentFrameGeometry(reshade::api::resource backbuffer)
 {
     using namespace reshade::api;
@@ -5971,9 +6062,13 @@ static bool SubmitSplitFrameGeneration(PresentationFrameSlot &slot,
 }
 
 static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pipeline_slot = -1,
-    int prepared_capture_slot = -1, bool completion_driven_dispatch = false)
+    int prepared_capture_slot = -1, bool completion_driven_dispatch = false,
+    const NvofMotionProvider::Submission *staged_nvof = nullptr,
+    unsigned long long staged_source_sequence = 0,
+    bool staged_history_reset = false)
 {
     const bool legacy_input = backbuffer == nullptr;
+    const bool resume_staged_nvof = staged_nvof && staged_nvof->valid;
     ScopedLegacyCaptureReservation capture_reservation;
     capture_reservation.index = prepared_capture_slot;
     const bool mailbox_d3d11_input = prepared_capture_slot >= 0 &&
@@ -6029,9 +6124,11 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
         pipeline_slot.state.store(PipelineSlotFree, std::memory_order_release);
         return false;
     }
-    const unsigned long long source_sequence = mailbox_d3d11_input ?
-        g_legacy_capture_slots[prepared_capture_slot].sequence :
-        g_source_frame_sequence.load(std::memory_order_acquire);
+    const unsigned long long source_sequence = resume_staged_nvof ?
+        staged_source_sequence :
+        (mailbox_d3d11_input ?
+            g_legacy_capture_slots[prepared_capture_slot].sequence :
+            g_source_frame_sequence.load(std::memory_order_acquire));
     if (g_last_neural_source_sequence != 0 && source_sequence > g_last_neural_source_sequence + 1)
     {
         const unsigned long long discontinuities = ++g_temporal_discontinuities;
@@ -6041,11 +6138,19 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
                 source_sequence - g_last_neural_source_sequence - 1, discontinuities);
     }
     const bool evaluate_nr = g_nr_enabled && g_nr_feature != nullptr;
+    const bool pipeline_nvof = !resume_staged_nvof &&
+        !completion_driven_dispatch && prepared_capture_slot < 0 &&
+        g_nvof_motion_enabled && g_nvof_motion.IsReady() &&
+        g_async_compute_active && !g_nvof_depth_enabled && !g_reset_every_frame &&
+        (g_present_api == reshade::api::device_api::d3d11 ||
+            g_present_api == reshade::api::device_api::d3d12);
 
     bool use_vort_guides = false;
-    if (!legacy_input && !SourceResolutionOverrideActive())
+    if (!pipeline_nvof && !resume_staged_nvof && !legacy_input &&
+        !SourceResolutionOverrideActive())
         use_vort_guides = RenderCurrentFrameGuides(backbuffer);
-    else if (!SourceResolutionOverrideActive() &&
+    else if (!pipeline_nvof && !resume_staged_nvof &&
+        !SourceResolutionOverrideActive() &&
         g_present_api == reshade::api::device_api::d3d11 && !mailbox_d3d11_input)
     {
         use_vort_guides = g_legacy_guides_ready && CapturedGuidesMatchInput();
@@ -6056,7 +6161,52 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     bool use_external_guides = use_vort_guides;
     bool use_nvof_guides = false;
     bool use_nvof_geometry = false;
-    NvofMotionProvider::Submission nvof_submission;
+    NvofMotionProvider::Submission nvof_submission = resume_staged_nvof ?
+        *staged_nvof : NvofMotionProvider::Submission{};
+
+    if (!resume_staged_nvof && !legacy_input && g_async_compute_active &&
+        !CaptureAsyncD3D12Backbuffer(pipeline_slot, backbuffer, packed_color))
+    {
+        pipeline_slot.state.store(PipelineSlotFree, std::memory_order_release);
+        return false;
+    }
+
+    const bool pending_history_reset = resume_staged_nvof ?
+        staged_history_reset : (g_need_history_reset || g_reset_every_frame);
+    bool nvof_submit_attempted = false;
+    if (pipeline_nvof)
+    {
+        nvof_submit_attempted = true;
+        if (QueueAsyncInputDependency(pipeline_slot) &&
+            g_nvof_motion.Submit(packed_color, D3D12_RESOURCE_STATE_COMMON,
+                source_sequence, pending_history_reset, nvof_submission) &&
+            nvof_submission.valid)
+        {
+            pipeline_slot.staged_nvof = nvof_submission;
+            pipeline_slot.staged_nvof_reset = pending_history_reset;
+            pipeline_slot.sequence = source_sequence;
+            QueryPerformanceCounter(&pipeline_slot.staged_nvof_qpc);
+            pipeline_slot.state.store(PipelineSlotNvofPending,
+                std::memory_order_release);
+            ++g_nvof_staged_submissions;
+
+            const int ready_index = ClaimOldestCompletedNvofPipelineSlot(
+                static_cast<int>(slot_index));
+            if (ready_index < 0)
+                return true;
+
+            PipelineFrameSlot &ready_slot = g_pipeline_slots[ready_index];
+            const NvofMotionProvider::Submission ready_submission =
+                ready_slot.staged_nvof;
+            const unsigned long long ready_sequence = ready_slot.sequence;
+            const bool ready_reset = ready_slot.staged_nvof_reset;
+            ready_slot.staged_nvof = {};
+            ready_slot.staged_nvof_qpc = {};
+            ready_slot.staged_nvof_reset = false;
+            return ExecuteOnPresentPipeline(backbuffer, ready_index, -1, false,
+                &ready_submission, ready_sequence, ready_reset);
+        }
+    }
 
     if (DirectOutputHandoffEnabled())
     {
@@ -6078,20 +6228,16 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
         }
     }
 
-    if (!legacy_input && g_async_compute_active &&
-        !CaptureAsyncD3D12Backbuffer(pipeline_slot, backbuffer, packed_color))
+    if (resume_staged_nvof ||
+        (!nvof_submit_attempted && g_nvof_motion_enabled && g_nvof_motion.IsReady()))
     {
-        pipeline_slot.state.store(PipelineSlotFree, std::memory_order_release);
-        return false;
-    }
-
-    const bool pending_history_reset = g_need_history_reset || g_reset_every_frame;
-    if (g_nvof_motion_enabled && g_nvof_motion.IsReady())
-    {
-        if (QueueAsyncInputDependency(pipeline_slot) &&
-            g_nvof_motion.Submit(packed_color, D3D12_RESOURCE_STATE_COMMON,
-                source_sequence, pending_history_reset, nvof_submission) &&
-            nvof_submission.valid)
+        bool have_submission = resume_staged_nvof;
+        if (!resume_staged_nvof)
+            have_submission = QueueAsyncInputDependency(pipeline_slot) &&
+                g_nvof_motion.Submit(packed_color, D3D12_RESOURCE_STATE_COMMON,
+                    source_sequence, pending_history_reset, nvof_submission) &&
+                nvof_submission.valid;
+        if (have_submission)
         {
             const HRESULT wait_hr = g_async_compute_queue->Wait(
                 g_nvof_motion.CompletionFence(),
@@ -6256,7 +6402,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
 
     timestamp(1);
 
-    const bool reset = g_need_history_reset || g_reset_every_frame;
+    const bool reset = staged_history_reset || g_need_history_reset || g_reset_every_frame;
     g_need_history_reset = false;
     D3D12_RESOURCE_BARRIER sr_to_uav = Transition(
         real_output, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -6616,6 +6762,28 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
             history_mask ? "BOUND" : "none",
             g_resource_input_width, g_resource_input_height, g_resource_output_width, g_resource_output_height);
     return true;
+}
+
+static bool DispatchCompletedNvofPipelineFrame(ID3D12Resource *d3d12_backbuffer)
+{
+    const int ready_index = ClaimOldestCompletedNvofPipelineSlot();
+    if (ready_index < 0) return false;
+
+    PipelineFrameSlot &slot = g_pipeline_slots[ready_index];
+    const NvofMotionProvider::Submission submission = slot.staged_nvof;
+    const unsigned long long sequence = slot.sequence;
+    const bool reset = slot.staged_nvof_reset;
+    slot.staged_nvof = {};
+    slot.staged_nvof_qpc = {};
+    slot.staged_nvof_reset = false;
+    if (ExecuteOnPresentPipeline(d3d12_backbuffer, ready_index, -1, false,
+            &submission, sequence, reset))
+        return true;
+
+    unsigned int expected = PipelineSlotRecording;
+    slot.state.compare_exchange_strong(expected, PipelineSlotFree,
+        std::memory_order_acq_rel, std::memory_order_acquire);
+    return false;
 }
 
 static WPARAM MouseMessageKeyState(UINT message, DWORD mouse_data)
@@ -8935,6 +9103,11 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
             g_guide_gpu_telemetry_available.load() ? 1u : 0u,
             g_cpu_vort_submit_us.load() / 1000.0f, g_cpu_feed_submit_us.load() / 1000.0f,
             g_cpu_guide_flush_us.load() / 1000.0f);
+        Log("performance NVOF pipeline: default=on staged=%llu completed=%llu not-ready=%llu flow-submit->dispatch=%.3fms peak=%.3fms",
+            g_nvof_staged_submissions.load(), g_nvof_staged_completions.load(),
+            g_nvof_staged_not_ready.load(),
+            g_nvof_staged_latency_us.load() / 1000.0f,
+            g_nvof_staged_latency_peak_us.load() / 1000.0f);
         Log("performance proxy: GPU generated=%.3fms real=%.3fms pair=%.3fms samples=%llu available=%u; CPU mailbox=%.3fms fence_wait=%.3fms swap_wait=%.3fms pacing_wait=%.3fms Present=%.3fms worker=%.3fms peak=%.3fms; output interval current=%.3fms avg=%.3fms peak=%.3fms generated->real=%.3fms real->generated=%.3fms target=%uHz late=%llu; requests=%llu completed=%llu coalesced=%llu timeouts=%llu display_backpressure=%llu; neural deferrals presenter=%llu GPU=%llu",
             g_gpu_proxy_generated_us.load() / 1000.0f, g_gpu_proxy_real_us.load() / 1000.0f,
             g_gpu_proxy_total_us.load() / 1000.0f, g_proxy_telemetry_samples.load(),
@@ -11246,7 +11419,13 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         if (!ApplyPendingColorProfileChange(g_input_width.load(), g_input_height.load(),
                 backbuffer_desc.Format))
             return;
-        if (!AdmitNewestFrameForFgPair()) return;
+        if (!AdmitNewestFrameForFgPair())
+        {
+            if (DispatchCompletedNvofPipelineFrame(backbuffer) &&
+                g_nr_output != nullptr && EnsureProxy(g_nr_output))
+                g_pending_proxy_frame = true;
+            return;
+        }
         if (!ExecuteOnPresentPipeline(backbuffer))
         {
             // A genuinely full pipeline ring is fail-open: the existing proxy
@@ -11313,11 +11492,24 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         }
         else
         {
-            if (!AdmitNewestFrameForFgPair()) return;
+            if (!AdmitNewestFrameForFgPair())
+            {
+                if (api == reshade::api::device_api::d3d11 &&
+                    DispatchCompletedNvofPipelineFrame(nullptr) &&
+                    g_nr_output != nullptr && EnsureProxy(g_nr_output))
+                    g_pending_proxy_frame = true;
+                return;
+            }
             const int prepared_slot = api == reshade::api::device_api::d3d11 ?
                 AcquirePipelineFrameSlot() : -1;
             if (api == reshade::api::device_api::d3d11 && prepared_slot < 0)
             {
+                if (DispatchCompletedNvofPipelineFrame(nullptr) &&
+                    g_nr_output != nullptr && EnsureProxy(g_nr_output))
+                {
+                    g_pending_proxy_frame = true;
+                    return;
+                }
                 ++g_neural_gpu_deferrals;
                 const unsigned long long skipped = ++g_neural_busy_frame_skips;
                 if (skipped <= 8 || skipped % 600 == 0)
@@ -12693,6 +12885,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             slot.telemetry_query_heap.Reset();
             slot.telemetry_fence_value = 0;
             slot.telemetry_pending = false;
+            slot.staged_nvof = {};
+            slot.staged_nvof_qpc = {};
+            slot.staged_nvof_reset = false;
             slot.state.store(PipelineSlotFree, std::memory_order_release);
         }
         for (PresentationFrameSlot &slot : g_presentation_slots)
