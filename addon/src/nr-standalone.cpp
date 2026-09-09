@@ -36,7 +36,7 @@
 #include "aio-menu-schema.hpp"
 #include "nvof-motion-provider.hpp"
 
-#define ADDON_VERSION "2.2.0-nvof-pipelined-prototype"
+#define ADDON_VERSION "2.2.0-nvof-pipelined-smooth-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -576,6 +576,7 @@ static NvofMotionProvider g_nvof_motion;
 static std::atomic<unsigned long long> g_nvof_staged_submissions{0};
 static std::atomic<unsigned long long> g_nvof_staged_completions{0};
 static std::atomic<unsigned long long> g_nvof_staged_not_ready{0};
+static std::atomic<unsigned long long> g_nvof_staged_backpressure_holds{0};
 static std::atomic<unsigned int> g_nvof_staged_latency_us{0};
 static std::atomic<unsigned int> g_nvof_staged_latency_peak_us{0};
 static bool g_nr_rejection_mask_enabled = false;
@@ -6177,10 +6178,11 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     if (pipeline_nvof)
     {
         nvof_submit_attempted = true;
-        if (QueueAsyncInputDependency(pipeline_slot) &&
+        const bool input_ready = QueueAsyncInputDependency(pipeline_slot);
+        const bool submit_ok = input_ready &&
             g_nvof_motion.Submit(packed_color, D3D12_RESOURCE_STATE_COMMON,
-                source_sequence, pending_history_reset, nvof_submission) &&
-            nvof_submission.valid)
+                source_sequence, pending_history_reset, nvof_submission);
+        if (submit_ok && nvof_submission.valid)
         {
             pipeline_slot.staged_nvof = nvof_submission;
             pipeline_slot.staged_nvof_reset = pending_history_reset;
@@ -6205,6 +6207,20 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
             ready_slot.staged_nvof_reset = false;
             return ExecuteOnPresentPipeline(backbuffer, ready_index, -1, false,
                 &ready_submission, ready_sequence, ready_reset);
+        }
+
+        // Priming the first NVOF history frame and temporary NVOF surface
+        // pressure must not evaluate a one-off zero-motion frame. Alternating
+        // the guide contract forces temporal resets and produces a periodic
+        // step-like hitch despite high average throughput. Preserve the last
+        // completed output until another coherent NVOF-guided frame is ready.
+        if (input_ready && (submit_ok ||
+                g_nvof_motion.LastSubmitWasBackpressured()))
+        {
+            pipeline_slot.state.store(PipelineSlotFree,
+                std::memory_order_release);
+            ++g_nvof_staged_backpressure_holds;
+            return true;
         }
     }
 
@@ -9103,9 +9119,10 @@ static void RecordAddonCpuTime(const LARGE_INTEGER &begin)
             g_guide_gpu_telemetry_available.load() ? 1u : 0u,
             g_cpu_vort_submit_us.load() / 1000.0f, g_cpu_feed_submit_us.load() / 1000.0f,
             g_cpu_guide_flush_us.load() / 1000.0f);
-        Log("performance NVOF pipeline: default=on staged=%llu completed=%llu not-ready=%llu flow-submit->dispatch=%.3fms peak=%.3fms",
+        Log("performance NVOF pipeline: default=on staged=%llu completed=%llu not-ready=%llu contract-holds=%llu flow-submit->dispatch=%.3fms peak=%.3fms",
             g_nvof_staged_submissions.load(), g_nvof_staged_completions.load(),
             g_nvof_staged_not_ready.load(),
+            g_nvof_staged_backpressure_holds.load(),
             g_nvof_staged_latency_us.load() / 1000.0f,
             g_nvof_staged_latency_peak_us.load() / 1000.0f);
         Log("performance proxy: GPU generated=%.3fms real=%.3fms pair=%.3fms samples=%llu available=%u; CPU mailbox=%.3fms fence_wait=%.3fms swap_wait=%.3fms pacing_wait=%.3fms Present=%.3fms worker=%.3fms peak=%.3fms; output interval current=%.3fms avg=%.3fms peak=%.3fms generated->real=%.3fms real->generated=%.3fms target=%uHz late=%llu; requests=%llu completed=%llu coalesced=%llu timeouts=%llu display_backpressure=%llu; neural deferrals presenter=%llu GPU=%llu",

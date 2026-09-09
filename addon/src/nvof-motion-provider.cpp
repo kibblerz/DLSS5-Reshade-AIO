@@ -857,10 +857,12 @@ bool NvofMotionProvider::Submit(ID3D12Resource *source,
     bool reset, Submission &submission)
 {
     submission = {};
+    last_submit_backpressured_ = false;
     if (!ready_ || !source || !compute_queue_) return false;
     const int selected = AcquireSlot();
     if (selected < 0)
     {
+        last_submit_backpressured_ = true;
         SetStatus("waiting for a free Optical Flow history slot");
         return false;
     }

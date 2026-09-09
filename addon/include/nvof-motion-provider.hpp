@@ -13,7 +13,9 @@
 class NvofMotionProvider
 {
 public:
-    static constexpr unsigned int kSlotCount = 3;
+    // Capacity for the previous reference, staged flow, neural consumption,
+    // and split-FG consumption without transiently losing the motion provider.
+    static constexpr unsigned int kSlotCount = 5;
 
     struct Submission
     {
@@ -48,6 +50,7 @@ public:
     // RecordConversion. NVOFA signals it after both flow directions are ready.
     ID3D12Fence *CompletionFence() const { return completion_fence_.Get(); }
     bool IsComplete(const Submission &submission) const;
+    bool LastSubmitWasBackpressured() const { return last_submit_backpressured_; }
 
     // Converts S10.5 forward/backward flow into full-resolution pixel motion
     // and produces a current-frame-bias mask from flow consistency and cost.
@@ -139,5 +142,6 @@ private:
     std::uint64_t registration_fence_value_ = 0;
     std::uint64_t previous_sequence_ = 0;
     int previous_slot_ = -1;
+    bool last_submit_backpressured_ = false;
     bool ready_ = false;
 };
