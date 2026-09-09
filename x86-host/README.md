@@ -26,6 +26,10 @@ The wrapper writes the real addon's `[Standalone.DLSSNR]` configuration in
 carrier process. NR pass count is forwarded as a session-only launch setting and
 therefore retains the same crash-safe reset-to-1x behavior as the x64 addon.
 
+Before each carrier start, the x86 add-on moves the previous `host64/ReShade.log`
+into `host64/logs` using a timestamped filename. It retains the newest 16 logs so
+restarts preserve A/B telemetry without allowing the archive to grow forever.
+
 Both builds compile `addon/include/aio-menu-schema.hpp`, the single definition
 of persistent menu keys, labels, choices, defaults, ranges, groups, and concise
 help text. The x86 panel renders that schema generically and writes the same keys

@@ -41,6 +41,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <string>
+#include <vector>
 #include <algorithm>
 #include <atomic>
 
@@ -55,7 +56,7 @@
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
 #include "aio-menu-schema.hpp"
 
-#define FEED_VERSION "2.2.0-nvof-foreground-halo-prototype"
+#define FEED_VERSION "2.2.0-nvof-liveness-log-rotation-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR (32-bit wrapper) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -706,6 +707,93 @@ static bool HostAlive()
     return g.hproc != nullptr && WaitForSingleObject(g.hproc, 0) == WAIT_TIMEOUT;
 }
 
+// ReShade opens host64\ReShade.log in truncate mode whenever the x64 carrier
+// starts. Preserve the completed log before every spawn so applying settings
+// from the x86 overlay does not erase the telemetry needed for an A/B test.
+// This also captures the previous game session and a host that exited early.
+static void ArchivePreviousHostReShadeLog()
+{
+    char game_dir[MAX_PATH];
+    GetModuleFileNameA(g_self, game_dir, MAX_PATH);
+    if (char *s = strrchr(game_dir, '\\')) *(s + 1) = '\0';
+
+    char source[MAX_PATH], archive_dir[MAX_PATH], pattern[MAX_PATH];
+    sprintf_s(source, "%shost64\\ReShade.log", game_dir);
+
+    WIN32_FILE_ATTRIBUTE_DATA source_data = {};
+    if (!GetFileAttributesExA(source, GetFileExInfoStandard, &source_data)) return;
+    if (source_data.nFileSizeHigh == 0 && source_data.nFileSizeLow == 0) return;
+
+    sprintf_s(archive_dir, "%shost64\\logs", game_dir);
+    if (!CreateDirectoryA(archive_dir, nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
+    {
+        Log("[feed32] could not create host log archive %s (error %lu)", archive_dir, GetLastError());
+        return;
+    }
+
+    SYSTEMTIME st = {};
+    GetLocalTime(&st);
+    char target[MAX_PATH];
+    bool named = false;
+    for (unsigned suffix = 0; suffix < 100; ++suffix)
+    {
+        if (suffix == 0)
+            sprintf_s(target, "%s\\ReShade-host-%04u%02u%02u-%02u%02u%02u-%03u.log",
+                archive_dir, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute,
+                st.wSecond, st.wMilliseconds);
+        else
+            sprintf_s(target, "%s\\ReShade-host-%04u%02u%02u-%02u%02u%02u-%03u-%02u.log",
+                archive_dir, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute,
+                st.wSecond, st.wMilliseconds, suffix);
+        if (GetFileAttributesA(target) == INVALID_FILE_ATTRIBUTES)
+        {
+            named = true;
+            break;
+        }
+    }
+    if (!named)
+    {
+        Log("[feed32] host log archive name space exhausted for this millisecond");
+        return;
+    }
+
+    if (!MoveFileExA(source, target, MOVEFILE_WRITE_THROUGH))
+    {
+        Log("[feed32] could not archive host64\\ReShade.log (error %lu)", GetLastError());
+        return;
+    }
+    Log("[feed32] preserved previous host telemetry: %s", target);
+
+    struct ArchivedLog { std::string path; FILETIME written; };
+    std::vector<ArchivedLog> archives;
+    sprintf_s(pattern, "%s\\ReShade-host-*.log", archive_dir);
+    WIN32_FIND_DATAA found = {};
+    HANDLE find = FindFirstFileA(pattern, &found);
+    if (find != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            if ((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+            {
+                char path[MAX_PATH];
+                sprintf_s(path, "%s\\%s", archive_dir, found.cFileName);
+                archives.push_back({ path, found.ftLastWriteTime });
+            }
+        } while (FindNextFileA(find, &found));
+        FindClose(find);
+    }
+
+    constexpr size_t kRetainedHostLogs = 16;
+    std::sort(archives.begin(), archives.end(), [](const ArchivedLog &a, const ArchivedLog &b) {
+        return CompareFileTime(&a.written, &b.written) > 0;
+    });
+    for (size_t i = kRetainedHostLogs; i < archives.size(); ++i)
+    {
+        if (!DeleteFileA(archives[i].path.c_str()))
+            Log("[feed32] could not prune old host log %s (error %lu)", archives[i].path.c_str(), GetLastError());
+    }
+}
+
 static bool PipeWrite(const void *buf, DWORD len)
 {
     DWORD put = 0;
@@ -722,6 +810,7 @@ static bool EnsureHost()
 {
     if (g.pipe != nullptr && HostAlive()) return true;
     HostClose();
+    ArchivePreviousHostReShadeLog();
 
     char dir[MAX_PATH];
     GetModuleFileNameA(g_self, dir, MAX_PATH);

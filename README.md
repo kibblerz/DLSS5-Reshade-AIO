@@ -46,6 +46,8 @@ The 32-bit game captures frames, while the x64 carrier inside `host64` runs the 
 4. Obtain the NVIDIA runtimes separately and put `nvngx_dlssnr.dll`, `nvngx_dlss.dll`, and `nvngx_dlssg.dll` in `game folder\host64`—**not** directly beside the 32-bit game executable.
 5. Start the game normally. `standalone-dlssnr.addon32` launches `host64\AIO DLSS5 32-bit Wrapper.exe` automatically. Use the AIO page in the game's normal ReShade Add-ons tab; **Apply settings and restart 64-bit AIO** restarts only the carrier.
 
+The x86 wrapper preserves the previous carrier `ReShade.log` before every host restart. The latest 16 completed host logs are kept under `host64\logs` with timestamped filenames, so setting changes do not erase performance or failure telemetry.
+
 The extracted layout should look like this:
 
 ```text
