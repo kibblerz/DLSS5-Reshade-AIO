@@ -36,7 +36,7 @@
 #include "aio-menu-schema.hpp"
 #include "nvof-motion-provider.hpp"
 
-#define ADDON_VERSION "2.2.0-nvof-foreground-halo-prototype"
+#define ADDON_VERSION "2.2.0-nvof-default-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -12061,7 +12061,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         Log("NVIDIA Optical Flow motion changed to %s; reconfiguration queued",
             g_nvof_motion_enabled ? "enabled" : "disabled");
     }
-    ImGui::TextDisabled("Off by default. Uses the NVIDIA driver's hardware Optical Flow engine; no game profile or VORT shader is required.");
+    ImGui::TextDisabled("On by default. Uses the NVIDIA driver's hardware Optical Flow engine; no game profile or VORT shader is required.");
     ImGui::TextDisabled("Requires asynchronous NGX compute. It may compete with Frame Generation for Optical Flow hardware on some GPUs.");
     if (ImGui::Checkbox(dlss5_aio_menu::Label("NvidiaOpticalFlowDepth", "Add ReShade depth geometry to Optical Flow (prototype)"), &g_nvof_depth_enabled))
     {
@@ -12495,7 +12495,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("NrRejectionStrength", "1.0", value, sizeof(value)); g_nr_rejection_mask_strength = std::clamp(static_cast<float>(atof(value)), 0.0f, 1.0f);
         read_setting("ResetEveryFrame", "0", value, sizeof(value)); g_reset_every_frame = strcmp(value, "0") != 0;
         read_setting("StableSrHistory", "0", value, sizeof(value)); g_stable_sr_history = strcmp(value, "0") != 0;
-        read_setting("NvidiaOpticalFlowMotion", "0", value, sizeof(value)); g_nvof_motion_enabled = strcmp(value, "0") != 0;
+        read_setting("NvidiaOpticalFlowMotion", "1", value, sizeof(value)); g_nvof_motion_enabled = strcmp(value, "0") != 0;
         read_setting("NvidiaOpticalFlowDepth", "0", value, sizeof(value)); g_nvof_depth_enabled = strcmp(value, "0") != 0;
         read_setting("NvidiaOpticalFlowConsistency", "3.0", value, sizeof(value)); g_nvof_consistency_threshold = std::clamp(static_cast<float>(atof(value)), 0.5f, 12.0f);
         read_setting("NvidiaOpticalFlowCost", "0.35", value, sizeof(value)); g_nvof_cost_threshold = std::clamp(static_cast<float>(atof(value)), 0.0f, 0.99f);
@@ -12564,7 +12564,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             g_opaque_composition ? "enabled" : "disabled",
             g_synchronous_proxy_presentation ? "serialized" : "asynchronous",
             g_performance_telemetry_enabled ? "enabled" : "disabled");
-        Log("NVIDIA Optical Flow prototype: requested=%s consistency=%.1fpx cost=%.2f (default off)",
+        Log("NVIDIA Optical Flow prototype: requested=%s consistency=%.1fpx cost=%.2f (default on)",
             g_nvof_motion_enabled ? "enabled" : "disabled",
             g_nvof_consistency_threshold, g_nvof_cost_threshold);
         if (g_startup_recovery_detected)
