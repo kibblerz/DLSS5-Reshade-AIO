@@ -36,7 +36,7 @@
 #include "aio-menu-schema.hpp"
 #include "nvof-motion-provider.hpp"
 
-#define ADDON_VERSION "2.2.0-nvof-liveness-prototype"
+#define ADDON_VERSION "2.2.0"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -273,6 +273,7 @@ static std::atomic<unsigned int> g_capture_mailbox_source_age{0};
 static HANDLE g_neural_dispatch_stop_event;
 static HANDLE g_neural_dispatch_wake_event;
 static HANDLE g_neural_dispatch_completion_event;
+static HANDLE g_nvof_dispatch_completion_event;
 static HANDLE g_neural_dispatch_thread;
 static std::atomic<unsigned long long> g_neural_dispatch_submissions{0};
 static std::atomic<unsigned int> g_neural_dispatch_gap_us{0};
@@ -695,6 +696,7 @@ struct PipelineFrameSlot
     NvofMotionProvider::Submission staged_nvof;
     LARGE_INTEGER staged_nvof_qpc = {};
     bool staged_nvof_reset = false;
+    int staged_capture_slot_index = -1;
     Microsoft::WRL::ComPtr<ID3D12QueryHeap> telemetry_query_heap;
     Microsoft::WRL::ComPtr<ID3D12Resource> telemetry_readback;
     UINT64 telemetry_fence_value = 0;
@@ -709,6 +711,7 @@ enum LegacyCaptureSlotState : unsigned int
     LegacyCaptureSlotQueued = 2,
     LegacyCaptureSlotReserved = 3,
     LegacyCaptureSlotNeuralReading = 4,
+    LegacyCaptureSlotNvofReading = 5,
 };
 struct LegacyCaptureSlot
 {
@@ -718,6 +721,7 @@ struct LegacyCaptureSlot
     std::atomic<unsigned int> state{LegacyCaptureSlotFree};
     UINT64 capture_fence_value = 0;
     UINT64 neural_fence_value = 0;
+    UINT64 nvof_fence_value = 0;
     unsigned long long sequence = 0;
     LARGE_INTEGER submitted_qpc = {};
     std::atomic<LONGLONG> completed_qpc{0};
@@ -743,6 +747,14 @@ struct ScopedLegacyCaptureReservation
         slot.neural_fence_value = neural_fence_value;
         slot.state.store(LegacyCaptureSlotNeuralReading, std::memory_order_release);
         ++g_capture_mailbox_consumed;
+        index = -1;
+    }
+    void CommitNvof(UINT64 nvof_fence_value)
+    {
+        if (index < 0 || index >= static_cast<int>(kLegacyCaptureSlotCount)) return;
+        LegacyCaptureSlot &slot = g_legacy_capture_slots[index];
+        slot.nvof_fence_value = nvof_fence_value;
+        slot.state.store(LegacyCaptureSlotNvofReading, std::memory_order_release);
         index = -1;
     }
 };
@@ -2027,6 +2039,43 @@ static bool AsyncFgGpuIdle()
         g_async_fg_fence->GetCompletedValue() >= g_async_fg_fence_value;
 }
 
+static void ReleaseStagedCaptureSlot(PipelineFrameSlot &pipeline_slot)
+{
+    const int capture_index = pipeline_slot.staged_capture_slot_index;
+    pipeline_slot.staged_capture_slot_index = -1;
+    if (capture_index < 0 ||
+        capture_index >= static_cast<int>(kLegacyCaptureSlotCount))
+        return;
+
+    LegacyCaptureSlot &capture = g_legacy_capture_slots[capture_index];
+    unsigned int expected = LegacyCaptureSlotNvofReading;
+    if (capture.state.compare_exchange_strong(expected, LegacyCaptureSlotFree,
+            std::memory_order_acq_rel, std::memory_order_acquire))
+    {
+        capture.capture_fence_value = 0;
+        capture.neural_fence_value = 0;
+        capture.nvof_fence_value = 0;
+        capture.completed_qpc.store(0, std::memory_order_release);
+    }
+}
+
+static int ReserveStagedCaptureSlot(PipelineFrameSlot &pipeline_slot)
+{
+    const int capture_index = pipeline_slot.staged_capture_slot_index;
+    if (capture_index < 0 ||
+        capture_index >= static_cast<int>(kLegacyCaptureSlotCount))
+        return -1;
+
+    LegacyCaptureSlot &capture = g_legacy_capture_slots[capture_index];
+    unsigned int expected = LegacyCaptureSlotNvofReading;
+    if (!capture.state.compare_exchange_strong(expected, LegacyCaptureSlotReserved,
+            std::memory_order_acq_rel, std::memory_order_acquire))
+        return -1;
+    capture.nvof_fence_value = 0;
+    pipeline_slot.staged_capture_slot_index = -1;
+    return capture_index;
+}
+
 static bool InitializeNvofMotion()
 {
     if (!g_nvof_motion_enabled) return true;
@@ -2055,6 +2104,7 @@ static void ServiceNvofReconfiguration()
         if (slot.state.compare_exchange_strong(expected, PipelineSlotFree,
                 std::memory_order_acq_rel, std::memory_order_acquire))
         {
+            ReleaseStagedCaptureSlot(slot);
             slot.staged_nvof = {};
             slot.staged_nvof_qpc = {};
             slot.staged_nvof_reset = false;
@@ -2157,6 +2207,7 @@ static void ReclaimLegacyCaptureSlots()
         {
             slot.capture_fence_value = 0;
             slot.neural_fence_value = 0;
+            slot.nvof_fence_value = 0;
             slot.completed_qpc.store(0, std::memory_order_release);
         }
     }
@@ -2200,6 +2251,7 @@ static void DiscardObsoleteLegacyCaptures()
             ++g_capture_mailbox_stale_drops;
             slot.capture_fence_value = 0;
             slot.neural_fence_value = 0;
+            slot.nvof_fence_value = 0;
             slot.completed_qpc.store(0, std::memory_order_release);
         }
     }
@@ -2261,6 +2313,7 @@ static int ReserveNewestReadyLegacyCapture()
             ++g_capture_mailbox_stale_drops;
             slot.capture_fence_value = 0;
             slot.neural_fence_value = 0;
+            slot.nvof_fence_value = 0;
             slot.completed_qpc.store(0, std::memory_order_release);
         }
     }
@@ -2351,6 +2404,7 @@ static int AcquirePipelineFrameSlot()
             g_pipeline_slots[index].staged_nvof = {};
             g_pipeline_slots[index].staged_nvof_qpc = {};
             g_pipeline_slots[index].staged_nvof_reset = false;
+            g_pipeline_slots[index].staged_capture_slot_index = -1;
             return static_cast<int>(index);
         }
     }
@@ -3734,6 +3788,7 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
             slot.state.compare_exchange_strong(state, PipelineSlotFree,
                 std::memory_order_acq_rel, std::memory_order_acquire))
         {
+            ReleaseStagedCaptureSlot(slot);
             slot.staged_nvof = {};
             slot.staged_nvof_qpc = {};
             slot.staged_nvof_reset = false;
@@ -3907,6 +3962,7 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
         slot.staged_nvof = {};
         slot.staged_nvof_qpc = {};
         slot.staged_nvof_reset = false;
+        slot.staged_capture_slot_index = -1;
     }
     for (PresentationFrameSlot &slot : g_presentation_slots)
     {
@@ -3968,6 +4024,7 @@ static void ReleaseLegacyFrameResources()
         slot.input12.Reset();
         slot.capture_fence_value = 0;
         slot.neural_fence_value = 0;
+        slot.nvof_fence_value = 0;
         slot.sequence = 0;
         slot.submitted_qpc = {};
         slot.completed_qpc.store(0, std::memory_order_release);
@@ -4637,6 +4694,7 @@ static bool BuildLegacyFrameResources(UINT width, UINT height, DXGI_FORMAT forma
                 return false;
             slot.capture_fence_value = 0;
             slot.neural_fence_value = 0;
+            slot.nvof_fence_value = 0;
             slot.sequence = 0;
             slot.submitted_qpc = {};
             slot.completed_qpc.store(0, std::memory_order_release);
@@ -4839,6 +4897,7 @@ static bool CaptureLegacyFrameToMailbox(void *native_resource)
 
     slot.capture_fence_value = value;
     slot.neural_fence_value = 0;
+    slot.nvof_fence_value = 0;
     slot.sequence = g_source_frame_sequence.load(std::memory_order_acquire);
     slot.submitted_qpc = now;
     slot.completed_qpc.store(0, std::memory_order_release);
@@ -5137,6 +5196,7 @@ static bool EnsureStandaloneResources(UINT capture_width, UINT capture_height, D
         slot.staged_nvof = {};
         slot.staged_nvof_qpc = {};
         slot.staged_nvof_reset = false;
+        slot.staged_capture_slot_index = -1;
         slot.state.store(PipelineSlotFree, std::memory_order_release);
         if (!CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, slot.real_output) ||
             !CreateTexture(ow, oh, result_format, true, D3D12_RESOURCE_STATE_COMMON, slot.generated_output) ||
@@ -5741,7 +5801,8 @@ static bool RenderLegacyCurrentFrameGuides(reshade::api::resource backbuffer)
     return true;
 }
 
-static int ClaimOldestCompletedNvofPipelineSlot(int excluded_slot = -1)
+static int ClaimOldestCompletedNvofPipelineSlot(int excluded_slot = -1,
+    bool mailbox_only = false)
 {
     int selected = -1;
     unsigned long long oldest = ULLONG_MAX;
@@ -5751,6 +5812,8 @@ static int ClaimOldestCompletedNvofPipelineSlot(int excluded_slot = -1)
         if (static_cast<int>(index) == excluded_slot) continue;
         PipelineFrameSlot &slot = g_pipeline_slots[index];
         if (slot.state.load(std::memory_order_acquire) != PipelineSlotNvofPending)
+            continue;
+        if (mailbox_only && slot.staged_capture_slot_index < 0)
             continue;
         if (!g_nvof_motion.IsComplete(slot.staged_nvof))
         {
@@ -5976,6 +6039,64 @@ static bool CaptureAsyncD3D12Backbuffer(PipelineFrameSlot &slot,
     return true;
 }
 
+// Vulkan imports one shared capture image. Snapshot it into the selected
+// pipeline slot before starting asynchronous Optical Flow so the Vulkan queue
+// can safely write the following frame while NVOF/NGX consume this one.
+static bool CaptureVulkanInputToPipelineSlot(PipelineFrameSlot &slot)
+{
+    if (g_present_api != reshade::api::device_api::vulkan ||
+        !g_command_queue || !g_legacy_fence12 || !g_packed_color ||
+        !slot.original_input || !slot.capture_allocator || !slot.capture_list)
+        return false;
+
+    HRESULT hr = slot.capture_allocator->Reset();
+    if (SUCCEEDED(hr))
+        hr = slot.capture_list->Reset(slot.capture_allocator.Get(), nullptr);
+    if (FAILED(hr))
+    {
+        Fail("Vulkan staged capture command-list reset",
+            static_cast<unsigned int>(hr));
+        return false;
+    }
+
+    D3D12_RESOURCE_BARRIER begin[2] = {
+        Transition(g_packed_color.Get(), D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_COPY_SOURCE),
+        Transition(slot.original_input.Get(), D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_COPY_DEST)
+    };
+    slot.capture_list->ResourceBarrier(2, begin);
+    slot.capture_list->CopyResource(slot.original_input.Get(),
+        g_packed_color.Get());
+    D3D12_RESOURCE_BARRIER end[2] = {
+        Transition(g_packed_color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_COMMON),
+        Transition(slot.original_input.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_COMMON)
+    };
+    slot.capture_list->ResourceBarrier(2, end);
+    hr = slot.capture_list->Close();
+    if (FAILED(hr))
+    {
+        Fail("Vulkan staged capture command-list close",
+            static_cast<unsigned int>(hr));
+        return false;
+    }
+
+    ID3D12CommandList *lists[] = {slot.capture_list.Get()};
+    g_command_queue->ExecuteCommandLists(1, lists);
+    const UINT64 release_value = ++g_legacy_fence_value;
+    hr = g_command_queue->Signal(g_legacy_fence12.Get(), release_value);
+    if (FAILED(hr))
+    {
+        Fail("Vulkan staged capture release signal",
+            static_cast<unsigned int>(hr));
+        return false;
+    }
+    g_legacy_d3d12_done_value = release_value;
+    return true;
+}
+
 static bool SubmitSplitFrameGeneration(PresentationFrameSlot &slot,
     ID3D12Resource *real_output, ID3D12Resource *generated_output,
     ID3D12Resource *depth, ID3D12Resource *motion, bool reset,
@@ -6126,9 +6247,20 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     const bool d3d12_source_override = !legacy_input &&
         g_present_api == reshade::api::device_api::d3d12 &&
         SourceResolutionOverrideActive();
+    const bool pipeline_nvof = !resume_staged_nvof &&
+        g_nvof_motion_enabled && g_nvof_motion.IsReady() &&
+        g_async_compute_active && !g_nvof_depth_enabled && !g_reset_every_frame &&
+        ((!completion_driven_dispatch && prepared_capture_slot < 0 &&
+            (g_present_api == reshade::api::device_api::d3d11 ||
+             g_present_api == reshade::api::device_api::d3d12 ||
+             g_present_api == reshade::api::device_api::vulkan)) ||
+         (completion_driven_dispatch && mailbox_d3d11_input));
+    const bool ringed_vulkan_input = legacy_input &&
+        g_present_api == reshade::api::device_api::vulkan &&
+        (pipeline_nvof || resume_staged_nvof);
     ID3D12Resource *packed_color = mailbox_d3d11_input ?
         g_legacy_capture_slots[prepared_capture_slot].input12.Get() :
-        ((ringed_d3d11_input || d3d12_source_override ||
+        ((ringed_d3d11_input || ringed_vulkan_input || d3d12_source_override ||
             (g_async_compute_active && !legacy_input)) ?
             pipeline_slot.original_input.Get() : g_packed_color.Get());
     if (!packed_color)
@@ -6150,12 +6282,6 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
                 source_sequence - g_last_neural_source_sequence - 1, discontinuities);
     }
     const bool evaluate_nr = g_nr_enabled && g_nr_feature != nullptr;
-    const bool pipeline_nvof = !resume_staged_nvof &&
-        !completion_driven_dispatch && prepared_capture_slot < 0 &&
-        g_nvof_motion_enabled && g_nvof_motion.IsReady() &&
-        g_async_compute_active && !g_nvof_depth_enabled && !g_reset_every_frame &&
-        (g_present_api == reshade::api::device_api::d3d11 ||
-            g_present_api == reshade::api::device_api::d3d12);
 
     bool use_vort_guides = false;
     if (!pipeline_nvof && !resume_staged_nvof && !legacy_input &&
@@ -6176,6 +6302,12 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
     NvofMotionProvider::Submission nvof_submission = resume_staged_nvof ?
         *staged_nvof : NvofMotionProvider::Submission{};
 
+    if (!resume_staged_nvof && ringed_vulkan_input &&
+        !CaptureVulkanInputToPipelineSlot(pipeline_slot))
+    {
+        pipeline_slot.state.store(PipelineSlotFree, std::memory_order_release);
+        return false;
+    }
     if (!resume_staged_nvof && !legacy_input && g_async_compute_active &&
         !CaptureAsyncD3D12Backbuffer(pipeline_slot, backbuffer, packed_color))
     {
@@ -6198,10 +6330,26 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
             pipeline_slot.staged_nvof = nvof_submission;
             pipeline_slot.staged_nvof_reset = pending_history_reset;
             pipeline_slot.sequence = source_sequence;
+            pipeline_slot.staged_capture_slot_index = mailbox_d3d11_input ?
+                prepared_capture_slot : -1;
+            if (mailbox_d3d11_input)
+                capture_reservation.CommitNvof(nvof_submission.completion_value);
             QueryPerformanceCounter(&pipeline_slot.staged_nvof_qpc);
             pipeline_slot.state.store(PipelineSlotNvofPending,
                 std::memory_order_release);
-            ++g_nvof_staged_submissions;
+            const unsigned long long staged_count = ++g_nvof_staged_submissions;
+            if (staged_count == 1)
+                Log("pipelined NVOF staging active: api=%u input=%s",
+                    static_cast<unsigned int>(g_present_api),
+                    mailbox_d3d11_input ? "completion-driven D3D11 mailbox" :
+                        (ringed_vulkan_input ? "Vulkan per-slot snapshot" :
+                            "per-slot capture"));
+
+            // The completion-driven D3D11 dispatcher owns publication and is
+            // awakened by the NVOF fence. Do not recursively publish a second
+            // mailbox frame from this capture dispatch.
+            if (completion_driven_dispatch)
+                return true;
 
             const int ready_index = ClaimOldestCompletedNvofPipelineSlot(
                 static_cast<int>(slot_index));
@@ -6216,6 +6364,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
             ready_slot.staged_nvof = {};
             ready_slot.staged_nvof_qpc = {};
             ready_slot.staged_nvof_reset = false;
+            ready_slot.staged_capture_slot_index = -1;
             return ExecuteOnPresentPipeline(backbuffer, ready_index, -1, false,
                 &ready_submission, ready_sequence, ready_reset);
         }
@@ -6720,7 +6869,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
         pipeline_slot.telemetry_fence_value = g_neural_fence_value;
         pipeline_slot.telemetry_pending = true;
     }
-    if (legacy_input && !mailbox_d3d11_input)
+    if (legacy_input && !mailbox_d3d11_input && !ringed_vulkan_input)
     {
         const UINT64 done = ++g_legacy_fence_value;
         if (FAILED(NeuralSubmissionQueue()->Signal(g_legacy_fence12.Get(), done)))
@@ -6806,6 +6955,7 @@ static bool DispatchCompletedNvofPipelineFrame(ID3D12Resource *d3d12_backbuffer)
     slot.staged_nvof = {};
     slot.staged_nvof_qpc = {};
     slot.staged_nvof_reset = false;
+    slot.staged_capture_slot_index = -1;
     if (ExecuteOnPresentPipeline(d3d12_backbuffer, ready_index, -1, false,
             &submission, sequence, reset))
         return true;
@@ -6898,6 +7048,7 @@ static bool ServiceNvofPipelineLiveness(ID3D12Resource *d3d12_backbuffer)
         if (slot.state.compare_exchange_strong(expected, PipelineSlotFree,
                 std::memory_order_acq_rel, std::memory_order_acquire))
         {
+            ReleaseStagedCaptureSlot(slot);
             slot.staged_nvof = {};
             slot.staged_nvof_qpc = {};
             slot.staged_nvof_reset = false;
@@ -10811,6 +10962,74 @@ static void ArmNeuralDispatcherForCompletion()
             g_neural_fence_value, static_cast<unsigned int>(hr));
 }
 
+static void ArmNvofDispatcherForCompletion()
+{
+    if (!g_nvof_dispatch_completion_event || !g_nvof_motion.IsReady() ||
+        !g_nvof_motion.CompletionFence())
+        return;
+
+    UINT64 earliest = ULLONG_MAX;
+    for (const PipelineFrameSlot &slot : g_pipeline_slots)
+    {
+        if (slot.state.load(std::memory_order_acquire) == PipelineSlotNvofPending &&
+            slot.staged_capture_slot_index >= 0 && slot.staged_nvof.valid)
+            earliest = std::min(earliest, slot.staged_nvof.completion_value);
+    }
+    if (earliest == ULLONG_MAX) return;
+
+    ID3D12Fence *fence = g_nvof_motion.CompletionFence();
+    if (fence->GetCompletedValue() >= earliest)
+    {
+        SetEvent(g_nvof_dispatch_completion_event);
+        return;
+    }
+    const HRESULT hr = fence->SetEventOnCompletion(
+        earliest, g_nvof_dispatch_completion_event);
+    if (FAILED(hr))
+        Log("completion-driven NVOF wake arm failed: fence=%llu hr=0x%08X",
+            earliest, static_cast<unsigned int>(hr));
+}
+
+static bool DispatchCompletedNvofMailboxFrame()
+{
+    const int ready_index = ClaimOldestCompletedNvofPipelineSlot(-1, true);
+    if (ready_index < 0) return false;
+
+    PipelineFrameSlot &slot = g_pipeline_slots[ready_index];
+    const NvofMotionProvider::Submission submission = slot.staged_nvof;
+    const unsigned long long sequence = slot.sequence;
+    const bool reset = slot.staged_nvof_reset;
+    const int capture_slot = ReserveStagedCaptureSlot(slot);
+    slot.staged_nvof = {};
+    slot.staged_nvof_qpc = {};
+    slot.staged_nvof_reset = false;
+    if (capture_slot < 0)
+    {
+        slot.state.store(PipelineSlotAbandoned, std::memory_order_release);
+        Log("completion-driven NVOF frame lost its protected D3D11 capture; frame abandoned safely");
+        return false;
+    }
+
+    if (!ExecuteOnPresentPipeline(nullptr, ready_index, capture_slot, true,
+            &submission, sequence, reset))
+    {
+        unsigned int expected = PipelineSlotRecording;
+        slot.state.compare_exchange_strong(expected, PipelineSlotFree,
+            std::memory_order_acq_rel, std::memory_order_acquire);
+        return false;
+    }
+    if (!PublishDirectOutputSlot(ready_index))
+    {
+        slot.state.store(PipelineSlotAbandoned, std::memory_order_release);
+        ArmNeuralDispatcherForCompletion();
+        return false;
+    }
+
+    ++g_neural_dispatch_submissions;
+    ArmNeuralDispatcherForCompletion();
+    return true;
+}
+
 static bool HoldNeuralDispatcherForFgPhase()
 {
     if (AsyncFgGpuIdle())
@@ -10838,15 +11057,16 @@ static bool HoldNeuralDispatcherForFgPhase()
 
 static DWORD WINAPI NeuralDispatchThread(void *)
 {
-    const HANDLE waits[4] = {g_neural_dispatch_stop_event, g_capture_ready_event,
-        g_neural_dispatch_wake_event, g_neural_dispatch_completion_event};
+    const HANDLE waits[5] = {g_neural_dispatch_stop_event, g_capture_ready_event,
+        g_neural_dispatch_wake_event, g_neural_dispatch_completion_event,
+        g_nvof_dispatch_completion_event};
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     Log("completion-driven D3D11 neural dispatcher started");
     while (true)
     {
-        const DWORD wait = WaitForMultipleObjects(4, waits, FALSE, INFINITE);
+        const DWORD wait = WaitForMultipleObjects(5, waits, FALSE, INFINITE);
         if (wait == WAIT_OBJECT_0) break;
-        if (wait < WAIT_OBJECT_0 + 1 || wait > WAIT_OBJECT_0 + 3) continue;
+        if (wait < WAIT_OBJECT_0 + 1 || wait > WAIT_OBJECT_0 + 4) continue;
         if (wait == WAIT_OBJECT_0 + 3)
         {
             LARGE_INTEGER completed = {};
@@ -10880,6 +11100,13 @@ static DWORD WINAPI NeuralDispatchThread(void *)
         if (!DirectOutputCapacityAvailable())
             continue;
 
+        if (DispatchCompletedNvofMailboxFrame())
+        {
+            ArmNvofDispatcherForCompletion();
+            continue;
+        }
+        ArmNvofDispatcherForCompletion();
+
         const int capture_slot = ReserveNewestReadyLegacyCapture();
         if (capture_slot < 0)
             continue;
@@ -10900,6 +11127,15 @@ static DWORD WINAPI NeuralDispatchThread(void *)
                 PipelineSlotFree, std::memory_order_acq_rel, std::memory_order_acquire);
             continue;
         }
+        const unsigned int pipeline_state = g_pipeline_slots[pipeline_slot].state.load(
+            std::memory_order_acquire);
+        if (pipeline_state == PipelineSlotNvofPending)
+        {
+            ArmNvofDispatcherForCompletion();
+            continue;
+        }
+        if (pipeline_state != PipelineSlotReady)
+            continue;
         if (!PublishDirectOutputSlot(pipeline_slot))
         {
             g_pipeline_slots[pipeline_slot].state.store(
@@ -10932,13 +11168,16 @@ static bool EnsureNeuralDispatchThread()
     g_neural_dispatch_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_neural_dispatch_wake_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g_neural_dispatch_completion_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_nvof_dispatch_completion_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!g_neural_dispatch_stop_event || !g_neural_dispatch_wake_event ||
-        !g_neural_dispatch_completion_event)
+        !g_neural_dispatch_completion_event || !g_nvof_dispatch_completion_event)
     {
+        if (g_nvof_dispatch_completion_event) CloseHandle(g_nvof_dispatch_completion_event);
         if (g_neural_dispatch_completion_event) CloseHandle(g_neural_dispatch_completion_event);
         if (g_neural_dispatch_wake_event) CloseHandle(g_neural_dispatch_wake_event);
         if (g_neural_dispatch_stop_event) CloseHandle(g_neural_dispatch_stop_event);
         g_neural_dispatch_completion_event = nullptr;
+        g_nvof_dispatch_completion_event = nullptr;
         g_neural_dispatch_wake_event = nullptr;
         g_neural_dispatch_stop_event = nullptr;
         return false;
@@ -10947,10 +11186,12 @@ static bool EnsureNeuralDispatchThread()
         nullptr, 0, NeuralDispatchThread, nullptr, 0, nullptr);
     if (!g_neural_dispatch_thread)
     {
+        CloseHandle(g_nvof_dispatch_completion_event);
         CloseHandle(g_neural_dispatch_completion_event);
         CloseHandle(g_neural_dispatch_wake_event);
         CloseHandle(g_neural_dispatch_stop_event);
         g_neural_dispatch_completion_event = nullptr;
+        g_nvof_dispatch_completion_event = nullptr;
         g_neural_dispatch_wake_event = nullptr;
         g_neural_dispatch_stop_event = nullptr;
         return false;
@@ -10967,10 +11208,12 @@ static void StopNeuralDispatchThread()
         CloseHandle(g_neural_dispatch_thread);
     }
     if (g_neural_dispatch_completion_event) CloseHandle(g_neural_dispatch_completion_event);
+    if (g_nvof_dispatch_completion_event) CloseHandle(g_nvof_dispatch_completion_event);
     if (g_neural_dispatch_wake_event) CloseHandle(g_neural_dispatch_wake_event);
     if (g_neural_dispatch_stop_event) CloseHandle(g_neural_dispatch_stop_event);
     g_neural_dispatch_thread = nullptr;
     g_neural_dispatch_completion_event = nullptr;
+    g_nvof_dispatch_completion_event = nullptr;
     g_neural_dispatch_wake_event = nullptr;
     g_neural_dispatch_stop_event = nullptr;
 }
@@ -11116,6 +11359,12 @@ static void OnReshadeFinishEffects(reshade::api::effect_runtime *runtime,
             RequestProxyVisibility(false);
         }
         SetStatus("Vulkan effects-boundary handoff failed; see log");
+        return;
+    }
+    if (ServiceNvofPipelineLiveness(nullptr))
+    {
+        if (g_enabled && !g_neural_failed && g_nr_output && EnsureProxy(g_nr_output))
+            g_pending_proxy_frame = true;
         return;
     }
     if (!ExecuteOnPresentPipeline(nullptr)) return;
@@ -11586,7 +11835,13 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         if (!ApplyPendingColorProfileChange(width, height, format)) return;
         if (api == reshade::api::device_api::d3d11 &&
             g_capture_mailbox_was_enabled.load(std::memory_order_acquire) &&
-            g_neural_ready && (width != g_resource_input_width || height != g_resource_input_height ||
+            // The backbuffer is the capture contract. With a source-resolution
+            // override, the NGX working size is deliberately smaller and must
+            // not be mistaken for a resize on every Present. Repeatedly
+            // invalidating the mailbox while NVOF owns a capture can race the
+            // completion-driven worker and corrupt D3D12 resource ownership.
+            g_neural_ready && (width != g_resource_capture_width ||
+                height != g_resource_capture_height ||
                 TypedInputFormat(format) != g_resource_input_format))
             UpdateLegacyCaptureMailboxMode(false);
         if (!EnsureStandaloneResources(width, height, format)) return;
@@ -12384,7 +12639,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     if (ImGui::SliderFloat(dlss5_aio_menu::Label("LocalTone", "Local tone strength"), &g_nr_local_tone, 0.0f, 2.0f, "%.2f")) save_float("LocalTone", g_nr_local_tone);
     if (ImGui::SliderFloat(dlss5_aio_menu::Label("LocalStructure", "Local structure strength"), &g_nr_local_structure, 0.0f, 2.0f, "%.2f")) save_float("LocalStructure", g_nr_local_structure);
     if (ImGui::SliderFloat(dlss5_aio_menu::Label("SkinStructure", "Skin / character structure"), &g_nr_skin_structure, -1.0f, 1.0f, "%.2f")) save_float("SkinStructure", g_nr_skin_structure);
-    if (ImGui::Checkbox(dlss5_aio_menu::Label("NvidiaOpticalFlowMotion", "NVIDIA Optical Flow motion (experimental)"), &g_nvof_motion_enabled))
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("NvidiaOpticalFlowMotion", "NVIDIA Optical Flow motion (recommended)"), &g_nvof_motion_enabled))
     {
         reshade::set_config_value(nullptr, section, "NvidiaOpticalFlowMotion",
             g_nvof_motion_enabled ? "1" : "0");
@@ -13028,6 +13283,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             slot.staged_nvof = {};
             slot.staged_nvof_qpc = {};
             slot.staged_nvof_reset = false;
+            slot.staged_capture_slot_index = -1;
             slot.state.store(PipelineSlotFree, std::memory_order_release);
         }
         for (PresentationFrameSlot &slot : g_presentation_slots)
