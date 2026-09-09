@@ -36,7 +36,7 @@
 #include "aio-menu-schema.hpp"
 #include "nvof-motion-provider.hpp"
 
-#define ADDON_VERSION "2.2.0"
+#define ADDON_VERSION "2.2.1"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -2504,7 +2504,9 @@ static bool AdmitNewestFrameForFgPair()
     const bool paced_fg = DirectOutputHandoffEnabled() &&
         EffectiveFramegenEnabled() && !g_framegen_failed && g_fg_feature != nullptr &&
         g_fg_frames.load(std::memory_order_acquire) >= 2 && g_show_neural_output &&
-        g_proxy_refresh_hz >= 24;
+        g_proxy_refresh_hz >= 24 &&
+        !g_reshade_overlay_open.load(std::memory_order_acquire) &&
+        !g_proxy_overlay_open.load(std::memory_order_acquire);
     if (!paced_fg)
     {
         g_fg_admission_next_qpc = 0;
@@ -5546,6 +5548,19 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *runtime)
         return;
     }
     if (runtime != g_runtime) return;
+    // A primary runtime is destroyed before DXGI resizes/recreates its
+    // backbuffers. Stop admitting detached-swapchain Presents immediately so
+    // an overlay interposer cannot observe our proxy Present concurrently with
+    // the game's ResizeBuffers transaction. OnCreateSwapchain normally raises
+    // this hold earlier; this is the lifecycle fallback for paths that do not.
+    g_proxy_transition_hold.store(true, std::memory_order_release);
+    if (g_proxy_present_event) SetEvent(g_proxy_present_event);
+    const ULONGLONG presenter_deadline = GetTickCount64() + 100;
+    while (g_proxy_present_request_state.load(std::memory_order_acquire) != 0 &&
+        GetTickCount64() < presenter_deadline)
+        Sleep(1);
+    Log("primary runtime teardown quiesced proxy presentation before backbuffer destruction: worker_state=%u",
+        g_proxy_present_request_state.load(std::memory_order_acquire));
     auto *device = runtime->get_device();
     for (const BackbufferView &entry : g_backbuffer_views)
         if (entry.rtv.handle) device->destroy_resource_view(entry.rtv);
@@ -10389,7 +10404,13 @@ static bool PresentProxySourcesOnWorker(ID3D12Resource *real_source,
     if (g_proxy_hidden || g_proxy_transition_hold || g_sr_frames.load() == 0 || real_source == nullptr ||
         original_source == nullptr || g_proxy_swapchain == nullptr) return false;
 
+    // Keep the processed image visible behind ReShade, but do not make menu
+    // snapshots contend with a generated/real pair that occupies virtually the
+    // entire refresh interval. The configured FG path resumes as soon as the
+    // overlay closes.
     const bool use_framegen = EffectiveFramegenEnabled() && !g_framegen_failed &&
+        !g_reshade_overlay_open.load(std::memory_order_acquire) &&
+        !g_proxy_overlay_open.load(std::memory_order_acquire) &&
         g_show_neural_output && has_generated_frame && generated_source != nullptr &&
         g_fg_frames.load() >= 2;
     const D3D12_RESOURCE_STATES original_base_state = D3D12_RESOURCE_STATE_COMMON;
@@ -10585,6 +10606,20 @@ static bool PresentProxySourcesOnWorker(ID3D12Resource *real_source,
         ++g_proxy_fence_value;
         if (FAILED(g_command_queue->Signal(g_proxy_fence.Get(), g_proxy_fence_value))) return false;
         g_proxy_command_fence_values[command_slot] = g_proxy_fence_value;
+        // ResizeBuffers can destroy the primary ReShade runtime after this
+        // worker passed the function-entry guard but while it was pacing or
+        // recording. Never enter an injected DXGI Present hook with that
+        // transition in progress. The already-submitted draw is fence-tracked
+        // and its presentation slot can retire normally.
+        if (g_proxy_transition_hold.load(std::memory_order_acquire))
+        {
+            static std::atomic<unsigned long long> cancelled_resize_presents{0};
+            const unsigned long long cancelled = ++cancelled_resize_presents;
+            if (cancelled <= 8 || cancelled % 120 == 0)
+                Log("proxy Present cancelled at the final resize-transition boundary (count=%llu)",
+                    cancelled);
+            return false;
+        }
         const UINT present_flags = use_framegen ?
             (g_proxy_allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0u) :
             DXGI_PRESENT_DO_NOT_WAIT;
@@ -11950,6 +11985,35 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
     if (g_nr_output != nullptr && EnsureProxy(g_nr_output)) g_pending_proxy_frame = true;
 }
 
+static void BeginPrimarySwapchainTransition(HWND hwnd, UINT requested_width,
+    UINT requested_height)
+{
+    if (hwnd == nullptr || g_game_window == nullptr || hwnd != g_game_window ||
+        g_proxy_swapchain == nullptr || g_frames_presented.load(std::memory_order_acquire) == 0)
+        return;
+
+    const bool newly_held = !g_proxy_transition_hold.exchange(
+        true, std::memory_order_acq_rel);
+    if (g_proxy_present_event) SetEvent(g_proxy_present_event);
+    if (!newly_held) return;
+
+    // The proxy worker normally spends less than a millisecond inside Present,
+    // but an injected overlay can wrap that call too. Let an already-started
+    // proxy transaction leave the interposer before the game enters
+    // ResizeBuffers. New worker iterations observe the hold and retire their
+    // frame slots without presenting. Bound the wait so an unhealthy overlay
+    // can never deadlock the game's resize callback.
+    const ULONGLONG deadline = GetTickCount64() + 100;
+    while (g_proxy_present_request_state.load(std::memory_order_acquire) == 2 &&
+        GetTickCount64() < deadline)
+        Sleep(1);
+
+    const unsigned int remaining = g_proxy_present_request_state.load(
+        std::memory_order_acquire);
+    Log("primary swapchain transition quiesced proxy presentation before resize: requested=%ux%u worker_state=%u",
+        requested_width, requested_height, remaining);
+}
+
 static bool OnCreateSwapchain(reshade::api::device_api api,
     reshade::api::swapchain_desc &desc, void *window)
 {
@@ -11962,6 +12026,7 @@ static bool OnCreateSwapchain(reshade::api::device_api api,
     HWND hwnd = static_cast<HWND>(window);
     const UINT requested_width = desc.back_buffer.texture.width;
     const UINT requested_height = desc.back_buffer.texture.height;
+    BeginPrimarySwapchainTransition(hwnd, requested_width, requested_height);
     const UINT retained_width = g_windowed_render_width.load();
     const UINT retained_height = g_windowed_render_height.load();
 

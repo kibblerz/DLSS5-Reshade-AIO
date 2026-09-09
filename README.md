@@ -5,7 +5,7 @@ Bring Neural Rendering, DLAA/DLSS Super Resolution, and Frame Generation to supp
 > [!IMPORTANT]
 > **NVIDIA Optical Flow motion stabilization is now integrated.** It analyzes consecutive game frames with NVIDIA's driver-provided Optical Flow hardware, then supplies stable screen-space motion to Neural Rendering, DLSS/DLAA, and Frame Generation. In multi-game testing this has **massively reduced boiling, smearing, and ghosting**, including with the demanding **3x NR** mode. The stable motion history keeps reconstructed details anchored between frames instead of allowing each NR pass to reinterpret moving edges independently.
 >
-> Version 2.2.0 enables Optical Flow by default because the new pipelined implementation delivered major visual improvements with only a small throughput cost in broad D3D11, D3D12, and Vulkan testing. It can be disabled persistently, requires no separately downloaded Optical Flow DLL, and safely falls back to VORT or zero-motion guides if the NVIDIA provider is unavailable. Its optional depth/geometry refinement remains experimental and disabled by default.
+> Version 2.2.1 retains the default pipelined Optical Flow path and adds safer live resolution changes plus a more responsive ReShade menu. The addon now quiesces detached presentation during swapchain resizing, and temporarily removes Frame Generation presentation pacing while ReShade is open so menu updates are not trapped behind generated/real frame pairs. Normal Frame Generation resumes when the menu closes.
 
 This project's original code and documentation are licensed under the [Apache License 2.0](LICENSE). Forks and redistributed derivatives must preserve the license and the attribution in [`NOTICE`](NOTICE), retain applicable notices, and mark modified files. Third-party components and NVIDIA runtime files remain under their own terms; see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
@@ -209,6 +209,13 @@ The new **Compatibility / troubleshooting** panel provides opt-in fixes for game
 Resolution transitions are serialized outside the game's DXGI callback, failed sessions can recover into serialized mode by holding **F8** during launch, and startup contract changes hold the last completed native frame instead of repeatedly exposing the low-resolution game surface.
 
 Because presentation behavior varies substantially between engines, 2.0 may work better or worse than 1.x in a particular game. Keep [v1.7.24](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/tag/v1.7.24) available as the stable 1.x fallback and report regressions with the game name, graphics API, display mode, and persistent addon log.
+
+### Version 2.2.1
+
+- Prevents the detached presentation worker from entering an overlay-intercepted DXGI `Present` while a game is resizing or rebuilding its primary swapchain.
+- Quiesces active proxy presentation before ReShade destroys resize-dependent backbuffers and rechecks the transition immediately before every proxy `Present`.
+- Keeps processed output visible behind the ReShade menu while temporarily suspending FG presentation pacing, substantially improving menu responsiveness.
+- Automatically restores the configured Frame Generation presentation path when the ReShade menu closes.
 
 ### Version 2.2.0
 
