@@ -497,7 +497,7 @@ enum class DlssRenderPreset : int
 };
 enum class NvofResolutionMode : int
 {
-    Auto1080p = 0,
+    Auto720p = 0,
     Native = 1,
     Cap1440p = 2,
     Cap1080p = 3,
@@ -571,7 +571,7 @@ static bool g_reset_every_frame = false;
 static bool g_stable_sr_history = false;
 static bool g_vort_guides_enabled = false;
 static bool g_nvof_motion_enabled = false;
-static NvofResolutionMode g_nvof_resolution_mode = NvofResolutionMode::Auto1080p;
+static NvofResolutionMode g_nvof_resolution_mode = NvofResolutionMode::Auto720p;
 static bool g_nvof_depth_enabled = false;
 static bool g_nvof_reconfigure_requested = false;
 static bool g_using_nvof_guides = false;
@@ -1247,7 +1247,7 @@ static const char *NvofResolutionModeName(NvofResolutionMode mode)
     case NvofResolutionMode::Cap1440p: return "Cap at 1440p";
     case NvofResolutionMode::Cap1080p: return "Cap at 1080p";
     case NvofResolutionMode::Cap720p: return "Cap at 720p";
-    default: return "Auto (cap at 1080p)";
+    default: return "Auto (cap at 720p)";
     }
 }
 
@@ -1263,8 +1263,9 @@ static void ResolveNvofWorkingResolution(UINT source_width, UINT source_height,
     case NvofResolutionMode::Cap1440p: height_cap = 1440; break;
     case NvofResolutionMode::Cap720p: height_cap = 720; break;
     case NvofResolutionMode::Cap1080p:
-    case NvofResolutionMode::Auto1080p:
-    default: height_cap = 1080; break;
+        height_cap = 1080; break;
+    case NvofResolutionMode::Auto720p:
+    default: height_cap = 720; break;
     }
     if (source_height <= height_cap) return;
 
@@ -12793,7 +12794,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         nvof_width, nvof_height);
     ImGui::TextDisabled("Runs NVOF at %ux%u and reconstructs motion/confidence at %ux%u.",
         nvof_width, nvof_height, g_resource_input_width, g_resource_input_height);
-    ImGui::TextDisabled("1080p is recommended for 4K sources. Native preserves thin-object precision; 720p prioritizes performance.");
+    ImGui::TextDisabled("720p Auto is recommended: testing found negligible quality loss versus 1080p. Higher modes preserve more thin-object precision at additional cost.");
     if (ImGui::Checkbox(dlss5_aio_menu::Label("NvidiaOpticalFlowDepth", "Add ReShade depth geometry to Optical Flow (prototype)"), &g_nvof_depth_enabled))
     {
         reshade::set_config_value(nullptr, section, "NvidiaOpticalFlowDepth",
