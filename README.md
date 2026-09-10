@@ -5,7 +5,7 @@ Bring Neural Rendering, DLAA/DLSS Super Resolution, and Frame Generation to supp
 > [!IMPORTANT]
 > **NVIDIA Optical Flow motion stabilization is now integrated.** It analyzes consecutive game frames with NVIDIA's driver-provided Optical Flow hardware, then supplies stable screen-space motion to Neural Rendering, DLSS/DLAA, and Frame Generation. In multi-game testing this has **massively reduced boiling, smearing, and ghosting**, including with the demanding **3x NR** mode. The stable motion history keeps reconstructed details anchored between frames instead of allowing each NR pass to reinterpret moving edges independently.
 >
-> Version 2.2.2 runs NVIDIA Optical Flow at an independent, aspect-preserving working resolution. **Auto now caps Optical Flow at 720p by default**, substantially reducing its GPU cost while reconstructing correctly scaled full-source-resolution motion and confidence for NR, DLSS/DLAA, and Frame Generation. Native, 1440p, and 1080p modes remain available when a game benefits from finer motion analysis.
+> Version 2.2.3 defaults Optical Flow to an aspect-preserving **180p** working resolution. Uncapped testing reduced observed flow latency from roughly 37 ms at 720p to 12 ms at 180p and nearly eliminated NVOF backpressure while retaining most of the stabilization benefit. Higher resolutions remain selectable.
 
 This project's original code and documentation are licensed under the [Apache License 2.0](LICENSE). Forks and redistributed derivatives must preserve the license and the attribution in [`NOTICE`](NOTICE), retain applicable notices, and mark modified files. Third-party components and NVIDIA runtime files remain under their own terms; see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
@@ -127,7 +127,7 @@ The practical improvement is strongest in motion. Optical Flow gives the tempora
 
 Optical Flow is enabled by default in the stable 2.2.0 release. It requires asynchronous NGX compute plus a supported NVIDIA GPU and driver. Users can disable it persistently in the add-on menu if its cost is too high or it produces a game-specific motion artifact. No extra Optical Flow DLL is included or normally installed by the user: the addon discovers the NVIDIA driver-provided `nvofapi64.dll` dynamically. If initialization fails, the normal VORT or zero-motion path remains active. The optional ReShade depth-geometry enhancement remains disabled by default.
 
-Version 2.2.2 separates Optical Flow resolution from the pipeline source resolution. **Auto (720p cap)** is the recommended default: it preserves the source aspect ratio, downsamples only the image analyzed by NVOF, then reconstructs full-source-resolution vectors and confidence while scaling motion magnitude correctly. Testing found negligible visible motion-quality improvement from 1080p over 720p in Conan Exiles, making 720p the better general performance choice. Try 1080p or Native when thin objects or small fast-moving details need additional precision. Changing this setting live safely reinitializes only the Optical Flow provider.
+Optical Flow resolution is separate from pipeline source resolution. **Auto (180p cap)** is the low-latency default: it preserves aspect ratio, downsamples only NVOF input, then reconstructs full-source-resolution vectors and confidence with correctly scaled motion. Raise it when thin objects need more precision. Changing it live safely reinitializes only Optical Flow.
 
 Use **Motion direction + magnitude** to inspect screen-space motion and **Confidence / rejection heatmap** to inspect DLSS history trust. Green means trusted history; orange/red means increasingly rejected history. Lower consistency or cost tolerances reject uncertain motion more aggressively. These controls affect DLSS history rejection, not whether NR is applied.
 
@@ -211,6 +211,12 @@ The new **Compatibility / troubleshooting** panel provides opt-in fixes for game
 Resolution transitions are serialized outside the game's DXGI callback, failed sessions can recover into serialized mode by holding **F8** during launch, and startup contract changes hold the last completed native frame instead of repeatedly exposing the low-resolution game surface.
 
 Because presentation behavior varies substantially between engines, 2.0 may work better or worse than 1.x in a particular game. Keep [v1.7.24](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/tag/v1.7.24) available as the stable 1.x fallback and report regressions with the game name, graphics API, display mode, and persistent addon log.
+
+### Version 2.2.3
+
+- Adds 360p and 180p Optical Flow working-resolution choices.
+- Makes aspect-preserving 180p the Auto default to minimize Optical Flow latency and pipeline backpressure.
+- Keeps 720p, 1080p, 1440p, and Native available as optional quality overrides.
 
 ### Version 2.2.2
 
