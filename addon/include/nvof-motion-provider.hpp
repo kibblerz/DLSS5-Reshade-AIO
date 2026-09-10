@@ -36,6 +36,7 @@ public:
 
     bool Initialize(ID3D12Device *device, ID3D12CommandQueue *compute_queue,
         ID3D12Fence *neural_fence, unsigned int width, unsigned int height,
+        unsigned int flow_width, unsigned int flow_height,
         DXGI_FORMAT source_format, LogCallback log);
     void Shutdown();
     void ResetHistory();
@@ -129,6 +130,8 @@ private:
     std::string status_ = "disabled";
     unsigned int width_ = 0;
     unsigned int height_ = 0;
+    unsigned int flow_width_ = 0;
+    unsigned int flow_height_ = 0;
     unsigned int grid_size_ = 1;
     unsigned int prep_descriptor_stride_ = 0;
     unsigned int conversion_descriptor_stride_ = 0;

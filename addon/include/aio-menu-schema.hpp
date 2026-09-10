@@ -30,6 +30,9 @@ inline constexpr const char *kColorItems[] = {
     "Auto (swapchain + format)", "sRGB (nonlinear BT.709)", "Linear BT.709 / scRGB",
     "BT.2100 PQ / HDR10", "BT.2100 HLG" };
 inline constexpr const char *kModelItems[] = { "Model 1", "Model 2", "Model 3" };
+inline constexpr const char *kNvofResolutionItems[] = {
+    "Auto (cap at 1080p)", "Native source resolution", "Cap at 1440p",
+    "Cap at 1080p", "Cap at 720p" };
 inline constexpr const char *kPresetItems[] = {
     "Default (NVIDIA)", "Preset J", "Preset K", "Preset L (Recommended default)", "Preset M" };
 inline constexpr const char *kSourceItems[] = {
@@ -63,6 +66,8 @@ inline constexpr NRSetting kSettings[] = {
     { "SkinStructure", "Skin / character structure", NR_FLOAT, -1, -1, 1, "%.2f", nullptr, 0, nullptr, Group::Neural },
     { "NvidiaOpticalFlowMotion", "NVIDIA Optical Flow motion (experimental)", NR_BOOL, 0, 0, 1, nullptr, nullptr, 0,
       "Off by default. Uses the NVIDIA driver's hardware Optical Flow engine to derive motion from captured source frames; no game profile or VORT shader is required.", Group::Neural },
+    { "NvidiaOpticalFlowResolution", "Optical Flow working resolution", NR_COMBO, 0, 0, 4, nullptr, kNvofResolutionItems, 5,
+      "Auto preserves the source aspect ratio and caps Optical Flow at 1080p. Lower settings reduce Optical Flow cost while motion and confidence are reconstructed at the NR source resolution.", Group::Neural },
     { "NvidiaOpticalFlowDepth", "Add ReShade depth geometry to Optical Flow (prototype)", NR_BOOL, 0, 0, 1, nullptr, nullptr, 0,
       "Opt-in D3D11 prototype. Rejects optical-flow history across object depth boundaries without requiring VORT. Restart after changing.", Group::Neural },
     { "NvidiaOpticalFlowMotionRepair", "Geometry object-fill strength", NR_FLOAT, 1, 0, 1, "%.2f", nullptr, 0,

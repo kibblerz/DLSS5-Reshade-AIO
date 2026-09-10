@@ -193,8 +193,16 @@ bool NvofMotionProvider::CreatePipelineState()
         "Texture2D<float4> Source:register(t0);"
         "RWTexture2D<float> OpticalInput:register(u0);"
         "[numthreads(8,8,1)] void CS(uint3 id:SV_DispatchThreadID){"
-        "uint w,h;OpticalInput.GetDimensions(w,h);if(id.x>=w||id.y>=h)return;"
-        "float4 c=Source.Load(int3(id.xy,0));"
+        "uint w,h,sw,sh;OpticalInput.GetDimensions(w,h);Source.GetDimensions(sw,sh);"
+        "if(id.x>=w||id.y>=h)return;float4 c;"
+        "if(w==sw&&h==sh)c=Source.Load(int3(id.xy,0));else{"
+        "float2 scale=float2(sw,sh)/float2(w,h);"
+        "uint2 p00=min(uint2((float2(id.xy)+float2(0.25,0.25))*scale),uint2(sw-1,sh-1));"
+        "uint2 p10=min(uint2((float2(id.xy)+float2(0.75,0.25))*scale),uint2(sw-1,sh-1));"
+        "uint2 p01=min(uint2((float2(id.xy)+float2(0.25,0.75))*scale),uint2(sw-1,sh-1));"
+        "uint2 p11=min(uint2((float2(id.xy)+float2(0.75,0.75))*scale),uint2(sw-1,sh-1));"
+        "c=(Source.Load(int3(p00,0))+Source.Load(int3(p10,0))+"
+        "Source.Load(int3(p01,0))+Source.Load(int3(p11,0)))*0.25;}"
         "float peak=max(max(c.r,c.g),max(c.b,1.0));"
         "c.rgb=saturate(c.rgb/peak);"
         "OpticalInput[id.xy]=dot(c.rgb,float3(0.2126,0.7152,0.0722));}";
@@ -228,7 +236,7 @@ bool NvofMotionProvider::CreatePipelineState()
     }
     conversion_params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     conversion_params[2].Constants.ShaderRegister = 0;
-    conversion_params[2].Constants.Num32BitValues = 13;
+    conversion_params[2].Constants.Num32BitValues = 15;
     D3D12_ROOT_SIGNATURE_DESC conversion_desc = {};
     conversion_desc.NumParameters = 3;
     conversion_desc.pParameters = conversion_params;
@@ -249,18 +257,24 @@ bool NvofMotionProvider::CreatePipelineState()
         "RWTexture2D<float2> Motion:register(u0);"
         "RWTexture2D<float> HistoryMask:register(u1);"
         "RWTexture2D<float> GeometryDepth:register(u2);"
-        "cbuffer C:register(b0){uint Width;uint Height;uint Grid;float Consistency;"
+        "cbuffer C:register(b0){uint Width;uint Height;uint FlowWidth;uint FlowHeight;"
+        "uint Grid;float Consistency;"
         "float CostThreshold;float CostScale;uint Reset;uint UseDepth;"
         "uint DepthWidth;uint DepthHeight;uint DepthReversed;float DepthSensitivity;"
         "float MotionRepairStrength;}"
         "[numthreads(8,8,1)] void CS(uint3 id:SV_DispatchThreadID){"
-        "if(id.x>=Width||id.y>=Height)return;uint2 cell=id.xy/Grid;"
-        "float2 f=float2(Forward.Load(int3(cell,0)))/32.0;"
+        "if(id.x>=Width||id.y>=Height)return;"
+        "float2 guideToFlow=float2(FlowWidth,FlowHeight)/float2(Width,Height);"
+        "float2 flowToGuide=float2(Width,Height)/float2(FlowWidth,FlowHeight);"
+        "float2 flowPixel=(float2(id.xy)+0.5)*guideToFlow-0.5;"
+        "uint2 cell=uint2(clamp(flowPixel,float2(0,0),float2(FlowWidth-1,FlowHeight-1)))/Grid;"
+        "float2 fFlow=float2(Forward.Load(int3(cell,0)))/32.0;float2 f=fFlow*flowToGuide;"
         "float2 previous=float2(id.xy)+f;bool outside=any(previous<0.0)||"
         "previous.x>=Width||previous.y>=Height;"
-        "uint2 priorCell=uint2(clamp(previous,float2(0,0),"
-        "float2(Width-1,Height-1)))/Grid;"
-        "float2 b=float2(Backward.Load(int3(priorCell,0)))/32.0;"
+        "float2 previousFlow=flowPixel+fFlow;"
+        "uint2 priorCell=uint2(clamp(previousFlow,float2(0,0),"
+        "float2(FlowWidth-1,FlowHeight-1)))/Grid;"
+        "float2 b=float2(Backward.Load(int3(priorCell,0)))/32.0*flowToGuide;"
         "float consistency=length(f+b);"
         "float cf=ForwardCost.Load(int3(cell,0))*CostScale;"
         "float cb=BackwardCost.Load(int3(priorCell,0))*CostScale;"
@@ -302,11 +316,15 @@ bool NvofMotionProvider::CreatePipelineState()
         "float depthGap=abs(cd-sceneDepth)/max(max(abs(cd),abs(sceneDepth)),1e-4);"
         "float signedDepthGap=(DepthReversed!=0?sceneDepth-cd:cd-sceneDepth)/"
         "max(max(abs(cd),abs(sceneDepth)),1e-4);"
-        "uint2 ccell=cp/Grid;float2 candidateFlow=float2(Forward.Load(int3(ccell,0)))/32.0;"
+        "float2 candidateFlowPixel=(float2(cp)+0.5)*guideToFlow-0.5;"
+        "uint2 ccell=uint2(clamp(candidateFlowPixel,float2(0,0),float2(FlowWidth-1,FlowHeight-1)))/Grid;"
+        "float2 candidateFlowRaw=float2(Forward.Load(int3(ccell,0)))/32.0;"
+        "float2 candidateFlow=candidateFlowRaw*flowToGuide;"
         "float2 candidatePrevious=float2(cp)+candidateFlow;bool candidateOutside=any(candidatePrevious<0.0)||"
         "candidatePrevious.x>=Width||candidatePrevious.y>=Height;"
-        "uint2 cbcell=uint2(clamp(candidatePrevious,float2(0,0),float2(Width-1,Height-1)))/Grid;"
-        "float2 candidateBackward=float2(Backward.Load(int3(cbcell,0)))/32.0;"
+        "float2 candidatePreviousFlow=candidateFlowPixel+candidateFlowRaw;"
+        "uint2 cbcell=uint2(clamp(candidatePreviousFlow,float2(0,0),float2(FlowWidth-1,FlowHeight-1)))/Grid;"
+        "float2 candidateBackward=float2(Backward.Load(int3(cbcell,0)))/32.0*flowToGuide;"
         "float candidateFlowBad=smoothstep(Consistency,Consistency*2.0,length(candidateFlow+candidateBackward));"
         "float candidateCost=max(ForwardCost.Load(int3(ccell,0))*CostScale,"
         "BackwardCost.Load(int3(cbcell,0))*CostScale);"
@@ -521,8 +539,8 @@ bool NvofMotionProvider::CreateSessionResources()
         return false;
     }
 
-    const unsigned int flow_width = (width_ + grid_size_ - 1) / grid_size_;
-    const unsigned int flow_height = (height_ + grid_size_ - 1) / grid_size_;
+    const unsigned int flow_width = (flow_width_ + grid_size_ - 1) / grid_size_;
+    const unsigned int flow_height = (flow_height_ + grid_size_ - 1) / grid_size_;
     for (unsigned int index = 0; index < kSlotCount; ++index)
     {
         Slot &slot = slots_[index];
@@ -535,7 +553,7 @@ bool NvofMotionProvider::CreateSessionResources()
             SetStatus("Optical Flow preparation command allocation failed");
             return false;
         }
-        if (!CreateTexture(device_.Get(), width_, height_, input_format_,
+        if (!CreateTexture(device_.Get(), flow_width_, flow_height_, input_format_,
                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_COMMON, slot.input) ||
             !CreateTexture(device_.Get(), flow_width, flow_height, flow_format_,
@@ -647,12 +665,13 @@ bool NvofMotionProvider::CreateSessionResources()
 
 bool NvofMotionProvider::Initialize(ID3D12Device *device,
     ID3D12CommandQueue *compute_queue, ID3D12Fence *neural_fence,
-    unsigned int width, unsigned int height, DXGI_FORMAT source_format,
-    LogCallback log)
+    unsigned int width, unsigned int height, unsigned int flow_width,
+    unsigned int flow_height, DXGI_FORMAT source_format, LogCallback log)
 {
     Shutdown();
     log_ = log;
-    if (!device || !compute_queue || !neural_fence || width == 0 || height == 0)
+    if (!device || !compute_queue || !neural_fence || width == 0 || height == 0 ||
+        flow_width == 0 || flow_height == 0)
     {
         SetStatus("Optical Flow requires the asynchronous D3D12 host queue");
         return false;
@@ -662,6 +681,8 @@ bool NvofMotionProvider::Initialize(ID3D12Device *device,
     neural_fence_ = neural_fence;
     width_ = width;
     height_ = height;
+    flow_width_ = std::min(width, flow_width);
+    flow_height_ = std::min(height, flow_height);
     source_format_ = source_format;
     if (!LoadApi())
     {
@@ -690,8 +711,8 @@ bool NvofMotionProvider::Initialize(ID3D12Device *device,
     grid_size_ = std::find(grids.begin(), grids.end(), 1u) != grids.end() ? 1u :
         (std::find(grids.begin(), grids.end(), 2u) != grids.end() ? 2u : 4u);
     NV_OF_INIT_PARAMS init = {};
-    init.width = width_;
-    init.height = height_;
+    init.width = flow_width_;
+    init.height = flow_height_;
     init.outGridSize = static_cast<NV_OF_OUTPUT_VECTOR_GRID_SIZE>(grid_size_);
     init.hintGridSize = NV_OF_HINT_VECTOR_GRID_SIZE_UNDEFINED;
     init.mode = NV_OF_MODE_OPTICALFLOW;
@@ -725,8 +746,8 @@ bool NvofMotionProvider::Initialize(ID3D12Device *device,
         return false;
     }
     ready_ = true;
-    SetStatus("ready: %ux%u, %ux%u grid, forward/backward + cost",
-        width_, height_, grid_size_, grid_size_);
+    SetStatus("ready: guide %ux%u, flow %ux%u, %ux%u grid, forward/backward + cost",
+        width_, height_, flow_width_, flow_height_, grid_size_, grid_size_);
     Log("%s", Status());
     return true;
 }
@@ -795,6 +816,7 @@ void NvofMotionProvider::Shutdown()
     module_ = nullptr;
     prep_fence_value_ = completion_fence_value_ = registration_fence_value_ = 0;
     width_ = height_ = 0;
+    flow_width_ = flow_height_ = 0;
     input_format_ = flow_format_ = cost_format_ = source_format_ = DXGI_FORMAT_UNKNOWN;
 }
 
@@ -900,7 +922,8 @@ bool NvofMotionProvider::Submit(ID3D12Resource *source,
         GpuDescriptor(prep_descriptors_.Get(), prep_descriptor_stride_, prep_base));
     slot.prep_list->SetComputeRootDescriptorTable(1,
         GpuDescriptor(prep_descriptors_.Get(), prep_descriptor_stride_, prep_base + 1));
-    slot.prep_list->Dispatch((width_ + 7) / 8, (height_ + 7) / 8, 1);
+    slot.prep_list->Dispatch((flow_width_ + 7) / 8,
+        (flow_height_ + 7) / 8, 1);
     barrier_count = 0;
     barriers[barrier_count++] = Transition(slot.input.Get(),
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
@@ -1040,6 +1063,8 @@ bool NvofMotionProvider::RecordConversion(ID3D12GraphicsCommandList *commands,
     {
         unsigned int width;
         unsigned int height;
+        unsigned int flow_width;
+        unsigned int flow_height;
         unsigned int grid;
         float consistency;
         float cost_threshold;
@@ -1051,7 +1076,7 @@ bool NvofMotionProvider::RecordConversion(ID3D12GraphicsCommandList *commands,
         unsigned int depth_reversed;
         float depth_sensitivity;
         float motion_repair_strength;
-    } constants = {width_, height_, grid_size_,
+    } constants = {width_, height_, flow_width_, flow_height_, grid_size_,
         std::max(0.25f, consistency_threshold_pixels),
         std::clamp(cost_threshold, 0.0f, 0.99f),
         cost_format_ == DXGI_FORMAT_R8_UINT ? 1.0f / 255.0f : 1.0f / 65535.0f,
@@ -1060,7 +1085,7 @@ bool NvofMotionProvider::RecordConversion(ID3D12GraphicsCommandList *commands,
         use_depth ? geometry_desc.Height : 1u,
         depth_reversed ? 1u : 0u, 0.02f,
         std::clamp(motion_repair_strength, 0.0f, 1.0f)};
-    commands->SetComputeRoot32BitConstants(2, 13, &constants, 0);
+    commands->SetComputeRoot32BitConstants(2, 15, &constants, 0);
     commands->Dispatch((width_ + 7) / 8, (height_ + 7) / 8, 1);
     D3D12_RESOURCE_BARRIER end[8] = {};
     unsigned int end_count = 0;

@@ -36,7 +36,7 @@
 #include "aio-menu-schema.hpp"
 #include "nvof-motion-provider.hpp"
 
-#define ADDON_VERSION "2.2.1"
+#define ADDON_VERSION "2.2.2-nvof-resolution-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -495,6 +495,14 @@ enum class DlssRenderPreset : int
     L = 12,
     M = 13
 };
+enum class NvofResolutionMode : int
+{
+    Auto1080p = 0,
+    Native = 1,
+    Cap1440p = 2,
+    Cap1080p = 3,
+    Cap720p = 4
+};
 struct SourceResolutionChoice
 {
     const char *label;
@@ -563,6 +571,7 @@ static bool g_reset_every_frame = false;
 static bool g_stable_sr_history = false;
 static bool g_vort_guides_enabled = false;
 static bool g_nvof_motion_enabled = false;
+static NvofResolutionMode g_nvof_resolution_mode = NvofResolutionMode::Auto1080p;
 static bool g_nvof_depth_enabled = false;
 static bool g_nvof_reconfigure_requested = false;
 static bool g_using_nvof_guides = false;
@@ -1228,6 +1237,41 @@ static void Log(const char *format, ...)
 static void LogNvof(const char *message)
 {
     Log("NVOF: %s", message ? message : "unknown status");
+}
+
+static const char *NvofResolutionModeName(NvofResolutionMode mode)
+{
+    switch (mode)
+    {
+    case NvofResolutionMode::Native: return "Native source resolution";
+    case NvofResolutionMode::Cap1440p: return "Cap at 1440p";
+    case NvofResolutionMode::Cap1080p: return "Cap at 1080p";
+    case NvofResolutionMode::Cap720p: return "Cap at 720p";
+    default: return "Auto (cap at 1080p)";
+    }
+}
+
+static void ResolveNvofWorkingResolution(UINT source_width, UINT source_height,
+    UINT &flow_width, UINT &flow_height)
+{
+    flow_width = source_width;
+    flow_height = source_height;
+    UINT height_cap = 0;
+    switch (g_nvof_resolution_mode)
+    {
+    case NvofResolutionMode::Native: return;
+    case NvofResolutionMode::Cap1440p: height_cap = 1440; break;
+    case NvofResolutionMode::Cap720p: height_cap = 720; break;
+    case NvofResolutionMode::Cap1080p:
+    case NvofResolutionMode::Auto1080p:
+    default: height_cap = 1080; break;
+    }
+    if (source_height <= height_cap) return;
+
+    const double scale = static_cast<double>(height_cap) / source_height;
+    flow_width = std::max<UINT>(2,
+        static_cast<UINT>(std::lround(source_width * scale))) & ~1u;
+    flow_height = height_cap & ~1u;
 }
 
 static const char *DlssRenderPresetName(DlssRenderPreset preset)
@@ -2087,9 +2131,16 @@ static bool InitializeNvofMotion()
         Log("NVOF requested but asynchronous D3D12 host resources are unavailable; zero-motion/VORT fallback remains active");
         return false;
     }
+    UINT flow_width = g_resource_input_width;
+    UINT flow_height = g_resource_input_height;
+    ResolveNvofWorkingResolution(g_resource_input_width, g_resource_input_height,
+        flow_width, flow_height);
+    Log("NVOF working resolution: mode=%s source=%ux%u flow=%ux%u",
+        NvofResolutionModeName(g_nvof_resolution_mode),
+        g_resource_input_width, g_resource_input_height, flow_width, flow_height);
     return g_nvof_motion.Initialize(g_neural_device.Get(),
         g_async_compute_queue.Get(), g_neural_fence.Get(),
-        g_resource_input_width, g_resource_input_height,
+        g_resource_input_width, g_resource_input_height, flow_width, flow_height,
         g_resource_input_format, LogNvof);
 }
 
@@ -6225,7 +6276,13 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
             LegacyCaptureSlotReserved;
     if (prepared_capture_slot >= 0 && !mailbox_d3d11_input) return false;
     if ((!legacy_input && !EnsureStandaloneResources(backbuffer)) || (legacy_input && !g_neural_ready)) return false;
-    ServiceNvofReconfiguration();
+    // A completion-driven D3D11 frame may carry a claimed NVOF submission in
+    // this stack frame. Destroying the provider here would unregister and free
+    // those resources before conversion/NGX consumes them. Finish that frame;
+    // the next invocation drains its recorded neural/FG consumer fences and
+    // performs the queued reconfiguration safely.
+    if (!resume_staged_nvof)
+        ServiceNvofReconfiguration();
     if (g_feature_recreate_requested.load())
     {
         if (!NeuralGpuIdle()) return false;
@@ -12715,6 +12772,28 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     }
     ImGui::TextDisabled("On by default. Uses the NVIDIA driver's hardware Optical Flow engine; no game profile or VORT shader is required.");
     ImGui::TextDisabled("Requires asynchronous NGX compute. It may compete with Frame Generation for Optical Flow hardware on some GPUs.");
+    int nvof_resolution = static_cast<int>(g_nvof_resolution_mode);
+    if (ImGui::Combo(dlss5_aio_menu::Label("NvidiaOpticalFlowResolution", "Optical Flow working resolution"),
+            &nvof_resolution, dlss5_aio_menu::kNvofResolutionItems,
+            static_cast<int>(std::size(dlss5_aio_menu::kNvofResolutionItems))))
+    {
+        g_nvof_resolution_mode = static_cast<NvofResolutionMode>(nvof_resolution);
+        char value[16] = {};
+        sprintf_s(value, "%d", nvof_resolution);
+        reshade::set_config_value(nullptr, section, "NvidiaOpticalFlowResolution",
+            static_cast<const char *>(value));
+        g_nvof_reconfigure_requested = true;
+        g_need_history_reset = true;
+        Log("NVIDIA Optical Flow resolution changed to %s; safe reconfiguration queued",
+            NvofResolutionModeName(g_nvof_resolution_mode));
+    }
+    UINT nvof_width = g_resource_input_width;
+    UINT nvof_height = g_resource_input_height;
+    ResolveNvofWorkingResolution(g_resource_input_width, g_resource_input_height,
+        nvof_width, nvof_height);
+    ImGui::TextDisabled("Runs NVOF at %ux%u and reconstructs motion/confidence at %ux%u.",
+        nvof_width, nvof_height, g_resource_input_width, g_resource_input_height);
+    ImGui::TextDisabled("1080p is recommended for 4K sources. Native preserves thin-object precision; 720p prioritizes performance.");
     if (ImGui::Checkbox(dlss5_aio_menu::Label("NvidiaOpticalFlowDepth", "Add ReShade depth geometry to Optical Flow (prototype)"), &g_nvof_depth_enabled))
     {
         reshade::set_config_value(nullptr, section, "NvidiaOpticalFlowDepth",
@@ -13148,6 +13227,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("ResetEveryFrame", "0", value, sizeof(value)); g_reset_every_frame = strcmp(value, "0") != 0;
         read_setting("StableSrHistory", "0", value, sizeof(value)); g_stable_sr_history = strcmp(value, "0") != 0;
         read_setting("NvidiaOpticalFlowMotion", "1", value, sizeof(value)); g_nvof_motion_enabled = strcmp(value, "0") != 0;
+        read_setting("NvidiaOpticalFlowResolution", "0", value, sizeof(value));
+        g_nvof_resolution_mode = static_cast<NvofResolutionMode>(
+            std::clamp(atoi(value), 0, 4));
         read_setting("NvidiaOpticalFlowDepth", "0", value, sizeof(value)); g_nvof_depth_enabled = strcmp(value, "0") != 0;
         read_setting("NvidiaOpticalFlowConsistency", "3.0", value, sizeof(value)); g_nvof_consistency_threshold = std::clamp(static_cast<float>(atof(value)), 0.5f, 12.0f);
         read_setting("NvidiaOpticalFlowCost", "0.35", value, sizeof(value)); g_nvof_cost_threshold = std::clamp(static_cast<float>(atof(value)), 0.0f, 0.99f);
@@ -13216,8 +13298,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             g_opaque_composition ? "enabled" : "disabled",
             g_synchronous_proxy_presentation ? "serialized" : "asynchronous",
             g_performance_telemetry_enabled ? "enabled" : "disabled");
-        Log("NVIDIA Optical Flow prototype: requested=%s consistency=%.1fpx cost=%.2f (default on)",
+        Log("NVIDIA Optical Flow prototype: requested=%s resolution=%s consistency=%.1fpx cost=%.2f (default on)",
             g_nvof_motion_enabled ? "enabled" : "disabled",
+            NvofResolutionModeName(g_nvof_resolution_mode),
             g_nvof_consistency_threshold, g_nvof_cost_threshold);
         if (g_startup_recovery_detected)
             Log("previous game session did not shut down cleanly; preserving configured presentation mode (automatic serialized recovery disabled): state=%s",
