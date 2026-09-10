@@ -497,7 +497,7 @@ enum class DlssRenderPreset : int
 };
 enum class NvofResolutionMode : int
 {
-    Auto720p = 0,
+    Auto180p = 0,
     Native = 1,
     Cap1440p = 2,
     Cap1080p = 3,
@@ -573,7 +573,7 @@ static bool g_reset_every_frame = false;
 static bool g_stable_sr_history = false;
 static bool g_vort_guides_enabled = false;
 static bool g_nvof_motion_enabled = false;
-static NvofResolutionMode g_nvof_resolution_mode = NvofResolutionMode::Auto720p;
+static NvofResolutionMode g_nvof_resolution_mode = NvofResolutionMode::Auto180p;
 static bool g_nvof_depth_enabled = false;
 static bool g_nvof_reconfigure_requested = false;
 static bool g_using_nvof_guides = false;
@@ -1251,7 +1251,7 @@ static const char *NvofResolutionModeName(NvofResolutionMode mode)
     case NvofResolutionMode::Cap720p: return "Cap at 720p";
     case NvofResolutionMode::Cap360p: return "Cap at 360p";
     case NvofResolutionMode::Cap180p: return "Cap at 180p";
-    default: return "Auto (cap at 720p)";
+    default: return "Auto (cap at 180p)";
     }
 }
 
@@ -1270,8 +1270,8 @@ static void ResolveNvofWorkingResolution(UINT source_width, UINT source_height,
     case NvofResolutionMode::Cap180p: height_cap = 180; break;
     case NvofResolutionMode::Cap1080p:
         height_cap = 1080; break;
-    case NvofResolutionMode::Auto720p:
-    default: height_cap = 720; break;
+    case NvofResolutionMode::Auto180p:
+    default: height_cap = 180; break;
     }
     if (source_height <= height_cap) return;
 
@@ -12800,7 +12800,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         nvof_width, nvof_height);
     ImGui::TextDisabled("Runs NVOF at %ux%u and reconstructs motion/confidence at %ux%u.",
         nvof_width, nvof_height, g_resource_input_width, g_resource_input_height);
-    ImGui::TextDisabled("720p Auto is recommended. Higher modes preserve thin-object precision; 360p/180p are low-cost quality-limit experiments.");
+    ImGui::TextDisabled("180p Auto prioritizes low latency and avoids NVOF backpressure. Raise it only when thin-object motion needs more precision.");
     if (ImGui::Checkbox(dlss5_aio_menu::Label("NvidiaOpticalFlowDepth", "Add ReShade depth geometry to Optical Flow (prototype)"), &g_nvof_depth_enabled))
     {
         reshade::set_config_value(nullptr, section, "NvidiaOpticalFlowDepth",
