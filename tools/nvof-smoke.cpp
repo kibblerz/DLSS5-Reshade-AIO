@@ -104,7 +104,7 @@ int main()
 
     NvofMotionProvider provider;
     const bool initialized = provider.Initialize(device.Get(), queue.Get(),
-        neural_fence.Get(), 1280, 720, 640, 360,
+        neural_fence.Get(), 1280, 720, 320, 180,
         DXGI_FORMAT_R8G8B8A8_UNORM, PrintStatus);
     bool full_path = initialized;
     ComPtr<ID3D12Resource> source_a, source_b, visualization, geometry_depth;

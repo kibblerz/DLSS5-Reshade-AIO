@@ -36,7 +36,7 @@
 #include "aio-menu-schema.hpp"
 #include "nvof-motion-provider.hpp"
 
-#define ADDON_VERSION "2.2.2"
+#define ADDON_VERSION "2.2.3-nvof-lowres-prototype"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -501,7 +501,9 @@ enum class NvofResolutionMode : int
     Native = 1,
     Cap1440p = 2,
     Cap1080p = 3,
-    Cap720p = 4
+    Cap720p = 4,
+    Cap360p = 5,
+    Cap180p = 6
 };
 struct SourceResolutionChoice
 {
@@ -1247,6 +1249,8 @@ static const char *NvofResolutionModeName(NvofResolutionMode mode)
     case NvofResolutionMode::Cap1440p: return "Cap at 1440p";
     case NvofResolutionMode::Cap1080p: return "Cap at 1080p";
     case NvofResolutionMode::Cap720p: return "Cap at 720p";
+    case NvofResolutionMode::Cap360p: return "Cap at 360p";
+    case NvofResolutionMode::Cap180p: return "Cap at 180p";
     default: return "Auto (cap at 720p)";
     }
 }
@@ -1262,6 +1266,8 @@ static void ResolveNvofWorkingResolution(UINT source_width, UINT source_height,
     case NvofResolutionMode::Native: return;
     case NvofResolutionMode::Cap1440p: height_cap = 1440; break;
     case NvofResolutionMode::Cap720p: height_cap = 720; break;
+    case NvofResolutionMode::Cap360p: height_cap = 360; break;
+    case NvofResolutionMode::Cap180p: height_cap = 180; break;
     case NvofResolutionMode::Cap1080p:
         height_cap = 1080; break;
     case NvofResolutionMode::Auto720p:
@@ -12794,7 +12800,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         nvof_width, nvof_height);
     ImGui::TextDisabled("Runs NVOF at %ux%u and reconstructs motion/confidence at %ux%u.",
         nvof_width, nvof_height, g_resource_input_width, g_resource_input_height);
-    ImGui::TextDisabled("720p Auto is recommended: testing found negligible quality loss versus 1080p. Higher modes preserve more thin-object precision at additional cost.");
+    ImGui::TextDisabled("720p Auto is recommended. Higher modes preserve thin-object precision; 360p/180p are low-cost quality-limit experiments.");
     if (ImGui::Checkbox(dlss5_aio_menu::Label("NvidiaOpticalFlowDepth", "Add ReShade depth geometry to Optical Flow (prototype)"), &g_nvof_depth_enabled))
     {
         reshade::set_config_value(nullptr, section, "NvidiaOpticalFlowDepth",
@@ -13230,7 +13236,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("NvidiaOpticalFlowMotion", "1", value, sizeof(value)); g_nvof_motion_enabled = strcmp(value, "0") != 0;
         read_setting("NvidiaOpticalFlowResolution", "0", value, sizeof(value));
         g_nvof_resolution_mode = static_cast<NvofResolutionMode>(
-            std::clamp(atoi(value), 0, 4));
+            std::clamp(atoi(value), 0, 6));
         read_setting("NvidiaOpticalFlowDepth", "0", value, sizeof(value)); g_nvof_depth_enabled = strcmp(value, "0") != 0;
         read_setting("NvidiaOpticalFlowConsistency", "3.0", value, sizeof(value)); g_nvof_consistency_threshold = std::clamp(static_cast<float>(atof(value)), 0.5f, 12.0f);
         read_setting("NvidiaOpticalFlowCost", "0.35", value, sizeof(value)); g_nvof_cost_threshold = std::clamp(static_cast<float>(atof(value)), 0.0f, 0.99f);
