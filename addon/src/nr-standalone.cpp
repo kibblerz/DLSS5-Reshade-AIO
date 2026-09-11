@@ -36,7 +36,7 @@
 #include "aio-menu-schema.hpp"
 #include "nvof-motion-provider.hpp"
 
-#define ADDON_VERSION "2.2.3"
+#define ADDON_VERSION "2.2.4"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR " ADDON_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -308,12 +308,16 @@ static constexpr UINT kProxySelectNrPassCountMessage = WM_APP + 0x59;
 static constexpr UINT kProxyShowProcessedMessage = WM_APP + 0x5A;
 static constexpr UINT kProxyEnableNrMessage = WM_APP + 0x5B;
 static constexpr UINT kProxyEnableFgMessage = WM_APP + 0x5C;
+static constexpr UINT kProxySelectNvofResolutionMessage = WM_APP + 0x5D;
+static constexpr UINT kProxyEnableNvofMessage = WM_APP + 0x5E;
 static std::atomic<int> g_external_nr_model_request{0};
 static std::atomic<int> g_external_dlss_preset_request{-1};
 static std::atomic<int> g_external_nr_pass_count_request{0};
 static std::atomic<int> g_external_show_processed_request{-1};
 static std::atomic<int> g_external_nr_enabled_request{-1};
 static std::atomic<int> g_external_fg_enabled_request{-1};
+static std::atomic<int> g_external_nvof_resolution_request{-1};
+static std::atomic<int> g_external_nvof_enabled_request{-1};
 static constexpr DWORD kInitializationGpuWaitMs = 2000;
 static constexpr DWORD kTransitionGpuWaitMs = 250;
 static constexpr DWORD kProxyWindowStartupWaitMs = 1000;
@@ -8596,6 +8600,18 @@ static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, 
         g_external_fg_enabled_request.store(wparam != 0 ? 1 : 0, std::memory_order_release);
         return 0;
     }
+    if (message == kProxySelectNvofResolutionMessage)
+    {
+        const int resolution = static_cast<int>(wparam);
+        if (resolution >= 0 && resolution <= 6)
+            g_external_nvof_resolution_request.store(resolution, std::memory_order_release);
+        return 0;
+    }
+    if (message == kProxyEnableNvofMessage)
+    {
+        g_external_nvof_enabled_request.store(wparam != 0 ? 1 : 0, std::memory_order_release);
+        return 0;
+    }
     if (message == kProxyOverlayInputModeMessage)
     {
         if (g_external_game_process_id != 0)
@@ -11640,6 +11656,33 @@ static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchai
         g_need_history_reset = true;
         if (g_neural_ready) g_feature_recreate_requested = true;
         Log("32-bit wrapper changed Frame Generation live to %s", g_framegen_enabled ? "enabled" : "disabled");
+    }
+    const int external_nvof_resolution =
+        g_external_nvof_resolution_request.exchange(-1, std::memory_order_acq_rel);
+    if (external_nvof_resolution >= 0 && external_nvof_resolution <= 6 &&
+        static_cast<int>(g_nvof_resolution_mode) != external_nvof_resolution)
+    {
+        g_nvof_resolution_mode = static_cast<NvofResolutionMode>(external_nvof_resolution);
+        char value[16] = {};
+        sprintf_s(value, "%d", external_nvof_resolution);
+        reshade::set_config_value(nullptr, dlss5_aio_menu::kConfigSection,
+            "NvidiaOpticalFlowResolution", static_cast<const char *>(value));
+        g_nvof_reconfigure_requested = true;
+        g_need_history_reset = true;
+        Log("32-bit wrapper changed NVIDIA Optical Flow resolution live to %s; safe reconfiguration queued",
+            NvofResolutionModeName(g_nvof_resolution_mode));
+    }
+    const int external_nvof_enabled =
+        g_external_nvof_enabled_request.exchange(-1, std::memory_order_acq_rel);
+    if (external_nvof_enabled >= 0 && g_nvof_motion_enabled != (external_nvof_enabled != 0))
+    {
+        g_nvof_motion_enabled = external_nvof_enabled != 0;
+        reshade::set_config_value(nullptr, dlss5_aio_menu::kConfigSection,
+            "NvidiaOpticalFlowMotion", g_nvof_motion_enabled ? "1" : "0");
+        g_nvof_reconfigure_requested = true;
+        g_need_history_reset = true;
+        Log("32-bit wrapper changed NVIDIA Optical Flow live to %s; safe reconfiguration queued",
+            g_nvof_motion_enabled ? "enabled" : "disabled");
     }
     const bool dlss_preset_hotkey_down = primary_foreground &&
         (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0 &&

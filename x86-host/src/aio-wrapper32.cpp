@@ -56,7 +56,7 @@
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
 #include "aio-menu-schema.hpp"
 
-#define FEED_VERSION "2.2.3"
+#define FEED_VERSION "2.2.4"
 
 extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR (32-bit wrapper) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -265,6 +265,8 @@ static constexpr UINT kProxyVisibilityMessage = WM_APP + 0x53;
 static constexpr UINT kProxyShowProcessedMessage = WM_APP + 0x5A;
 static constexpr UINT kProxyEnableNrMessage = WM_APP + 0x5B;
 static constexpr UINT kProxyEnableFgMessage = WM_APP + 0x5C;
+static constexpr UINT kProxySelectNvofResolutionMessage = WM_APP + 0x5D;
+static constexpr UINT kProxyEnableNvofMessage = WM_APP + 0x5E;
 // Known motion-vector providers, keyed by the DLSS5_MV_PROVIDER value DLSS5_Feed.fx
 // was compiled with (0 texMotionVectors, 1 Launchpad, 2 VORT, 3 LumeniteFX Kernel,
 // 4 LumeniteFX QuantMotion). Name checks only, for the status line and a mismatch warning.
@@ -1010,7 +1012,9 @@ static bool TryApplyLiveHostSettings()
         if (strcmp(kNR[i].key, "Model") != 0 &&
             strcmp(kNR[i].key, "DlssRenderPreset") != 0 &&
             strcmp(kNR[i].key, "NeuralRendering") != 0 &&
-            strcmp(kNR[i].key, "FrameGeneration") != 0)
+            strcmp(kNR[i].key, "FrameGeneration") != 0 &&
+            strcmp(kNR[i].key, "NvidiaOpticalFlowResolution") != 0 &&
+            strcmp(kNR[i].key, "NvidiaOpticalFlowMotion") != 0)
             return false;
     }
     if (!any) return true;
@@ -1025,6 +1029,10 @@ static bool TryApplyLiveHostSettings()
         if (strcmp(kNR[i].key, "Model") == 0) message = kProxySelectNrModelMessage;
         else if (strcmp(kNR[i].key, "NeuralRendering") == 0) message = kProxyEnableNrMessage;
         else if (strcmp(kNR[i].key, "FrameGeneration") == 0) message = kProxyEnableFgMessage;
+        else if (strcmp(kNR[i].key, "NvidiaOpticalFlowResolution") == 0)
+            message = kProxySelectNvofResolutionMessage;
+        else if (strcmp(kNR[i].key, "NvidiaOpticalFlowMotion") == 0)
+            message = kProxyEnableNvofMessage;
         if (!PostMessageW(proxy, message, static_cast<WPARAM>(encoded), 0))
             return false;
         g_nr_present[i] = true;
@@ -1037,7 +1045,7 @@ static bool TryApplyLiveHostSettings()
             return false;
         g_aio_nr_pass_touched = false;
     }
-    Log("[feed32] NR/FG/model/DLSS preset/pass-count change sent live; carrier restart avoided");
+    Log("[feed32] live-safe AIO setting change sent to host; carrier restart avoided");
     return true;
 }
 
@@ -4094,7 +4102,9 @@ static void DrawAioGroup(dlss5_aio_menu::Group group)
         const bool setting_changed = DrawAioSetting(index);
         if (setting_changed && g.d3d9_cpu_bridge && HostAlive() &&
             (strcmp(setting.key, "Model") == 0 || strcmp(setting.key, "DlssRenderPreset") == 0 ||
-             strcmp(setting.key, "NeuralRendering") == 0 || strcmp(setting.key, "FrameGeneration") == 0))
+             strcmp(setting.key, "NeuralRendering") == 0 || strcmp(setting.key, "FrameGeneration") == 0 ||
+             strcmp(setting.key, "NvidiaOpticalFlowResolution") == 0 ||
+             strcmp(setting.key, "NvidiaOpticalFlowMotion") == 0))
             HostApplySettings();
 
         if (strcmp(setting.key, "DlssRenderPreset") == 0)

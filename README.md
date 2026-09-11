@@ -5,7 +5,7 @@ Bring Neural Rendering, DLAA/DLSS Super Resolution, and Frame Generation to supp
 > [!IMPORTANT]
 > **NVIDIA Optical Flow motion stabilization is now integrated.** It analyzes consecutive game frames with NVIDIA's driver-provided Optical Flow hardware, then supplies stable screen-space motion to Neural Rendering, DLSS/DLAA, and Frame Generation. In multi-game testing this has **massively reduced boiling, smearing, and ghosting**, including with the demanding **3x NR** mode. The stable motion history keeps reconstructed details anchored between frames instead of allowing each NR pass to reinterpret moving edges independently.
 >
-> Version 2.2.3 defaults Optical Flow to an aspect-preserving **180p** working resolution. Uncapped testing reduced observed flow latency from roughly 37 ms at 720p to 12 ms at 180p and nearly eliminated NVOF backpressure while retaining most of the stabilization benefit. Higher resolutions remain selectable.
+> Version 2.2.4 also lets 32-bit games enable/disable Optical Flow and change its working resolution live, without restarting the game or x64 host. Optical Flow defaults to an aspect-preserving **180p** working resolution; higher resolutions remain selectable.
 
 This project's original code and documentation are licensed under the [Apache License 2.0](LICENSE). Forks and redistributed derivatives must preserve the license and the attribution in [`NOTICE`](NOTICE), retain applicable notices, and mark modified files. Third-party components and NVIDIA runtime files remain under their own terms; see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
