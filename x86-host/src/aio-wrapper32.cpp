@@ -121,7 +121,7 @@ struct Cfg
     int   log_frames;
     int   host_window;     // 1 = show the host's window (it carries the DLSS 5 tuning panel: press Home there)
     int   show_processed_output; // initial virtual-screen A/B state; F10 still toggles it live
-    int   work_resolution; // 50..100 percent of each backbuffer axis; the game stays native-sized
+    int   work_resolution; // 25..100 percent of each backbuffer axis; the game stays native-sized
     int   classic_d3d9_cpu_fallback; // opt-in CPU readback when D3D9/D3D11 sharing is unsupported
     int   classic_d3d9_fullscreen_virtualization; // opt-in initial exclusive -> borderless rewrite
     float mv_scale_x, mv_scale_y;
@@ -233,7 +233,7 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
     }
     fclose(f);
-    if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
+    if (next.work_resolution < 25 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
     next.classic_d3d9_cpu_fallback = next.classic_d3d9_cpu_fallback != 0 ? 1 : 0;
     next.classic_d3d9_fullscreen_virtualization =
         next.classic_d3d9_fullscreen_virtualization != 0 ? 1 : 0;
@@ -3946,7 +3946,7 @@ static void DrawLegacyOverlay(reshade::api::effect_runtime *)
     {
         if (g_pending_work_resolution == 0 && g_work_resolution_ui != g_cfg.work_resolution)
             g_work_resolution_ui = g_cfg.work_resolution;
-        if (ImGui::SliderInt("Work resolution (%)", &g_work_resolution_ui, 50, 100))
+        if (ImGui::SliderInt("Work resolution (%)", &g_work_resolution_ui, 25, 100))
         {
             g_pending_work_resolution = g_work_resolution_ui;
             g_work_resolution_apply_after = GetTickCount64() + 400;
@@ -4115,6 +4115,17 @@ static void DrawAioGroup(dlss5_aio_menu::Group group)
     }
 }
 
+// True when an explicit pipeline source resolution is chosen in the x64 AIO
+// settings. ResolveWorkExtent honours that ahead of the work-resolution
+// percentage, so the slider has no effect while it is set.
+static bool RequestedSourceResolutionIsSet()
+{
+    for (int i = 0; i < NR_COUNT; ++i)
+        if (strcmp(kNR[i].key, "SourceResolutionOverride") == 0)
+            return static_cast<int>(g_nr[i]) > 0;
+    return false;
+}
+
 static void DrawOverlay(reshade::api::effect_runtime *)
 {
     if (!g_host_nr_loaded)
@@ -4161,7 +4172,42 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::SeparatorText("General");
     DrawAioGroup(dlss5_aio_menu::Group::General);
 
+    // Work resolution is stored in dlss5-aio-x86.cfg rather than the schema, so
+    // it has to be drawn by hand. It shrinks the captured frame before it crosses
+    // the pipe, which is what makes Neural Rendering run on fewer pixels and turns
+    // DLSS from 1:1 DLAA into a real upscale back to native.
+    if (g.is_gl || g.is_vulkan)
+    {
+        ImGui::BeginDisabled();
+        int fixed = 100;
+        ImGui::SliderInt("Work resolution (%)", &fixed, 25, 100);
+        ImGui::EndDisabled();
+        ImGui::SameLine(); HelpMarker("Fixed at 100% on the OpenGL and Vulkan transports: DLSS runs at the "
+                                      "game's native resolution there.");
+    }
+    else
+    {
+        if (g_pending_work_resolution == 0 && g_work_resolution_ui != g_cfg.work_resolution)
+            g_work_resolution_ui = g_cfg.work_resolution;
+        if (ImGui::SliderInt("Work resolution (%)", &g_work_resolution_ui, 25, 100))
+        {
+            g_pending_work_resolution = g_work_resolution_ui;
+            g_work_resolution_apply_after = GetTickCount64() + 400;
+        }
+        ImGui::SameLine(); HelpMarker("Scales both axes of the shared DLAA + Neural Rendering work textures the host "
+                                      "runs on. The game and its backbuffer stay native-sized. Applied once 400 ms "
+                                      "after dragging stops, since each change rebuilds the shared set.");
+        if (g_pending_work_resolution != 0)
+            ImGui::TextDisabled("Pending: %d%%", g_pending_work_resolution);
+        else if (g.backbuffer_width != 0)
+            ImGui::TextDisabled("Active: %ux%u (%d%%) -> %ux%u", g.width, g.height,
+                                g_cfg.work_resolution, g.backbuffer_width, g.backbuffer_height);
+        if (RequestedSourceResolutionIsSet())
+            ImGui::TextDisabled("Pipeline source resolution override is set above and takes priority over this slider.");
+    }
+
     ImGui::SeparatorText("Neural rendering / reconstruction");
+    ImGui::TextDisabled("NR runs at the work resolution before DLSS upscales");
     DrawAioGroup(dlss5_aio_menu::Group::Neural);
 
     ImGui::SeparatorText("Output / performance");
