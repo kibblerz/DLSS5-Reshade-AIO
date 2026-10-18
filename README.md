@@ -18,6 +18,8 @@ This project's original code and documentation are licensed under the [Apache Li
 > [!TIP]
 > **Windowed mode is recommended for setup and normal use.** It reliably exposes a lower-resolution backbuffer for DLSS SR, and version 2.0.1 can place the processed output in a small preview beside the real ReShade window while you change settings. Closing ReShade restores the native-size processed output.
 
+For State of Decay 2, an [experimental HUD preservation profile](docs/state-of-decay-2-hud.md) restores original menu text and HUD pixels after neural rendering. It is limited to that game's D3D11 executable and can be disabled in `ReShade.ini`.
+
 ## Quick install — choose one package
 
 The ReShade installer identifies whether a selected game executable is 32-bit or 64-bit. Install the matching ReShade build **with addon support**, then download the matching AIO ZIP from the [latest release](https://github.com/kibblerz/DLSS5-Reshade-AIO/releases/latest).

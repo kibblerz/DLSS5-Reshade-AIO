@@ -3483,6 +3483,8 @@ static DXGI_FORMAT TypedInputFormat(DXGI_FORMAT format)
     }
 }
 
+#include "sod2-hud.hpp"
+
 static bool CreateTexture(UINT width, UINT height, DXGI_FORMAT format, bool uav,
     D3D12_RESOURCE_STATES initial_state, Microsoft::WRL::ComPtr<ID3D12Resource> &resource,
     D3D12_RESOURCE_FLAGS additional_flags = D3D12_RESOURCE_FLAG_NONE)
@@ -4736,7 +4738,7 @@ static bool BuildLegacyFrameResources(UINT width, UINT height, DXGI_FORMAT forma
         {
             if (!CreateSharedPair11(width, height, format,
                     slot.original_input, slot.legacy_input11,
-                    SourceResolutionOverrideActive()))
+                    SourceResolutionOverrideActive() || g_sod_hud))
                 return false;
             if (SourceResolutionOverrideActive() &&
                 !CreateLegacyDownsampleRtv(slot.legacy_input11.Get(), format,
@@ -4746,7 +4748,7 @@ static bool BuildLegacyFrameResources(UINT width, UINT height, DXGI_FORMAT forma
         for (LegacyCaptureSlot &slot : g_legacy_capture_slots)
         {
             if (!CreateSharedPair11(width, height, format, slot.input12, slot.input11,
-                    SourceResolutionOverrideActive()))
+                    SourceResolutionOverrideActive() || g_sod_hud))
                 return false;
             if (SourceResolutionOverrideActive() &&
                 !CreateLegacyDownsampleRtv(slot.input11.Get(), format,
@@ -4864,7 +4866,7 @@ static bool CopyLegacyFrameToD3D12(void *native_resource, bool post_effects, int
                     g_pipeline_slots[pipeline_slot_index].legacy_input_rtv.Get() : nullptr);
             if (!DownsampleLegacyFrame(source11.Get(), rtv)) return false;
         }
-        else
+        else if (post_effects || !SodPackHud(g_legacy_context11.Get(), destination11, source11.Get()))
             g_legacy_context11->CopyResource(destination11, source11.Get());
     }
     else if (g_present_api == reshade::api::device_api::d3d9)
@@ -4940,7 +4942,7 @@ static bool CaptureLegacyFrameToMailbox(void *native_resource)
             if (!DownsampleLegacyFrame(source11.Get(), slot.input_rtv.Get()))
                 hr = E_FAIL;
         }
-        else
+        else if (!SodPackHud(g_legacy_context11.Get(), slot.input11.Get(), source11.Get()))
             g_legacy_context11->CopyResource(slot.input11.Get(), source11.Get());
     }
     else if (SUCCEEDED(hr))
@@ -10014,7 +10016,7 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
     if (SUCCEEDED(hr)) { failed_stage = "SerializeRootSignature"; hr = D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &error_blob); }
     if (SUCCEEDED(hr)) { failed_stage = "CreateRootSignature"; hr = device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&g_proxy_root_signature)); }
     static const char *shader_source =
-        "Texture2D<float3> Neural:register(t0); Texture2D<float3> Original:register(t1); Texture2D<float3> Post:register(t2);"
+        "Texture2D<float3> Neural:register(t0); Texture2D<float4> Original:register(t1); Texture2D<float3> Post:register(t2);"
         "SamplerState Samp:register(s0); cbuffer C:register(b0){uint Mode;uint Fps;uint ShowFps;float Threshold;float2 CursorInput;float2 PreviousCursorInput;uint NoticeVisible;uint NoticeLength;uint2 NoticePadding;uint4 NoticeText[10];}"
         "struct O{float4 p:SV_Position;float2 uv:TEXCOORD0;};"
         "O VS(uint id:SV_VertexID){O o; float2 p=float2((id<<1)&2,id&2); o.uv=p; o.p=float4(p*float2(2,-2)+float2(-1,1),0,1); return o;}"
@@ -10045,11 +10047,12 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
         "float4 PS(O i):SV_Target{float3 post=Post.SampleLevel(Samp,i.uv,0);float3 neural=Neural.SampleLevel(Samp,i.uv,0);float3 result;"
         "uint w,h; Post.GetDimensions(w,h); uint2 p=min(uint2(i.uv*float2(w,h)),uint2(w-1,h-1));"
         "uint ow,oh; Original.GetDimensions(ow,oh); uint2 op=min(uint2(i.uv*float2(ow,oh)),uint2(ow-1,oh-1));"
-        "float3 postPoint=Post.Load(int3(p,0)); float3 original=Original.Load(int3(op,0));"
+        "float3 postPoint=Post.Load(int3(p,0)); float4 originalWithMask=Original.Load(int3(op,0));float3 original=originalWithMask.rgb;"
         "if(Mode==0)result=original;else if(Mode==1)result=neural;else if(Mode==2)result=neural+(postPoint-original);else result=postPoint;"
         "bool cursorNow=CursorInput.x>=0&&all(float2(p)>=CursorInput-float2(6,6))&&all(float2(p)<=CursorInput+float2(36,44));"
         "bool cursorPrevious=PreviousCursorInput.x>=0&&all(float2(p)>=PreviousCursorInput-float2(6,6))&&all(float2(p)<=PreviousCursorInput+float2(36,44));"
         "if((cursorNow||cursorPrevious)&&Mode!=1)result=Mode==0?original:neural;"
+        "if(NoticePadding.x!=0&&Mode!=0&&Mode!=3)result=lerp(result,original,step(0.5,originalWithMask.a)*(1-step(0.8,originalWithMask.a)));"
         "return float4(AddNotice(AddFps(result,i.p.xy),i.p.xy),1);}";
     if (SUCCEEDED(hr)) { failed_stage = "Compile vertex shader"; hr = D3DCompile(shader_source, strlen(shader_source), nullptr, nullptr, nullptr, "VS", "vs_5_0", 0, 0, &vertex_shader, &error_blob); }
     if (SUCCEEDED(hr)) { failed_stage = "Compile pixel shader"; hr = D3DCompile(shader_source, strlen(shader_source), nullptr, nullptr, nullptr, "PS", "ps_5_0", 0, 0, &pixel_shader, &error_blob); }
@@ -10526,6 +10529,9 @@ static bool PresentProxySourcesOnWorker(ID3D12Resource *real_source,
     static_assert(sizeof(ProxyConstants) == 52 * sizeof(UINT));
     constants.mode = g_composite_reshade_output && composite_post ?
         (g_show_neural_output ? 2u : 3u) : (g_show_neural_output ? 1u : 0u);
+    constants.notice_padding[0] = g_sod_hud &&
+        g_present_api == reshade::api::device_api::d3d11 &&
+        !SourceResolutionOverrideActive() && SodSupportsFormat(g_resource_input_format) ? 1u : 0u;
     constants.fps = g_proxy_fps.load();
     constants.show_fps = g_show_proxy_fps ? 1u : 0u;
     constants.cursor_x = cursor_x;
@@ -13204,6 +13210,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             reshade::get_config_value(nullptr, section, key, buffer, &size);
         };
         char value[32];
+        wchar_t executable[MAX_PATH] = {};
+        const bool sod2 = GetModuleFileNameW(nullptr, executable, MAX_PATH) != 0 &&
+            SodIsGameExecutable(executable);
+        read_setting("StateOfDecay2HudProtection", "1", value, sizeof(value));
+        g_sod_hud = sod2 && strcmp(value, "0") != 0;
+        if (g_sod_hud) Log("SOD2 HUD: experimental frame-local UI preservation enabled");
         // InputColorProfile is intentionally a new key. Older builds defaulted
         // ColorProfile to HDR10 globally, so importing that value would retain
         // the cross-game color bug instead of migrating installations to Auto.
@@ -13325,7 +13337,18 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
         reshade::register_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
         reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+        if (g_sod_hud) {
+            reshade::register_event<reshade::addon_event::init_pipeline>(SodInitPipeline);
+            reshade::register_event<reshade::addon_event::destroy_pipeline>(SodDestroyPipeline);
+            reshade::register_event<reshade::addon_event::bind_pipeline>(SodBindPipeline);
+            reshade::register_event<reshade::addon_event::reset_command_list>(SodResetCommandList);
+            reshade::register_event<reshade::addon_event::destroy_command_list>(SodResetCommandList);
+            reshade::register_event<reshade::addon_event::destroy_device>(SodDestroyDevice);
+            reshade::register_event<reshade::addon_event::draw>(SodDraw);
+            reshade::register_event<reshade::addon_event::draw_indexed>(SodDrawIndexed);
+        }
         reshade::register_event<reshade::addon_event::present>(OnPresent);
+        if (g_sod_hud) reshade::register_event<reshade::addon_event::present>(SodFrameEnd);
         reshade::register_event<reshade::addon_event::reshade_finish_effects>(OnReshadeFinishEffects);
         reshade::register_event<reshade::addon_event::reshade_present>(OnReshadePresent);
         reshade::register_event<reshade::addon_event::reshade_open_overlay>(OnReshadeOpenOverlay);
@@ -13343,7 +13366,18 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(OnReshadeOpenOverlay);
         reshade::unregister_event<reshade::addon_event::reshade_present>(OnReshadePresent);
         reshade::unregister_event<reshade::addon_event::reshade_finish_effects>(OnReshadeFinishEffects);
+        if (g_sod_hud) {
+            reshade::unregister_event<reshade::addon_event::init_pipeline>(SodInitPipeline);
+            reshade::unregister_event<reshade::addon_event::destroy_pipeline>(SodDestroyPipeline);
+            reshade::unregister_event<reshade::addon_event::bind_pipeline>(SodBindPipeline);
+            reshade::unregister_event<reshade::addon_event::reset_command_list>(SodResetCommandList);
+            reshade::unregister_event<reshade::addon_event::destroy_command_list>(SodResetCommandList);
+            reshade::unregister_event<reshade::addon_event::destroy_device>(SodDestroyDevice);
+            reshade::unregister_event<reshade::addon_event::draw>(SodDraw);
+            reshade::unregister_event<reshade::addon_event::draw_indexed>(SodDrawIndexed);
+        }
         reshade::unregister_event<reshade::addon_event::present>(OnPresent);
+        if (g_sod_hud) reshade::unregister_event<reshade::addon_event::present>(SodFrameEnd);
         reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
         reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
         reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
